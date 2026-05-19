@@ -1,0 +1,29 @@
+---
+description: Follow implementation plans step-by-step; complete, verify, and iterate until correct
+alwaysApply: true
+---
+
+# Plan execution and completion
+
+When the user provides a plan (for example under `.cursor/plans/` or pasted in chat), treat it as a **binding checklist**, not a loose outline.
+
+## Execution
+
+- **Work in order** unless the plan explicitly allows parallel tracks or reordering. Do not skip, merge, or “mostly” complete steps.
+- **Cover every item**: every step, sub-step, file, migration, test, and doc change the plan names must be done or explicitly called out if blocked (with the blocker and what is needed to unblock)—do not silently omit work.
+- **One pass is not enough** if anything failed or was deferred: loop back and finish remaining items before declaring the task done.
+
+## Verification
+
+- After substantive changes, **run the relevant checks** for this repo (e.g. `cargo test`, `cargo clippy`, `cargo build --release`, or whatever the plan implies). Fix failures **before** stopping.
+- Confirm behavior matches the plan’s intent (not only that code compiles): if the plan describes HTTP or storage behavior, verify via **`tests/integration.rs`** and/or a manual smoke path (`cargo run` + curl with a test JWT).
+
+## Done criteria
+
+Do not say the work is complete until:
+
+1. Every plan step is addressed (implemented, tested as specified, or explicitly blocked with a clear reason).
+2. Project checks you ran are **green** (or you document the exact failing command and fix in progress if the user must intervene).
+3. Nothing material from the plan was left implied but unimplemented.
+
+This rule exists because partial execution of plans has caused missed steps and broken states in the past.

@@ -1,0 +1,46 @@
+---
+description: >-
+  HTTP error JSON, logging vs client messages, and tracing for Nebular OS object
+  storage routes
+alwaysApply: true
+---
+
+# API responses, errors, and logging
+
+Nebular OS uses a **simple JSON error envelope** on object and bucket routes. Follow these conventions in **`src/routes/`**, **`src/auth.rs`**, and **`src/server.rs`**.
+
+## Canonical error JSON
+
+- **Error HTTP bodies** on object/bucket routes use a single field:
+  `{ "error": "<message>" }`
+  See `src/routes/object.rs`, `src/routes/bucket.rs`, and `src/auth.rs` (`{"error": "unauthorized"}`).
+- **Do not** introduce alternate shapes for the same routes (plain text only, `{ "message": "..." }` without `error`, or nested `{ "error": { "code", "detail" } }`) unless the user explicitly approves a **breaking** contract change—and then **update** `tests/integration.rs` and document callers (e.g. Aurora `NebulaStorage`) in the same work.
+- **Success JSON** where used (e.g. PUT returns `{ "etag": "..." }`) stays minimal; do not change without a deliberate migration.
+
+## Status codes and messages
+
+- Use appropriate HTTP status: **401** unauthorized (JWT/presigned), **404** not found, **416** range not satisfiable, **500** internal/storage failures.
+- Keep **`error` strings safe for clients**—no stack traces, SQL fragments, internal paths, tokens, or secrets in JSON bodies.
+- Prefer **stable, short messages** for known cases (`"not found"`, `"unauthorized"`, `"range not satisfiable"`). For storage/engine failures, a generic string is acceptable if the detailed cause is only in logs.
+
+## Logging
+
+- Use **`tracing`** (`error!` / `warn!` / `info!`) in handlers and the storage engine. **Log the real error** with `tracing::error!(..., error = %e, ...)`; map to user-facing JSON separately.
+- **Do not** log `NOS_JWT_SECRET`, `NOS_SIGNING_SECRET`, full JWTs, or presigned query secrets.
+- Request tracing uses **`tower_http::TraceLayer`** (see `src/server.rs`). Avoid `println!` in request paths.
+- Log verbosity: **`RUST_LOG`** / `tracing_subscriber` env filter (default includes `tower_http=debug` in `main.rs`).
+
+## Non-JSON routes
+
+- **`GET /health`** and **`GET /metrics`** return JSON success payloads defined in `src/routes/health.rs` and `src/routes/metrics.rs`; keep them stable for probes and monitoring.
+- **Streaming GET/PUT** bodies are not JSON; still avoid leaking internals in headers.
+
+## Downstream clients
+
+- HTTP clients (e.g. Aurora backend, curl, S3-compatible tools) should parse **`error`** from JSON on non-2xx responses. JWT for API calls must match **`NOS_JWT_SECRET`** and the **`Claims`** shape in `src/auth.rs` (`sub`, `email`, `role`, `exp`, `iat`).
+
+## Anti-patterns
+
+- Returning **500** with database or filesystem details in the JSON **`error`** string.
+- Mixing **JSON errors** and **plain-text** errors on the same object routes.
+- Logging **PII** at **error** level in hot paths without need.

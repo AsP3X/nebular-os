@@ -1,0 +1,50 @@
+---
+description: >-
+  Mandatory inline comments (human + optional AI-digestible line) on Rust in this
+  repo
+globs: "**/*.rs"
+alwaysApply: false
+---
+
+# Inline documentation (required)
+
+**Applies to `*.rs` only** (not `Cargo.toml`, lockfiles, CI, env samples, or other configs unless the user asks for the same style there).
+
+**All new or modified Rust code must include clean, human-readable inline comments.** Where behavior is non-trivial, **each such comment must also include an `// Agent:` line** (see below) so Cursor and other agents can parse intent quickly—**unless** that line would be redundant. Documentation is **not optional**—do not ship blocks of logic with no explanation.
+
+## What to comment
+
+- **Every non-trivial module, function, or handler**: Briefly state **purpose** and, where helpful, **inputs/outputs** or side effects (object routes, SQLite metadata, JWT/presigned auth, range requests, streaming uploads).
+- **Non-obvious logic**: Explain **why** something is done, not what the syntax already shows. Include edge cases, ordering constraints, or async I/O quirks (temp file rename, `StreamReader`, semaphore-less concurrency limits).
+- **Sections in longer files**: Short header comments before logical blocks (routing, validation, storage engine) so a human can scan the file.
+- **Magic numbers, flags, and workarounds**: Name the intent or link to a design constraint in plain language (e.g. `NOS_MAX_BODY_SIZE`, hash prefix for blob paths).
+
+## AI-oriented line (when applicable)
+
+**Each inline comment that documents non-trivial behavior must also include one separate comment line** that states the same idea in **dense, agent-digestible language**—only **omit** this line when it would add no value (e.g. purely obvious or redundant with the human line).
+
+Use a **fixed prefix** so tools and models can spot it:
+
+- **Rust:** `// Human:` and `// Agent:`
+
+On the **Agent** line, prefer **structured, scannable phrasing**: contracts (pre/post), inputs/outputs, HTTP status paths, SQLite tables touched, env vars read (`NOS_*`), invariants, failure modes, or dependencies on other modules. Example shape (adapt to context):
+
+```rust
+// Human: We reject the upload early if the stream exceeds the configured body limit.
+// Agent: READS NOS_MAX_BODY_SIZE via LimitReader; RETURNS 413 on overflow; WRITES temp file only after size check.
+```
+
+The **human** line stays conversational; the **Agent** line stays factual and keyword-oriented for fast retrieval in later Cursor sessions.
+
+## Style
+
+- Use full sentences or clear phrases in the **human** line; avoid cryptic abbreviations there. The **Agent** line may use compact tokens (`READS`, `WRITES`, `EMITS`, `REQUIRES`, `CALLS`, `HTTP`, `DB`).
+- Place comments **above** the code they describe (or end-of-line only for very short clarifications).
+- Keep **`///` rustdoc** for public API summaries where the project already uses it; use **`// Human:` / `// Agent:`** next to non-trivial implementation details (do not fold dense Agent tokens into user-facing doc comments).
+- Keep comments **up to date** when behavior changes—stale comments are treated as bugs.
+
+## Out of scope
+
+- Do not comment every single obvious line (e.g. trivial pass-through getters). **Do** comment anything another developer (or future you) would need to understand to edit safely.
+
+If implementation would otherwise be left undocumented, **add the comments first**, then keep the code aligned with them.

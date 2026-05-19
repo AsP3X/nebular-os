@@ -1,0 +1,35 @@
+---
+description: >-
+  Nebular OS repo layout—standalone Rust object storage crate; where to implement
+  changes by default
+alwaysApply: true
+---
+
+# Nebular OS project layout
+
+**Nebular OS** (`nebular-os`) is a standalone, self-hosted object storage service (Rust / Axum). It exposes an S3-like HTTP API with JWT auth, flat-file blobs, and SQLite metadata. There is **no** `backend/`, `frontend/`, or `apps/` tree in this repository.
+
+## Directories
+
+| Path | Role |
+|------|------|
+| **`src/`** | Library + binary: `main.rs`, `lib.rs`, `auth`, `config`, `secrets`, `server`, `routes/`, `storage/` |
+| **`tests/`** | Integration tests (`integration.rs`) against `create_app` |
+| **Root** | `Cargo.toml`, `Dockerfile`, `docker-compose.yml`, `README.md`, `.env.example` |
+
+## Where to implement
+
+- **HTTP API, auth, storage engine, config:** `src/` (routes under `src/routes/`, engine under `src/storage/`).
+- **Integration / API behavior tests:** `tests/integration.rs`.
+- **Do not** assume Aurora monorepo paths (`backend/src/`, `frontend/src/api/`, Meilisearch, playlists) unless the user explicitly references Aurora.
+
+## Local development (reference)
+
+- **`cargo run`** — server on `NOS_BIND_ADDR` (default `0.0.0.0:9000`); copy `.env.example` → `.env` and set `NOS_JWT_SECRET` / `NOS_SIGNING_SECRET` (each ≥ 32 chars).
+- **`cargo test`** — integration tests (temp dirs; no running server required).
+- **`docker compose up --build`** — container with `/data` volume for blobs + metadata DB.
+- Env defaults and API overview: `README.md`, `src/config.rs`.
+
+## Consumers (other repos)
+
+Downstream apps (e.g. Aurora) call this service over HTTP with JWTs aligned to `NOS_JWT_SECRET`. This crate can also be used as a **library** (`nebular_os`) for `create_app` and `StorageEngine` in tests or embedded deployments.

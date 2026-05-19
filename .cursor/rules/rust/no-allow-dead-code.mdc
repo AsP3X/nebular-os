@@ -1,0 +1,16 @@
+---
+description: Do not use #[allow(dead_code)] or similar suppressions
+alwaysApply: true
+---
+
+# No allow(dead_code)
+
+**Do not use `#[allow(dead_code)]` (or `#[allow(dead_code)]` on fields/items) in this project.**
+
+If the compiler reports dead code:
+
+- **Use the value** somewhere (e.g. in metrics, logs, or logic), or
+- **Remove the code** if it is truly unused, or
+- **Rename** to indicate intentionally unused (e.g. `_total`) only when the value is required by an API/schema and cannot be removed.
+
+Do not suppress the warning with `#[allow(dead_code)]`. This rule exists so we fix or remove dead code instead of hiding it.

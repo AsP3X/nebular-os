@@ -1,0 +1,153 @@
+---
+description: >-
+  Git commits only on explicit user request; TASK/FIX/BUGFIX/DOCS/CHORE message
+  format; branch model (master, feat/*); staging, safety, hooks, push, merge
+  exceptions
+alwaysApply: true
+---
+
+# Git commits
+
+## Enforcement (strict)
+
+- This rule is **mandatory** for all agent-authored git actions in this repository.
+- If a git command would violate any section below, **do not run it**. Stop, explain the exact rule conflict, and ask for explicit user confirmation or clarification.
+- When multiple instructions exist, prefer the **most restrictive** interpretation that keeps history safe and intentional.
+
+## When commits are allowed
+
+- **Create a git commit only when the user explicitly asks** (e.g. “commit this”, “make a commit”, “git commit”). Phrases like “save my work” or “checkpoint” count as explicit only if they clearly mean a **git commit**—when in doubt, **ask** before committing.
+- **Do not commit** to “helpfully” save progress, to finish a task, or because a change set “feels done.” **Never** run `git commit` without a clear, direct request to commit.
+- **Do not** amend, rebase, or otherwise rewrite history unless the user explicitly asks.
+
+## Push and branches
+
+- **Do not** `git push` (or force-push) unless the user **explicitly** asks to push.
+- **Do not** merge or rebase branches unless the user **explicitly** asks (same spirit as commits).
+
+### Branch model (this project)
+
+| Branch | Role |
+|--------|------|
+| **`master`** | **Default integration and release line.** Production-ready history; receives merged feature work via pull request (or explicit user-directed merge). |
+| **`feat/<name>`** or **`feature/<name>`** | **Feature development.** Branch from up-to-date **`master`**, implement, then open a PR into **`master`** when ready. |
+
+**Intended flow:** `feat/...` (or `feature/...`) → **`master`** via **pull request** on the host (GitHub, etc.). This repo does **not** use a separate long-lived `dev` branch.
+
+**Agent defaults when the user asks for a new branch:** create **`feat/<short-descriptive-slug>`** from **`master`** (after `git fetch` / `checkout master` / `pull` when using a remote), unless the user names another pattern (e.g. `fix/...`, `chore/...`).
+
+**Release / merge to `master`:** Prefer completing a **PR** on the remote. Do **not** recommend `git checkout master && git merge feat/...` as the normal path without the user asking. A **local** merge is acceptable only when the user **explicitly** asks and confirms compatibility (build/tests as they care about).
+
+**Hosting note:** Enable branch protection on **`master`** (require PR, reviews, status checks) when using GitHub/GitLab so merges go through review.
+
+## Staging scope
+
+- **Stage only** paths the user named, or changes that clearly belong to the requested commit. If the working tree has **other** modified or untracked files, **list them** and either leave them unstaged or **ask** whether to include them—**do not** silently `git add -A` unless the user explicitly asked to commit **everything**.
+- Before committing, prefer **`git status`** (or equivalent) so staged vs unstaged is intentional.
+
+## One logical change per commit
+
+- Prefer **one coherent story** per commit. If the working tree mixes unrelated changes (e.g. a **BUGFIX** and a **DOCS** refresh with no link), **tell the user** and offer **split commits** (stage subsets with separate messages) or **ask** which single prefix and scope they want for this commit.
+
+## Safety (never commit)
+
+- **Secrets:** Do not commit API keys, passwords, tokens, private keys, or full `.env` files that hold secrets. If such material appears staged or in diffs, **stop**, warn the user, and remove it from the index before proceeding.
+- **Generated and ignored artifacts:** Do not add paths listed in `.gitignore` (e.g. `target/`, `data/`, `*.db`, coverage output) unless the user **explicitly** asks to track that path anyway.
+
+## Hooks
+
+- **Do not** bypass Git hooks with `--no-verify` / `-n` unless the user **explicitly** asks to skip hooks for that commit.
+
+---
+
+## Commit message structure (required)
+
+For any commit **authored by the agent** with a custom message, use the shape below. **Exception:** commits created by **`git merge`** (merge commits) or **`git revert`** may keep **Git’s default merge/revert message**—do not force a TASK/FIX/… prefix onto those.
+
+### Message shape
+
+1. **First line:** exactly one required prefix below, colon, space, then a short summary. Prefer **about 72 characters or fewer** on this line for readable `git log --oneline`.
+2. **Blank line** after the first line when there is more to say.
+3. **Body:** optional paragraphs with detail (what changed, why, how for fixes). Match depth to change size: **trivial** changes stay short; **non-trivial** changes get a fuller body.
+
+Every such message must begin with **exactly one** of the following prefixes (including the colon and space).
+
+### `TASK: `
+
+**New work or refactors**—behavior, structure, or features—not mainly repairing a defect, not docs-only, not tooling-only.
+
+### `FIX: `
+
+Correcting something that went **wrong because of an earlier intentional change** (regression, bad assumption, incomplete follow-up—not an original latent bug).
+
+### `BUGFIX: `
+
+Fixing a **bug**—incorrect behavior not introduced solely by the immediately previous change (logic error, edge case, misuse of a framework, etc.).
+
+### `DOCS: `
+
+**Documentation-only** changes: README, guides. **Not** for normal inline code comments that accompany a code change—those stay with a **`TASK:`** (mention doc tweak in the body if needed).
+
+### `CHORE: `
+
+**Tooling and maintenance** only: CI, `.gitignore`, Cursor config, formatting config, dependency bumps, script renames that don’t change product behavior.
+
+---
+
+## Which prefix? (when in doubt)
+
+- **Only documentation / readme / guides changed?** → **`DOCS:`**
+- **Only CI, ignore rules, or config housekeeping?** → **`CHORE:`**
+- **Regression from the last intentional change?** → **`FIX:`**
+- **Pre-existing wrong behavior or latent bug?** → **`BUGFIX:`**
+- **Feature, refactor, or product/code change?** → **`TASK:`**
+- **Mixed unrelated edits?** → **Split commits** or **ask** the user.
+
+---
+
+## Format examples
+
+```text
+TASK: Add bucket existence check before list_objects.
+
+Returns 404 JSON when metadata DB has no rows for bucket prefix.
+```
+
+```text
+BUGFIX: Range request returns 500 when end offset equals file size.
+
+Clamp end to size - 1; add integration test in tests/integration.rs.
+```
+
+```text
+DOCS: Document presigned URL query parameters in README.
+
+Matches auth.rs signing inputs (expires, signature).
+```
+
+```text
+CHORE: Add Cursor rules for standalone nebular-os layout.
+
+Replaces Aurora backend/frontend paths in agent guidance.
+```
+
+---
+
+## No AI commit attribution
+
+- **Never** add `Co-authored-by: Cursor`, `Co-authored-by: Claude`, `cursoragent@cursor.com`, `noreply@anthropic.com`, or similar trailers to commit messages.
+- If Cursor injects attribution despite a clean message, rewrite with `git commit-tree` (see project history cleanup) or strip via `.githooks/commit-msg` after `git config core.hooksPath .githooks`.
+- In Cursor: **Settings → Agent → Attribution → Commit Attribution OFF** (and `commitAttribution: false` in `~/.cursor/cli-config.json` if needed).
+
+---
+
+## Rules summary
+
+1. **No commit** without explicit user request; **no push** unless explicitly asked; **no merge/rebase** unless explicitly asked.
+2. **Branches:** **`master`** + **`feat/*`** / **`feature/*`** from `master`; merge via **PR** when using a remote.
+3. **Staging:** Only what belongs; surface unrelated dirty files; avoid `git add -A` without explicit “commit everything.”
+4. **One logical change** per commit when possible.
+5. **Safety:** No secrets; no ignored/generated artifacts unless user explicitly wants them tracked.
+6. **Hooks:** No `--no-verify` unless user explicitly asks.
+7. **Custom commit messages** use **`TASK:`**, **`FIX:`**, **`BUGFIX:`**, **`DOCS:`**, or **`CHORE:`** prefixes.
+8. **Merge / revert** commits may use **Git’s default message**.

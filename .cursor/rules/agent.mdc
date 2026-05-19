@@ -1,0 +1,11 @@
+---
+alwaysApply: true
+---
+
+# Agent non-negotiables
+
+- Treat rules in `.cursor/rules/` as binding requirements, not suggestions.
+- **Nebular OS layout** is a single Rust crate at the repo root (see `project-layout.mdc`)—not Aurora’s `backend/` + `frontend/` monorepo unless the user is porting from that repo.
+- **Git operations must strictly follow `git-commits.mdc` exactly.** If any instruction conflicts with convenience, speed, or habit, follow `git-commits.mdc`.
+- If a requested git action is ambiguous (commit/push/merge/rebase intent is not explicit), stop and ask before running the command.
+- Never bypass commit safeguards silently; explain the blocker and ask for explicit confirmation when required by rule.
