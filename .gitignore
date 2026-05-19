@@ -1,0 +1,22 @@
+# OS
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Rust
+/target/
+*.rs.bk
+
+# Local object storage data
+/data/
+
+# SQLite metadata
+*.db
+*.db-shm
+*.db-wal
+
+# IDE
+.idea/
+.vscode/

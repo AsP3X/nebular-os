@@ -1,0 +1,18 @@
+services:
+  nebular-os:
+    build: .
+    container_name: nebular-os
+    environment:
+      NOS_JWT_SECRET: ${NOS_JWT_SECRET:?Set NOS_JWT_SECRET in .env (min 32 chars)}
+      NOS_SIGNING_SECRET: ${NOS_SIGNING_SECRET:?Set NOS_SIGNING_SECRET in .env (min 32 chars)}
+      NOS_BIND_ADDR: 0.0.0.0:9000
+      NOS_DATA_DIR: /data/blobs
+      NOS_META_PATH: /data/meta/metadata.db
+      RUST_LOG: info
+    ports:
+      - "9000:9000"
+    volumes:
+      - nebular_data:/data
+
+volumes:
+  nebular_data:
