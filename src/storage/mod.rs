@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod error;
 pub mod types;
 
 use std::path::PathBuf;

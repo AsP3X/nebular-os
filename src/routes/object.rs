@@ -8,12 +8,15 @@ use axum::{
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map};
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
+use crate::routes::errors::{map_storage_error, PayloadTooLarge};
 use crate::routes::AppState;
+use crate::storage::error::StorageError;
 
 struct LimitReader<R> {
     inner: R,
@@ -25,16 +28,13 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitReader<R> {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let result = Pin::new(&mut self.inner).poll_read(cx, buf);
         let after = buf.filled().len();
         let read = after - before;
         if read > self.remaining {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "payload too large",
-            )));
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, PayloadTooLarge)));
         }
         self.remaining -= read;
         result
@@ -78,7 +78,7 @@ pub async fn put_object(
     let body_stream = req.into_body().into_data_stream();
     let body_reader = tokio_util::io::StreamReader::new(
         body_stream.map(|result| {
-            result.map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))
+            result.map_err(|err| io::Error::new(io::ErrorKind::Other, err))
         }),
     );
     let body_reader = LimitReader {
@@ -107,13 +107,13 @@ pub async fn put_object(
             }
             resp
         }
+        Err(e @ StorageError::PayloadTooLarge) => {
+            tracing::warn!(bucket = %params.bucket, key = %params.key, "put_object payload too large");
+            map_storage_error(e).into_response()
+        }
         Err(e) => {
             tracing::error!(bucket = %params.bucket, key = %params.key, error = %e, "put_object failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
+            map_storage_error(e).into_response()
         }
     }
 }
@@ -131,7 +131,11 @@ pub async fn get_object(
 
     tracing::info!(bucket = %params.bucket, key = %params.key, ?range, "get_object started");
 
-    match state.storage.get_object(&params.bucket, &params.key, range).await {
+    match state
+        .storage
+        .get_object(&params.bucket, &params.key, range)
+        .await
+    {
         Ok((stream, content_length, total_size, mime_type)) => {
             tracing::info!(bucket = %params.bucket, key = %params.key, content_length, total_size, mime_type = ?mime_type, "get_object completed");
             let body = Body::from_stream(stream);
@@ -157,29 +161,15 @@ pub async fn get_object(
             }
             resp
         }
-        Err(e) if e.to_string().contains("not found") => {
-            tracing::warn!(bucket = %params.bucket, key = %params.key, "get_object not found");
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "not found" })),
-            )
-                .into_response()
-        }
-        Err(e) if e.to_string().contains("range not satisfiable") => {
-            tracing::warn!(bucket = %params.bucket, key = %params.key, ?range, "get_object range not satisfiable");
-            (
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                Json(json!({ "error": "range not satisfiable" })),
-            )
-                .into_response()
-        }
         Err(e) => {
-            tracing::error!(bucket = %params.bucket, key = %params.key, error = %e, "get_object failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
+            if matches!(e, StorageError::NotFound) {
+                tracing::warn!(bucket = %params.bucket, key = %params.key, "get_object not found");
+            } else if matches!(e, StorageError::RangeNotSatisfiable) {
+                tracing::warn!(bucket = %params.bucket, key = %params.key, ?range, "get_object range not satisfiable");
+            } else {
+                tracing::error!(bucket = %params.bucket, key = %params.key, error = %e, "get_object failed");
+            }
+            map_storage_error(e).into_response()
         }
     }
 }
@@ -209,21 +199,13 @@ pub async fn head_object(
             }
             resp
         }
-        Err(e) if e.to_string().contains("not found") => {
-            tracing::warn!(bucket = %params.bucket, key = %params.key, "head_object not found");
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "not found" })),
-            )
-                .into_response()
-        }
         Err(e) => {
-            tracing::error!(bucket = %params.bucket, key = %params.key, error = %e, "head_object failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
+            if matches!(e, StorageError::NotFound) {
+                tracing::warn!(bucket = %params.bucket, key = %params.key, "head_object not found");
+            } else {
+                tracing::error!(bucket = %params.bucket, key = %params.key, error = %e, "head_object failed");
+            }
+            map_storage_error(e).into_response()
         }
     }
 }
@@ -241,11 +223,7 @@ pub async fn delete_object(
         }
         Err(e) => {
             tracing::error!(bucket = %params.bucket, key = %params.key, error = %e, "delete_object failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
+            map_storage_error(e).into_response()
         }
     }
 }

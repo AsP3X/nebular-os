@@ -27,7 +27,8 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_DATA_DIR` | Blob directory (default `./data/blobs`) |
 | `NOS_META_PATH` | SQLite metadata path (default `./data/meta/metadata.db`) |
 | `NOS_MAX_BODY_SIZE` | Max upload bytes (default `104857600`) |
-| `NOS_ALLOW_PUBLIC_READ` | Allow unauthenticated GET when `true` (default `false`) |
+| `NOS_UPLOAD_BUFFER_SIZE` | Read buffer for streaming uploads (default `262144`) |
+| `NOS_ALLOW_PUBLIC_READ` | Allow unauthenticated GET/HEAD on `/{bucket}/{key}` when `true` (default `false`) |
 | `RUST_LOG` | Tracing filter (default `info`) |
 
 ## HTTP API
@@ -38,7 +39,7 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `GET` | `/:bucket/*key` | Bearer JWT or presigned query | Download (supports `Range`) |
 | `HEAD` | `/:bucket/*key` | Bearer JWT | Object metadata |
 | `DELETE` | `/:bucket/*key` | Bearer JWT | Hard delete |
-| `GET` | `/:bucket` | Bearer JWT | List objects (`prefix`, `delimiter`, `limit`, `start_after`) |
+| `GET` | `/:bucket` | Bearer JWT | List objects (`prefix`, `delimiter`, `limit`, `start_after`); response includes `common_prefixes`, `is_truncated`, `next_start_after` |
 | `GET` | `/health` | None | Health check |
 | `GET` | `/metrics` | None | Storage stats |
 

@@ -20,7 +20,12 @@ async fn main() -> Result<()> {
     }
     tracing::info!(?cfg, "Configuration loaded");
 
-    let storage = storage::engine::StorageEngine::new(&cfg.meta_path, &cfg.data_dir).await?;
+    let storage = storage::engine::StorageEngine::with_options(
+        &cfg.meta_path,
+        &cfg.data_dir,
+        cfg.upload_buffer_size,
+    )
+    .await?;
     tracing::info!("Storage engine initialized");
 
     let app = server::create_app(

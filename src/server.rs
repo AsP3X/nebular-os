@@ -18,26 +18,20 @@ pub async fn create_app(
     jwt_secret: String,
     signing_secret: Option<String>,
     max_body_size: usize,
-    allow_public_read: bool, // TODO: implement public read mode (post-MVP)
+    allow_public_read: bool,
 ) -> anyhow::Result<Router> {
     let secret = Arc::new(JwtSecret(jwt_secret));
     let signing_secret = signing_secret.map(Arc::new);
     let state = Arc::new(AppState {
         storage,
-        jwt_secret: secret.clone(),
-        signing_secret: signing_secret.clone(),
+        jwt_secret: secret,
+        signing_secret,
         max_body_size,
         allow_public_read,
     });
 
-    let auth_layer = middleware::from_fn_with_state(
-        state.clone(),
-        |state: axum::extract::State<Arc<AppState>>, req, next| {
-            let jwt_secret = state.jwt_secret.clone();
-            let signing_secret = state.signing_secret.clone();
-            presigned_or_jwt_middleware(jwt_secret, signing_secret, req, next)
-        },
-    );
+    let auth_layer =
+        middleware::from_fn_with_state(state.clone(), presigned_or_jwt_middleware);
 
     let public_routes = Router::new()
         .route("/health", get(health::health))

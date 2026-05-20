@@ -1,4 +1,5 @@
 pub mod bucket;
+pub mod errors;
 pub mod health;
 pub mod metrics;
 pub mod object;
