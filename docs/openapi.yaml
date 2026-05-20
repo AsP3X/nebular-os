@@ -1,0 +1,184 @@
+openapi: 3.1.0
+info:
+  title: Nebular OS API
+  version: 0.2.0
+  description: Self-hosted object storage with JWT and presigned URL auth.
+servers:
+  - url: http://localhost:9000
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+  /metrics:
+    get:
+      summary: Storage metrics (JSON or Prometheus)
+      security:
+        - metricsToken: []
+      parameters:
+        - in: header
+          name: Accept
+          schema:
+            type: string
+            example: text/plain
+      responses:
+        "200":
+          description: Metrics payload
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /{bucket}:
+    get:
+      summary: List objects
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - in: query
+          name: prefix
+          schema: { type: string }
+        - in: query
+          name: delimiter
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+        - in: query
+          name: start_after
+          schema: { type: string }
+      responses:
+        "200":
+          description: List result with pagination fields
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /{bucket}/{key}:
+    put:
+      summary: Upload or copy object
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - $ref: "#/components/parameters/key"
+        - in: header
+          name: x-nd-copy-source
+          schema: { type: string, example: music/source.mp3 }
+        - in: header
+          name: x-nd-custom-meta-*
+          schema: { type: string }
+      responses:
+        "201": { description: Created, returns `{ "etag": "..." }` }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+    get:
+      summary: Download object
+      security:
+        - bearerAuth: []
+        - presigned: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - $ref: "#/components/parameters/key"
+        - in: header
+          name: Range
+          schema: { type: string, example: "bytes=-500" }
+        - in: header
+          name: If-None-Match
+          schema: { type: string }
+        - in: header
+          name: If-Modified-Since
+          schema: { type: string }
+      responses:
+        "200": { description: Object bytes }
+        "206": { description: Partial content }
+        "304": { description: Not modified }
+        "404": { $ref: "#/components/responses/NotFound" }
+    head:
+      summary: Object metadata
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Headers only }
+        "304": { description: Not modified }
+    delete:
+      summary: Soft-delete object
+      security:
+        - bearerAuth: []
+      responses:
+        "204": { description: Marked deleted }
+  /{bucket}/_multipart:
+    post:
+      summary: Init multipart upload
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - in: query
+          name: key
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: `{ "upload_id", "part_size" }`
+  /{bucket}/_multipart/{uploadId}/parts/{partNumber}:
+    put:
+      summary: Upload multipart part
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: `{ "etag" }` }
+  /{bucket}/_multipart/{uploadId}/complete:
+    post:
+      summary: Complete multipart upload
+      security:
+        - bearerAuth: []
+      responses:
+        "201": { description: Final object created }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    presigned:
+      type: apiKey
+      in: query
+      name: signature
+    metricsToken:
+      type: http
+      scheme: bearer
+  parameters:
+    bucket:
+      in: path
+      name: bucket
+      required: true
+      schema: { type: string }
+    key:
+      in: path
+      name: key
+      required: true
+      schema: { type: string }
+  responses:
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Payload too large
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

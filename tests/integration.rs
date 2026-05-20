@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use nebular_os::auth::Claims;
+use nebular_os::config::NosConfig;
 use nebular_os::server::create_app;
-use nebular_os::storage::engine::StorageEngine;
+use nebular_os::storage::engine::{EngineOptions, StorageEngine};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -31,6 +34,29 @@ fn make_token() -> String {
     .unwrap()
 }
 
+fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<NosConfig> {
+    Arc::new(NosConfig {
+        bind_addr: "127.0.0.1:0".into(),
+        data_dir: "./data/blobs".into(),
+        meta_path: "./data/meta/metadata.db".into(),
+        jwt_secret: TEST_SECRET.into(),
+        signing_secret,
+        max_body_size: 10_000_000,
+        upload_buffer_size: 64 * 1024,
+        allow_public_read,
+        reconcile_on_startup: false,
+        reconcile_interval_secs: 0,
+        soft_delete_ttl_secs: 86_400,
+        metrics_token: None,
+        rate_limit_rps: 0,
+        rate_limit_burst: 50,
+        list_scan_cap: 4096,
+        multipart_part_size: 8 * 1024 * 1024,
+        read_pool_size: 2,
+        cors_origins: vec![],
+    })
+}
+
 async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (axum::Router, String, TempDir) {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("blobs");
@@ -41,19 +67,22 @@ async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (
     let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
     let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
 
-    let storage = StorageEngine::with_options(&meta_path_str, &data_dir_str, 64 * 1024)
-        .await
-        .unwrap();
-
-    let app = create_app(
-        storage,
-        TEST_SECRET.into(),
-        signing_secret,
-        10_000_000,
-        allow_public_read,
+    let storage = StorageEngine::with_full_options(
+        &meta_path_str,
+        &data_dir_str,
+        EngineOptions {
+            upload_buffer_size: 64 * 1024,
+            list_scan_cap: 4096,
+            multipart_part_size: 8 * 1024 * 1024,
+            soft_delete_ttl_secs: 86_400,
+            read_pool_size: 2,
+        },
     )
     .await
     .unwrap();
+
+    let cfg = test_config(signing_secret, allow_public_read);
+    let app = create_app(storage, cfg).await.unwrap();
 
     (app, make_token(), tmp)
 }
@@ -396,12 +425,22 @@ async fn test_payload_too_large_returns_413() {
     let id = uuid::Uuid::new_v4().to_string();
     let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
     let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
-    let storage = StorageEngine::with_options(&meta_path_str, &data_dir_str, 4096)
-        .await
-        .unwrap();
-    let app = create_app(storage, TEST_SECRET.into(), None, 8, false)
-        .await
-        .unwrap();
+    let storage = StorageEngine::with_full_options(
+        &meta_path_str,
+        &data_dir_str,
+        EngineOptions {
+            upload_buffer_size: 4096,
+            list_scan_cap: 4096,
+            multipart_part_size: 8 * 1024 * 1024,
+            soft_delete_ttl_secs: 86_400,
+            read_pool_size: 2,
+        },
+    )
+    .await
+    .unwrap();
+    let mut cfg = (*test_config(None, false)).clone();
+    cfg.max_body_size = 8;
+    let app = create_app(storage, Arc::new(cfg)).await.unwrap();
     let token = make_token();
 
     let req = Request::builder()
@@ -509,4 +548,230 @@ async fn test_list_pagination() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["items"].as_array().unwrap().len(), 1);
     assert_eq!(json["is_truncated"], false);
+}
+
+#[tokio::test]
+async fn test_conditional_get_not_modified() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/etag.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::from("hello"))
+        .unwrap();
+    let put_resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(put_resp.status(), StatusCode::CREATED);
+    let etag = put_resp
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/etag.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("if-none-match", etag)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+}
+
+#[tokio::test]
+async fn test_custom_meta_roundtrip() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/meta.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("x-nd-custom-meta-artist", "aurora")
+        .body(Body::from("x"))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/meta.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let artist = response
+        .headers()
+        .get("x-nd-custom-meta-artist")
+        .unwrap();
+    assert_eq!(artist, "aurora");
+}
+
+#[tokio::test]
+async fn test_suffix_range_request() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+    let content = b"abcdefghijklmnopqrstuvwxyz";
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/suffix.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::from(&content[..]))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/suffix.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("range", "bytes=-4")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"wxyz");
+}
+
+#[tokio::test]
+async fn test_copy_object() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/original.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::from("copy-me"))
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/copied.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("x-nd-copy-source", "music/original.txt")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/copied.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"copy-me");
+}
+
+#[tokio::test]
+async fn test_multipart_upload() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/music/_multipart?key=large.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/octet-stream")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let upload_id = json["upload_id"].as_str().unwrap();
+
+    for (part, data) in [(1, "aaa"), (2, "bbb")] {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/music/_multipart/{}/parts/{}",
+                upload_id, part
+            ))
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::from(data))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/music/_multipart/{}/complete", upload_id))
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/large.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"aaabbb");
+}
+
+#[tokio::test]
+async fn test_metrics_requires_token_when_configured() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("blobs");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
+    let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
+    let storage = StorageEngine::with_full_options(
+        &meta_path_str,
+        &data_dir_str,
+        EngineOptions {
+            upload_buffer_size: 64 * 1024,
+            list_scan_cap: 4096,
+            multipart_part_size: 8 * 1024 * 1024,
+            soft_delete_ttl_secs: 86_400,
+            read_pool_size: 2,
+        },
+    )
+    .await
+    .unwrap();
+    let mut cfg = (*test_config(None, false)).clone();
+    cfg.metrics_token = Some("metrics-secret".into());
+    let app = create_app(storage, Arc::new(cfg)).await.unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .header("authorization", "Bearer metrics-secret")
+        .header("accept", "text/plain")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("nos_objects_total"));
 }

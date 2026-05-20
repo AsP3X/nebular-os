@@ -124,9 +124,8 @@ pub async fn presigned_or_jwt_middleware(
         .get("authorization")
         .and_then(|h| h.to_str().ok());
 
-    if let Some(header) = auth_header {
-        if header.starts_with("Bearer ") {
-            let token = &header[7..];
+    if let Some(header) = auth_header
+        && let Some(token) = header.strip_prefix("Bearer ") {
             let mut validation = Validation::new(Algorithm::HS256);
             validation.validate_exp = true;
             validation.validate_nbf = false;
@@ -143,7 +142,6 @@ pub async fn presigned_or_jwt_middleware(
                 tracing::warn!(%path, %method, "jwt auth rejected: invalid token");
             }
         }
-    }
 
     let Some(secret) = signing_secret else {
         tracing::warn!(%path, %method, "auth failed: no signing_secret configured and no valid JWT");
