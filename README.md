@@ -139,8 +139,22 @@ including but not limited to:
 - **Hosted services** for customers, tenants, or users
 - Products or services that incorporate or expose Nebular OS to third parties
 
-See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) and
-[open a GitHub issue](https://github.com/AsP3X/nebular-os/issues/new).
+See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) and open a
+["Commercial License Request" issue](https://github.com/AsP3X/nebular-os/issues/new)
+(contact channel only; not a license tracker).
+
+### Bug and security reports
+
+Report bugs, defects, and security vulnerabilities via the
+[Project Issue Tracker](https://github.com/AsP3X/nebular-os/issues/new).
+Exploiting vulnerabilities or using them for illegal activity is prohibited.
+See [LICENSE](LICENSE) Sections 6.4–6.5.
+
+### Liability and prohibited use
+
+Licensor is **not liable** for misuse, damages, data loss, or security incidents
+arising from your use of Nebular OS. Use by **terrorist organizations** and for
+**illegal activity** is prohibited.
 
 ### Licensor
 

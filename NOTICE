@@ -7,7 +7,12 @@ This software is licensed under the Nebular OS Private Non-Commercial License
 Commercial use, distribution, and for-profit use require a separate written
 Commercial License Agreement from the Licensor. See COMMERCIAL-LICENSE.md.
 
-Contact: open a GitHub issue at https://github.com/AsP3X/nebular-os/issues/new
+Bug and security reports: https://github.com/AsP3X/nebular-os/issues/new
+Commercial license inquiries: open a "Commercial License Request" issue at the
+same URL (contact channel only; not a license tracker).
+
+Licensor is not liable for misuse, damages, or illegal use of the Software.
+Use by terrorist organizations is prohibited.
 
 Third-party components included in this software may be subject to separate
 license terms. See dependency manifests (Cargo.toml, Cargo.lock) and upstream

@@ -10,6 +10,11 @@ READ THIS LICENSE, UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS. IF YOU
 DO NOT AGREE, YOU MUST NOT USE THE SOFTWARE AND MUST DELETE ALL COPIES IN
 YOUR POSSESSION OR CONTROL.
 
+LICENSOR IS NOT LIABLE FOR MISUSE, DAMAGES, DATA LOSS, SECURITY INCIDENTS, OR
+ILLEGAL USE OF THE SOFTWARE. BUGS AND SECURITY ISSUES MUST BE REPORTED THROUGH
+THE PROJECT ISSUE TRACKER AND MUST NOT BE EXPLOITED. USE BY TERRORIST
+ORGANIZATIONS IS PROHIBITED.
+
 This license is NOT an Open Source Initiative (OSI) approved open source
 license. The Software is source-available under the restrictive terms below.
 
@@ -19,22 +24,36 @@ license. The Software is source-available under the restrictive terms below.
 ================================================================================
 
 1.1 Licensor. "Licensor" means Niklas Vorberg, the copyright owner of the
-    Software. Contact with Licensor regarding commercial licensing, notices, or
-    other matters under this Agreement must be made by opening a GitHub issue at
-    https://github.com/AsP3X/nebular-os/issues/new (the "Licensor Issue Tracker").
+    Software.
 
-1.2 Licensee. "You" or "Licensee" means the individual or legal entity
+1.2 Project Repository. The official public repository for the Software is
+    maintained at https://github.com/AsP3X/nebular-os (the "Project Repository").
+
+1.3 Project Issue Tracker. The GitHub issues facility of the Project Repository
+    at https://github.com/AsP3X/nebular-os/issues/new is the designated channel
+    for reporting Software bugs, defects, errors, and security vulnerabilities to
+    Licensor (the "Project Issue Tracker"). The Project Issue Tracker is not a
+    license management system, license registry, or automated license tracker.
+
+1.4 Commercial License Inquiries. Requests for a Commercial License Agreement
+    must be submitted by opening a new issue on the Project Repository with a
+    title that clearly identifies the request as a commercial license inquiry
+    (for example, "Commercial License Request"). Such an issue is a contact
+    channel only and does not constitute approval, registration, or issuance of
+    any license until confirmed in writing by Licensor as set forth in Section 5.
+
+1.5 Licensee. "You" or "Licensee" means the individual or legal entity
     accessing or using the Software, and any person or entity on whose behalf
     such access or use occurs.
 
-1.3 Binding Agreement. This Nebular OS Private Non-Commercial License
+1.6 Binding Agreement. This Nebular OS Private Non-Commercial License
     ("Agreement" or "NOCL-1.0") is a legally binding contract between Licensor
     and You. Your acceptance occurs upon the earliest of: (a) clicking or
     otherwise indicating assent where such mechanism is presented; (b) cloning,
     downloading, or receiving a copy of the Software; (c) compiling, linking to,
     or executing the Software; or (d) using the Software in any manner.
 
-1.4 Authority. If You accept on behalf of an organization, You represent and
+1.7 Authority. If You accept on behalf of an organization, You represent and
     warrant that You have authority to bind that organization, and "You" refers
     to that organization.
 
@@ -131,14 +150,30 @@ license. The Software is source-available under the restrictive terms below.
      reduce licensing costs that would otherwise apply.
 
 2.11 "Commercial License Agreement" means a separate written agreement executed
-     by Licensor and Licensee (which may be a GitHub issue thread on the Licensor
-     Issue Tracker explicitly confirmed by Licensor in writing, or a signed
-     contract) that authorizes specified Commercial Use in exchange for fees and
-     on terms set forth therein.
+     by Licensor and Licensee (which may be confirmed by Licensor in writing in
+     a Project Repository issue thread opened as a commercial license inquiry,
+     or in a signed contract) that authorizes specified Commercial Use in exchange
+     for fees and on terms set forth therein.
 
 2.12 "Permitted Use" has the meaning set forth in Section 3.2.
 
 2.13 "Licensor Reserved Rights" has the meaning set forth in Section 4.
+
+2.14 "Security Vulnerability" means any flaw, weakness, misconfiguration, defect,
+     or condition in the Software that could reasonably be exploited to compromise
+     the confidentiality, integrity, or availability of the Software or of data
+     processed, stored, or transmitted by it, or to obtain unauthorized access
+     or privileges.
+
+2.15 "Terrorist Organization" means any entity or group: (a) designated, listed,
+     proscribed, or classified as a terrorist organization or terrorist entity
+     under applicable law or by a competent governmental or supranational authority
+     (including, by way of example, lists maintained under European Union law,
+     United Nations Security Council resolutions, or the laws of the Federal
+     Republic of Germany); (b) that has as a purpose, or is substantially engaged
+     in, terrorism, violent extremism, or providing material support for such
+     activities; or (c) that is owned, controlled by, or acting on behalf of
+     any such entity or group.
 
 
 ================================================================================
@@ -256,11 +291,12 @@ license. The Software is source-available under the restrictive terms below.
         to or benefits the For-Profit Entity's activities.
 
 5.3 Commercial Licensing Process. To request a Commercial License Agreement,
-    You must open a GitHub issue at the Licensor Issue Tracker with a description
-    of the intended use, legal entity name, and contact information. Licensor has
-    sole discretion whether to offer commercial terms. No commercial license exists
-    until Licensor confirms agreement in writing (including via the GitHub issue
-    thread) and any applicable fees are paid according to the agreed terms.
+    You must open a commercial license inquiry issue on the Project Repository
+    as described in Section 1.4, including a description of the intended use,
+    legal entity name, and contact information. Licensor has sole discretion
+    whether to offer commercial terms. No commercial license exists until Licensor
+    confirms agreement in writing (including via the relevant Project Repository
+    issue thread) and any applicable fees are paid according to the agreed terms.
 
 5.4 Fees. Unless otherwise agreed in writing, no Commercial Use is authorized
     without payment of licensing fees as specified in the Commercial License
@@ -296,10 +332,17 @@ license. The Software is source-available under the restrictive terms below.
     (f) use the Software to store, transmit, or process unlawful content or to
         interfere with third-party systems;
 
-    (g) circumvent, disable, or interfere with technical or contractual measures
-        used to enforce this Agreement; or
+    (g) use the Software for any illegal activity or in furtherance of any
+        unlawful purpose;
 
-    (h) misrepresent Your qualification for Permitted Use or Your authorization
+    (h) use the Software if You are a Terrorist Organization or are owned,
+        controlled by, acting for, or providing material support to a Terrorist
+        Organization;
+
+    (i) circumvent, disable, or interfere with technical or contractual measures
+        used to enforce this Agreement;
+
+    (j) misrepresent Your qualification for Permitted Use or Your authorization
         for Commercial Use.
 
 6.2 Competitive Use. Except under a Commercial License Agreement explicitly
@@ -310,6 +353,40 @@ license. The Software is source-available under the restrictive terms below.
     Software or any Derivative Work under an open source license, "copyleft"
     license, or any license that would grant third parties rights broader than
     Permitted Use, except with Licensor's prior written consent.
+
+6.4 Bug and Security Reporting; Prohibition on Exploitation. If You discover or
+    become aware of any bug, defect, error, or Security Vulnerability in the
+    Software, You must promptly report it to Licensor through the Project Issue
+    Tracker, providing sufficient detail for Licensor to understand and reproduce
+    the issue where reasonably possible. You shall not:
+
+    (a) exploit any bug, defect, error, or Security Vulnerability to gain
+        unauthorized access, exfiltrate data, disrupt systems, or cause harm;
+
+    (b) use knowledge of any such issue to use the Software for illegal activity
+        or to assist any third party in doing so;
+
+    (c) publicly disclose a Security Vulnerability in a manner that enables
+        exploitation before giving Licensor a reasonable opportunity to investigate
+        and address it, except where required by applicable law; or
+
+    (d) delay reporting a Security Vulnerability so that it may be exploited,
+        weaponized, sold, or used for any purpose other than good-faith testing
+        within the scope of Your Permitted Use or authorized Commercial Use.
+
+    Good-faith security research strictly limited to systems You own or are
+    expressly authorized to test, and conducted without causing harm or accessing
+    third-party data without authorization, does not violate this Section 6.4
+    provided all discovered issues are reported promptly through the Project Issue
+    Tracker and are not exploited for unlawful purposes.
+
+6.5 Terrorist and Sanctioned Use Prohibition. You shall not use, deploy, modify,
+    distribute, or provide access to the Software, directly or indirectly, for the
+    benefit of any Terrorist Organization or for any activity related to terrorism,
+    violent extremism, or material support thereof. You shall not use the Software
+    in violation of applicable sanctions, export control, or anti-terrorism laws.
+    Any such use is void, constitutes immediate termination under Section 11, and
+    may be reported to competent authorities.
 
 
 ================================================================================
@@ -402,8 +479,8 @@ license. The Software is source-available under the restrictive terms below.
 
 11.4 Survival. Sections 2 (Definitions, to the extent needed to interpret
      surviving provisions), 4 (Licensor Reserved Rights), 5 (to the extent of
-     accrued obligations), 6.1(h), 7, 9, 10, 11.3, 11.4, 12, 13, 14, and 15
-     survive termination.
+     accrued obligations), 6 (Restrictions and Prohibited Conduct), 7, 9, 10,
+     11.3, 11.4, 12, 13, 14, and 15 survive termination.
 
 
 ================================================================================
@@ -423,6 +500,13 @@ license. The Software is source-available under the restrictive terms below.
 12.3 YOU ASSUME ALL RISK ARISING FROM USE OF THE SOFTWARE. LICENSOR DOES NOT
      WARRANT THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS OR THAT DEFECTS WILL
      BE CORRECTED.
+
+12.4 NO RESPONSIBILITY FOR MISUSE. LICENSOR IS NOT RESPONSIBLE FOR, AND EXPRESSLY
+     DISCLAIMS ANY LIABILITY ARISING FROM, YOUR MISUSE OF THE SOFTWARE, YOUR
+     FAILURE TO USE THE SOFTWARE IN ACCORDANCE WITH THIS AGREEMENT, YOUR VIOLATION
+     OF LAW, YOUR STORAGE OR PROCESSING OF DATA OR CONTENT, OR ANY ACTS OR
+     OMISSIONS OF YOU OR ANY THIRD PARTY USING OR ACCESSING THE SOFTWARE THROUGH
+     YOU, WHETHER OR NOT AUTHORIZED.
 
 
 ================================================================================
@@ -449,6 +533,22 @@ license. The Software is source-available under the restrictive terms below.
      for fraud, intentional misconduct, or death or personal injury caused by
      negligence where such exclusion is prohibited.
 
+13.4 No Liability for Misuse, Damages, or Illegal Use. WITHOUT LIMITING SECTIONS
+     12 AND 13.1–13.2, TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW,
+     LICENSOR SHALL NOT BE LIABLE FOR ANY DAMAGES, LOSSES, COSTS, CLAIMS, FINES,
+     PENALTIES, OR EXPENSES OF ANY KIND ARISING FROM OR RELATED TO: (a) YOUR
+     MISUSE, ABUSE, OR UNAUTHORIZED USE OF THE SOFTWARE; (b) BUGS, DEFECTS,
+     ERRORS, OR SECURITY VULNERABILITIES IN THE SOFTWARE, EXCEPT TO THE EXTENT
+     LIABILITY CANNOT BE EXCLUDED UNDER MANDATORY LAW; (c) YOUR FAILURE TO REPORT
+     OR YOUR EXPLOITATION OF BUGS, DEFECTS, ERRORS, OR SECURITY VULNERABILITIES;
+     (d) ILLEGAL ACTIVITY CONDUCTED BY YOU OR THROUGH YOUR USE OF THE SOFTWARE;
+     (e) USE BY OR FOR THE BENEFIT OF A TERRORIST ORGANIZATION; (f) DATA LOSS,
+     CORRUPTION, UNAUTHORIZED ACCESS, SERVICE INTERRUPTION, OR SECURITY INCIDENTS
+     AFFECTING YOUR SYSTEMS OR DATA; OR (g) ANY DECISION YOU MAKE TO RELY ON THE
+     SOFTWARE FOR ANY PURPOSE. YOU BEAR SOLE RESPONSIBILITY FOR YOUR USE OF THE
+     SOFTWARE AND FOR IMPLEMENTING APPROPRIATE SECURITY, BACKUP, AND OPERATIONAL
+     CONTROLS.
+
 
 ================================================================================
 14. INDEMNIFICATION
@@ -458,9 +558,12 @@ license. The Software is source-available under the restrictive terms below.
      any third-party claims, damages, losses, liabilities, costs, and expenses
      (including reasonable attorneys' fees) arising out of or related to: (a) Your
      use of the Software outside Permitted Use; (b) Your breach of this Agreement;
-     (c) Your violation of law; or (d) content or data You store or process using
-     the Software, except to the extent caused by Licensor's intentional
-     misconduct.
+     (c) Your violation of law, including illegal activity, exploitation of bugs
+     or Security Vulnerabilities, or use by or for a Terrorist Organization;
+     (d) content or data You store or process using the Software; or (e) any
+     misuse, unauthorized access, or damages caused by You or by third parties
+     accessing the Software through You, except to the extent caused by Licensor's
+     intentional misconduct.
 
 
 ================================================================================
@@ -500,10 +603,21 @@ license. The Software is source-available under the restrictive terms below.
      sanctions laws and shall not export or re-export the Software to prohibited
      jurisdictions or parties.
 
-15.8 Notices. Notices to Licensor must be submitted by opening a GitHub issue at
-     the Licensor Issue Tracker. Notices to You may be sent via the GitHub issue
-     thread You opened, contact information You provide in that issue, or via the
-     repository where the Software is made available.
+15.8 Notices and Reporting.
+
+     (a) Bug, defect, error, and Security Vulnerability reports must be submitted
+         through the Project Issue Tracker.
+
+     (b) Commercial license inquiries must be submitted as described in
+         Section 1.4.
+
+     (c) Other notices to Licensor under this Agreement must be submitted by
+         opening an issue on the Project Repository or by another method
+         expressly accepted by Licensor in writing.
+
+     (d) Notices to You may be sent via a Project Repository issue thread You
+         opened, contact information You provide in such an issue, or via the
+         Project Repository where the Software is made available.
 
 15.9 Interpretation. Section headings are for convenience only. "Including" means
      "including without limitation." The terms of this Agreement apply to the
@@ -532,8 +646,14 @@ This summary is for convenience only and does not modify the binding terms above
     - Hosted services for third parties, clients, or customers
     - Products or services that incorporate or expose the Software to third parties
 
+  PROHIBITED ALWAYS:
+    - Illegal activity or exploitation of bugs/security issues
+    - Use by or for terrorist organizations
+    - Misuse; Licensor is not liable for damages arising from misuse
+
   UNRESTRICTED:
     - Niklas Vorberg (Licensor) and entities wholly owned and controlled by Licensor
 
-For commercial licensing, open a GitHub issue at:
-https://github.com/AsP3X/nebular-os/issues/new
+Bug and security reports: https://github.com/AsP3X/nebular-os/issues/new
+Commercial license inquiries: open a "Commercial License Request" issue at the
+same URL (contact channel only; not a license tracker or registry).

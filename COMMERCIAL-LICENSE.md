@@ -8,6 +8,9 @@ uses that are **not** covered by the [Nebular OS Private Non-Commercial License]
 (Niklas Vorberg) confirms terms in **writing** and any agreed fees are paid.
 Unsigned or draft terms do not authorize Commercial Use.
 
+The GitHub issue page is a **contact channel only**. It is not a license tracker,
+license registry, or automated license management system.
+
 
 ## When a commercial license is required
 
@@ -26,10 +29,10 @@ is not [Permitted Use](LICENSE) under NOCL-1.0, including but not limited to:
 
 ## How to request a commercial license
 
-1. **Open a GitHub issue** at
+1. **Open an issue** on the Project Repository at
    [github.com/AsP3X/nebular-os/issues/new](https://github.com/AsP3X/nebular-os/issues/new).
 
-2. Use a clear title, for example: `Commercial License Request`.
+2. Use a clear title: `Commercial License Request`.
 
 3. Include at minimum:
 
@@ -43,6 +46,14 @@ is not [Permitted Use](LICENSE) under NOCL-1.0, including but not limited to:
 4. Licensor will respond on the issue with proposed terms or decline at sole
    discretion. **Do not begin Commercial Use until written confirmation is
    received on the issue thread (or via a separate signed agreement).**
+
+
+## Bug and security reports (separate from licensing)
+
+Reports of bugs, defects, errors, and security vulnerabilities must be submitted
+through the [Project Issue Tracker](https://github.com/AsP3X/nebular-os/issues/new).
+Do **not** exploit vulnerabilities or use them for illegal activity. See
+[Section 6.4 of the LICENSE](LICENSE).
 
 
 ## Indicative commercial terms (non-binding until agreed)
@@ -84,5 +95,6 @@ terms are negotiated case by case and may differ.
 ## Contact
 
 **Licensor:** Niklas Vorberg  
-**Commercial licensing:** [Open a GitHub issue](https://github.com/AsP3X/nebular-os/issues/new)  
+**Commercial license inquiries:** [Open a "Commercial License Request" issue](https://github.com/AsP3X/nebular-os/issues/new)  
+**Bug and security reports:** [Project Issue Tracker](https://github.com/AsP3X/nebular-os/issues/new)  
 **Community license:** [LICENSE](LICENSE) (NOCL-1.0)
