@@ -1,0 +1,539 @@
+NEBULAR OS PRIVATE NON-COMMERCIAL LICENSE
+Version 1.0 — Effective Date: 20 May 2026
+
+Copyright (c) 2026 Niklas Vorberg. All Rights Reserved.
+
+IMPORTANT — READ CAREFULLY BEFORE USING, COPYING, MODIFYING, OR DISTRIBUTING
+THIS SOFTWARE. BY ACCESSING, CLONING, DOWNLOADING, INSTALLING, COMPILING,
+LINKING TO, OR OTHERWISE USING THE SOFTWARE, YOU ACKNOWLEDGE THAT YOU HAVE
+READ THIS LICENSE, UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS. IF YOU
+DO NOT AGREE, YOU MUST NOT USE THE SOFTWARE AND MUST DELETE ALL COPIES IN
+YOUR POSSESSION OR CONTROL.
+
+This license is NOT an Open Source Initiative (OSI) approved open source
+license. The Software is source-available under the restrictive terms below.
+
+
+================================================================================
+1. PARTIES AND ACCEPTANCE
+================================================================================
+
+1.1 Licensor. "Licensor" means Niklas Vorberg, the copyright owner of the
+    Software. Contact with Licensor regarding commercial licensing, notices, or
+    other matters under this Agreement must be made by opening a GitHub issue at
+    https://github.com/AsP3X/nebular-os/issues/new (the "Licensor Issue Tracker").
+
+1.2 Licensee. "You" or "Licensee" means the individual or legal entity
+    accessing or using the Software, and any person or entity on whose behalf
+    such access or use occurs.
+
+1.3 Binding Agreement. This Nebular OS Private Non-Commercial License
+    ("Agreement" or "NOCL-1.0") is a legally binding contract between Licensor
+    and You. Your acceptance occurs upon the earliest of: (a) clicking or
+    otherwise indicating assent where such mechanism is presented; (b) cloning,
+    downloading, or receiving a copy of the Software; (c) compiling, linking to,
+    or executing the Software; or (d) using the Software in any manner.
+
+1.4 Authority. If You accept on behalf of an organization, You represent and
+    warrant that You have authority to bind that organization, and "You" refers
+    to that organization.
+
+
+================================================================================
+2. DEFINITIONS
+================================================================================
+
+2.1 "Software" means the Nebular OS computer program and all associated
+    materials distributed by Licensor under this Agreement, including without
+    limitation source code, object code, binary executables, container images,
+    documentation, configuration files, schemas, migration scripts, and any
+    corrections, updates, upgrades, or new releases that Licensor designates as
+    subject to this Agreement, unless expressly provided under separate terms.
+
+2.2 "Derivative Work" means any work based upon or incorporating the Software
+    or any portion thereof, including without limitation modifications,
+    adaptations, translations, merged or combined works, or any work whose
+    creation requires permission under applicable copyright law. For clarity,
+    a software product that statically or dynamically links to, embeds, wraps,
+    or calls into the Software (including as a Rust crate dependency) constitutes
+    a Derivative Work for purposes of this Agreement to the extent it incorporates
+    or depends upon the Software.
+
+2.3 "Distribution" means to make available, publish, disclose, transmit,
+    deliver, sublicense, sell, offer to sell, rent, lease, lend, upload,
+    post, share, or otherwise provide access to the Software or any Derivative
+    Work to any third party, whether for consideration or gratuitously, including
+    without limitation: (a) publishing source code in a public or private
+    repository accessible to anyone other than Permitted Private Recipients;
+    (b) distributing binaries, packages, or container images; (c) including
+    the Software in a product made available to third parties; (d) making the
+    Software available through a network where persons other than Permitted
+    Private Recipients may obtain or use it; or (e) any act that would constitute
+    "making available to the public" or "Veröffentlichung" under applicable
+    copyright law.
+
+2.4 "Permitted Private Recipients" means: (a) when You are a Natural Person
+    Qualifying User, only You and members of Your household; or (b) when You
+    are a Qualifying Non-Profit Organization, only Your employees, volunteers,
+    contractors, and agents who require access solely to perform work directly
+    for Your internal, non-commercial operations and who are bound by written
+    confidentiality obligations at least as protective as this Agreement.
+
+2.5 "Natural Person Qualifying User" means a human individual using the
+    Software in a personal, private, non-commercial capacity, not as an employee,
+    contractor, agent, or representative acting within the scope of employment
+    or engagement with a For-Profit Entity, and not primarily for monetary or
+    commercial advantage.
+
+2.6 "Qualifying Non-Profit Organization" means a legal entity that: (a) is
+    formally recognized as a non-profit, charitable, educational, or similar
+    not-for-profit organization under the laws of its jurisdiction of
+    incorporation or registration (including, by way of example, an organization
+    described in Section 501(c)(3) of the United States Internal Revenue Code,
+    a German gemeinnützige Organisation within the meaning of the German Fiscal
+    Code (Abgabenordnung), or an equivalent status elsewhere); (b) is not
+    organized or operated for the profit or financial benefit of private
+    shareholders, members, or partners; (c) is not controlled, directly or
+    indirectly, by a For-Profit Entity; and (d) does not operate a paid
+    proprietary product or service tier that incorporates or depends upon the
+    Software as a material component.
+
+2.7 "For-Profit Entity" means any corporation, company, partnership, limited
+    liability company, trust, association, government commercial enterprise, or
+    other legal entity organized or operated for profit or the economic benefit
+    of owners, shareholders, members, or partners, and any entity controlled
+    by such an entity, as well as any sole proprietorship or unincorporated
+    business operated for commercial advantage.
+
+2.8 "Private Use" means use of the Software solely for Licensee's own internal
+    purposes where: (a) the Software and any Derivative Work are not Distributed;
+    (b) the Software is not used to provide a Hosted Service to any person or
+    entity other than Permitted Private Recipients; (c) the Software is not used
+    to develop, test, or deliver a product or service that is Distributed or
+    offered to third parties; and (d) access credentials, endpoints, and
+    interfaces exposing the Software are not made available to the general public
+    or to any For-Profit Entity except as expressly permitted under a Commercial
+    License Agreement.
+
+2.9 "Hosted Service" means operating the Software (or a Derivative Work) on
+    one or more servers, containers, virtual machines, or cloud instances such
+    that users, applications, tenants, customers, or other third parties store,
+    retrieve, or manage data through the Software's object storage API or library
+    interfaces, whether directly or indirectly.
+
+2.10 "Commercial Use" means any use of the Software that is not Permitted Use
+     (as defined in Section 3.2), including without limitation any use by or
+     for the benefit of a For-Profit Entity; any use in connection with revenue
+     generation, fee-for-service offerings, advertising-supported services,
+     internal production infrastructure of a For-Profit Entity, consulting or
+     managed services for third parties, evaluation for potential commercial
+     deployment, benchmarking for competitive purposes, or any use intended to
+     reduce licensing costs that would otherwise apply.
+
+2.11 "Commercial License Agreement" means a separate written agreement executed
+     by Licensor and Licensee (which may be a GitHub issue thread on the Licensor
+     Issue Tracker explicitly confirmed by Licensor in writing, or a signed
+     contract) that authorizes specified Commercial Use in exchange for fees and
+     on terms set forth therein.
+
+2.12 "Permitted Use" has the meaning set forth in Section 3.2.
+
+2.13 "Licensor Reserved Rights" has the meaning set forth in Section 4.
+
+
+================================================================================
+3. LICENSE GRANT — PERMITTED USE ONLY
+================================================================================
+
+3.1 Conditional Grant. Subject to Your ongoing compliance with all terms of
+    this Agreement, Licensor grants You a limited, non-exclusive,
+    non-transferable, non-sublicensable, revocable, worldwide license to use
+    the Software only as Permitted Use.
+
+3.2 Permitted Use. "Permitted Use" means Private Use of the Software by exactly
+    one of the following qualified Licensees, and only while all qualification
+    criteria remain satisfied:
+
+    (a) Natural Person Qualifying User — You are a natural person acting in
+        a personal, private, non-commercial capacity; or
+
+    (b) Qualifying Non-Profit Organization — You are a Qualifying Non-Profit
+        Organization using the Software exclusively for Your internal
+        operations that are not Commercial Use;
+
+    AND in either case:
+
+    (c) Private — the use satisfies the definition of Private Use in Section 2.8;
+
+    (d) Non-Commercial — the use is not Commercial Use and is not primarily
+        intended for or directed toward monetary or commercial advantage; and
+
+    (e) No Distribution — You do not Distribute the Software or any Derivative
+        Work except as expressly allowed in Section 3.3.
+
+3.3 Limited Internal Sharing. A Qualifying Non-Profit Organization may permit
+    Permitted Private Recipients to access internally deployed instances solely
+    for the organization's internal Private Use, provided the organization
+    ensures compliance with this Agreement and remains liable for any breach by
+    such recipients.
+
+3.4 Scope of Permitted Use. Permitted Use explicitly includes, when all
+    qualifications in Section 3.2 are met:
+
+    (a) installing and running the Software as a self-hosted object storage
+        service on infrastructure controlled by the Licensee;
+
+    (b) compiling the Software and linking to it as a library dependency (including
+        as the `nebular_os` Rust crate) within a private application that is not
+        Distributed and is not used for Commercial Use;
+
+    (c) modifying the Software for private internal use, provided modifications
+        are not Distributed except to Licensor as contributions subject to
+        Section 10; and
+
+    (d) making a reasonable number of backup copies solely for disaster recovery
+        of Permitted Use deployments, provided such copies remain under Your
+        control and are not Distributed.
+
+3.5 No Implied Rights. Any use not expressly granted is reserved by Licensor.
+    Without limiting the foregoing, Permitted Use does NOT include Distribution,
+    Commercial Use, public open source release, inclusion in products offered
+    to third parties, Hosted Service operation for third parties, or use by
+    any For-Profit Entity (including internal use), even if such use is
+    non-public.
+
+
+================================================================================
+4. LICENSOR RESERVED RIGHTS
+================================================================================
+
+4.1 Unlimited Licensor Use. Notwithstanding any other provision of this
+    Agreement, Niklas Vorberg (Licensor) and any legal entity wholly owned and
+    controlled by Licensor may use, modify, reproduce, distribute, sublicense,
+    and commercialize the Software and Derivative Works for any purpose without
+    restriction and without payment of fees under this Agreement.
+
+4.2 Explicit Authorization. Licensor may additionally authorize specific third
+    parties in writing to use the Software outside Permitted Use on terms
+    determined solely by Licensor, including under a Commercial License Agreement
+    or a separate written waiver.
+
+4.3 Reservation of Title. The Software is licensed, not sold. Licensor retains
+    all right, title, and interest in and to the Software, including all
+    intellectual property rights therein, except for the limited license
+    expressly granted in Section 3.
+
+
+================================================================================
+5. COMMERCIAL USE — SEPARATE WRITTEN LICENSE AND FEE REQUIRED
+================================================================================
+
+5.1 Prohibition. Any Commercial Use is strictly prohibited unless expressly
+    authorized in a Commercial License Agreement executed or confirmed in
+    writing by Licensor.
+
+5.2 Required Commercial License. Without limiting Section 5.1, You must obtain
+    a Commercial License Agreement before engaging in any of the following
+    (each of which constitutes Commercial Use unless otherwise authorized in
+    writing by Licensor):
+
+    (a) any use by, for, or on behalf of a For-Profit Entity, including internal
+        development, testing, staging, and production use, whether or not public;
+
+    (b) Distribution of the Software or any Derivative Work in any form;
+
+    (c) offering the Software or a Derivative Work as a Hosted Service to any
+        third party, including single-tenant managed hosting for clients;
+
+    (d) embedding or linking the Software in a product or service that is
+        Distributed or commercially offered;
+
+    (e) providing access to the Software's functionality to customers, tenants,
+        users, or partners who are not Permitted Private Recipients; or
+
+    (f) use by an individual acting within the scope of employment or contract
+        with a For-Profit Entity, even on personal hardware, if the use relates
+        to or benefits the For-Profit Entity's activities.
+
+5.3 Commercial Licensing Process. To request a Commercial License Agreement,
+    You must open a GitHub issue at the Licensor Issue Tracker with a description
+    of the intended use, legal entity name, and contact information. Licensor has
+    sole discretion whether to offer commercial terms. No commercial license exists
+    until Licensor confirms agreement in writing (including via the GitHub issue
+    thread) and any applicable fees are paid according to the agreed terms.
+
+5.4 Fees. Unless otherwise agreed in writing, no Commercial Use is authorized
+    without payment of licensing fees as specified in the Commercial License
+    Agreement. Failure to pay fees constitutes immediate breach and termination
+    under Section 11.
+
+5.5 No Estoppel by Silence. Licensor's failure to respond to an inquiry, failure
+    to enforce this Agreement in a particular instance, or provision of information
+    about the Software does not constitute consent to Commercial Use.
+
+
+================================================================================
+6. RESTRICTIONS AND PROHIBITED CONDUCT
+================================================================================
+
+6.1 You shall not, and shall not permit any third party to:
+
+    (a) use the Software except as Permitted Use or as authorized under a
+        Commercial License Agreement;
+
+    (b) remove, alter, or obscure any copyright, trademark, or proprietary
+        notices in the Software;
+
+    (c) use Licensor's name, trademarks, logos, or branding to endorse or
+        promote products or services without prior written consent;
+
+    (d) sublicense, rent, lease, lend, sell, or transfer the Software or any
+        rights therein except as expressly permitted;
+
+    (e) use the Software in violation of applicable law, including export control,
+        sanctions, data protection, and anti-spam laws;
+
+    (f) use the Software to store, transmit, or process unlawful content or to
+        interfere with third-party systems;
+
+    (g) circumvent, disable, or interfere with technical or contractual measures
+        used to enforce this Agreement; or
+
+    (h) misrepresent Your qualification for Permitted Use or Your authorization
+        for Commercial Use.
+
+6.2 Competitive Use. Except under a Commercial License Agreement explicitly
+    permitting otherwise, You shall not use the Software to develop or offer a
+    competing object storage product or service for third parties.
+
+6.3 No OSS Conversion. You shall not relicense, release, or contribute the
+    Software or any Derivative Work under an open source license, "copyleft"
+    license, or any license that would grant third parties rights broader than
+    Permitted Use, except with Licensor's prior written consent.
+
+
+================================================================================
+7. OWNERSHIP AND INTELLECTUAL PROPERTY
+================================================================================
+
+7.1 Licensor Ownership. Licensor owns all copyrights, trade secrets, and other
+    intellectual property rights in the Software, except for third-party
+    components identified in NOTICE or accompanying documentation, which remain
+    subject to their respective licenses.
+
+7.2 No Assignment. Nothing in this Agreement assigns or transfers ownership of
+    any intellectual property to You.
+
+7.3 Feedback. If You provide suggestions, bug reports, or feedback regarding
+    the Software, Licensor may use them without restriction or compensation,
+    and You grant Licensor a perpetual, irrevocable, worldwide, royalty-free
+    license to use and incorporate such feedback.
+
+7.4 Third-Party Components. The Software may include third-party open source
+    components licensed under separate terms. Your use of such components is
+    governed by those separate licenses in addition to this Agreement to the
+    extent applicable. In case of conflict regarding such third-party components,
+    the third-party license governs only those components.
+
+
+================================================================================
+8. SOURCE AVAILABILITY AND REPOSITORY ACCESS
+================================================================================
+
+8.1 Public Repository Disclaimer. If Licensor makes the Software available in
+    a public source code repository, such availability is for transparency and
+    does not grant any rights beyond those expressly stated in this Agreement.
+    Cloning or viewing a public repository constitutes acceptance of this
+    Agreement.
+
+8.2 No Right to Fork Publicly. Creating a public fork, mirror, or republishing
+    of the Software constitutes Distribution and is prohibited unless authorized
+    under a Commercial License Agreement or Section 4.
+
+8.3 Dependency Resolution Tools. Use of package managers, build tools, or CI
+    systems to fetch the Software for a project does not expand Your rights.
+    The qualification of the consuming project (private non-profit vs commercial)
+    determines whether such use is Permitted Use.
+
+
+================================================================================
+9. TRADEMARKS
+================================================================================
+
+9.1 No trademark license is granted. "Nebular OS", "nebular-os", and associated
+    logos are the property of Licensor. You may not use them except for factual,
+    non-misleading reference identifying the unmodified Software in compliance
+    with this Agreement, or with Licensor's prior written consent.
+
+
+================================================================================
+10. CONTRIBUTIONS
+================================================================================
+
+10.1 If You submit patches, pull requests, or other contributions to a
+     repository controlled by Licensor, You represent that You have the right to
+     submit such contributions and You grant Licensor a perpetual, worldwide,
+     irrevocable, royalty-free, fully paid-up, transferable, sublicensable
+     license to use, reproduce, modify, distribute, and commercialize the
+     contributions as part of or separate from the Software without obligation
+     to You.
+
+10.2 Contributions do not entitle the contributor to broader use rights than
+     this Agreement provides unless Licensor agrees otherwise in writing.
+
+
+================================================================================
+11. TERM AND TERMINATION
+================================================================================
+
+11.1 Term. This Agreement is effective upon acceptance and continues until
+     terminated.
+
+11.2 Termination for Breach. Licensor may terminate this Agreement immediately
+     upon notice if You breach any term. Termination is automatic upon commencement
+     of Commercial Use without a Commercial License Agreement.
+
+11.3 Effect of Termination. Upon termination, all licenses granted to You end
+     immediately. You must cease all use of the Software, destroy all copies
+     (including backups) in Your possession or control, and certify destruction
+     upon Licensor's request, except that copies retained solely as required by
+     applicable law must remain subject to the confidentiality and non-use
+     obligations of this Agreement.
+
+11.4 Survival. Sections 2 (Definitions, to the extent needed to interpret
+     surviving provisions), 4 (Licensor Reserved Rights), 5 (to the extent of
+     accrued obligations), 6.1(h), 7, 9, 10, 11.3, 11.4, 12, 13, 14, and 15
+     survive termination.
+
+
+================================================================================
+12. DISCLAIMER OF WARRANTIES
+================================================================================
+
+12.1 THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE," WITH ALL FAULTS AND
+     WITHOUT WARRANTY OF ANY KIND.
+
+12.2 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, LICENSOR DISCLAIMS ALL
+     WARRANTIES, WHETHER EXPRESS, IMPLIED, STATUTORY, OR OTHERWISE, INCLUDING
+     WITHOUT LIMITATION WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+     PURPOSE, TITLE, NON-INFRINGEMENT, QUIET ENJOYMENT, ACCURACY, AND THAT THE
+     SOFTWARE WILL BE UNINTERRUPTED, ERROR-FREE, SECURE, OR FREE OF HARMFUL
+     COMPONENTS.
+
+12.3 YOU ASSUME ALL RISK ARISING FROM USE OF THE SOFTWARE. LICENSOR DOES NOT
+     WARRANT THAT THE SOFTWARE WILL MEET YOUR REQUIREMENTS OR THAT DEFECTS WILL
+     BE CORRECTED.
+
+
+================================================================================
+13. LIMITATION OF LIABILITY
+================================================================================
+
+13.1 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, IN NO EVENT SHALL
+     LICENSOR BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL,
+     EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR ANY LOSS OF PROFITS, REVENUE, DATA,
+     GOODWILL, BUSINESS INTERRUPTION, OR PROCUREMENT OF SUBSTITUTE GOODS OR
+     SERVICES, ARISING OUT OF OR RELATED TO THIS AGREEMENT OR THE SOFTWARE,
+     WHETHER BASED ON WARRANTY, CONTRACT, TORT (INCLUDING NEGLIGENCE), STRICT
+     LIABILITY, OR ANY OTHER THEORY, EVEN IF LICENSOR HAS BEEN ADVISED OF THE
+     POSSIBILITY OF SUCH DAMAGES.
+
+13.2 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, LICENSOR'S TOTAL
+     AGGREGATE LIABILITY ARISING OUT OF OR RELATED TO THIS AGREEMENT OR THE
+     SOFTWARE SHALL NOT EXCEED THE GREATER OF: (a) ONE HUNDRED EUROS (EUR 100);
+     OR (b) THE AMOUNT PAID BY YOU TO LICENSOR UNDER A COMMERCIAL LICENSE
+     AGREEMENT IN THE TWELVE (12) MONTHS PRECEDING THE CLAIM.
+
+13.3 Mandatory Law. Nothing in this Agreement excludes or limits liability that
+     cannot be excluded or limited under applicable law, including liability
+     for fraud, intentional misconduct, or death or personal injury caused by
+     negligence where such exclusion is prohibited.
+
+
+================================================================================
+14. INDEMNIFICATION
+================================================================================
+
+14.1 You shall defend, indemnify, and hold harmless Licensor from and against
+     any third-party claims, damages, losses, liabilities, costs, and expenses
+     (including reasonable attorneys' fees) arising out of or related to: (a) Your
+     use of the Software outside Permitted Use; (b) Your breach of this Agreement;
+     (c) Your violation of law; or (d) content or data You store or process using
+     the Software, except to the extent caused by Licensor's intentional
+     misconduct.
+
+
+================================================================================
+15. GENERAL PROVISIONS
+================================================================================
+
+15.1 Governing Law. This Agreement is governed by the laws of the Federal
+     Republic of Germany, excluding its conflict-of-law rules and the United
+     Nations Convention on Contracts for the International Sale of Goods (CISG).
+
+15.2 Venue. Subject to mandatory consumer protection provisions that may apply
+     to Natural Person Qualifying Users, the exclusive place of jurisdiction for
+     all disputes arising out of or in connection with this Agreement shall be
+     the courts of Berlin, Germany. Licensor may additionally seek injunctive
+     or equitable relief in any competent jurisdiction.
+
+15.3 Entire Agreement. This Agreement constitutes the entire agreement between
+     the parties regarding the Software and supersedes all prior or contemporaneous
+     understandings on that subject, except for a duly executed Commercial License
+     Agreement which supplements or replaces the commercial terms for the scope
+     specified therein.
+
+15.4 Severability. If any provision is held invalid or unenforceable, the
+     remaining provisions remain in full force and effect, and the invalid
+     provision shall be reformed to the minimum extent necessary to make it
+     valid and enforceable while preserving the parties' intent.
+
+15.5 No Waiver. Failure to enforce any provision is not a waiver of that or any
+     other provision.
+
+15.6 Assignment. You may not assign or transfer this Agreement or any rights or
+     obligations hereunder without Licensor's prior written consent. Any attempted
+     assignment in violation of this section is void. Licensor may assign this
+     Agreement freely.
+
+15.7 Export Compliance. You shall comply with all applicable export control and
+     sanctions laws and shall not export or re-export the Software to prohibited
+     jurisdictions or parties.
+
+15.8 Notices. Notices to Licensor must be submitted by opening a GitHub issue at
+     the Licensor Issue Tracker. Notices to You may be sent via the GitHub issue
+     thread You opened, contact information You provide in that issue, or via the
+     repository where the Software is made available.
+
+15.9 Interpretation. Section headings are for convenience only. "Including" means
+     "including without limitation." The terms of this Agreement apply to the
+     maximum extent permitted by applicable law.
+
+15.10 Language. This Agreement is drafted in English. Any translation is provided
+      for convenience only; the English version controls.
+
+
+================================================================================
+16. SUMMARY OF PERMITTED USE (NON-BINDING)
+================================================================================
+
+This summary is for convenience only and does not modify the binding terms above.
+
+  FREE (NO COMMERCIAL LICENSE REQUIRED):
+    - Private, non-commercial use by an individual in a personal capacity
+    - Private, internal use by a registered non-profit organization that is
+      not controlled by a for-profit entity
+    - Running as self-hosted storage or using as a library dependency, provided
+      the use is private, non-commercial, and not distributed
+
+  REQUIRES WRITTEN COMMERCIAL LICENSE AND FEE:
+    - Any use by or for a for-profit company (including internal/private repos)
+    - Public distribution, open source release, or public forks
+    - Hosted services for third parties, clients, or customers
+    - Products or services that incorporate or expose the Software to third parties
+
+  UNRESTRICTED:
+    - Niklas Vorberg (Licensor) and entities wholly owned and controlled by Licensor
+
+For commercial licensing, open a GitHub issue at:
+https://github.com/AsP3X/nebular-os/issues/new

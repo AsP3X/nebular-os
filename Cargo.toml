@@ -2,6 +2,11 @@
 name = "nebular-os"
 version = "0.1.0"
 edition = "2024"
+authors = ["Niklas Vorberg"]
+license = "LicenseRef-NOCL-1.0"
+license-file = "LICENSE"
+description = "Standalone self-hosted object storage with an S3-like HTTP API"
+repository = "https://github.com/AsP3X/nebular-os"
 
 [dependencies]
 axum = "0.8"

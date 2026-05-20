@@ -1,5 +1,9 @@
 # Nebular OS
 
+> **License:** Source-available under [NOCL-1.0](LICENSE) — free only for
+> **private, non-profit** use. Commercial and for-profit use requires a
+> [commercial license](COMMERCIAL-LICENSE.md).
+
 Standalone, self-hosted object storage with an S3-like HTTP API. Blobs live on disk; metadata is tracked in SQLite. JWT auth uses the same `Claims` shape as typical Aurora-style backends (`sub`, `email`, `role`, `exp`, `iat`).
 
 Originally developed as `nebula-os` inside the [Aurora](https://github.com/) monorepo; this repository is the extracted, independently versioned crate.
@@ -65,7 +69,7 @@ See [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
 
 ```toml
 [dependencies]
-nebular-os = { git = "https://github.com/YOUR_ORG/nebular-os.git", tag = "v0.1.0" }
+nebular-os = { git = "https://github.com/AsP3X/nebular-os.git", tag = "v0.1.0" }
 ```
 
 **Path (local development):**
@@ -108,4 +112,37 @@ docker run --rm -p 9000:9000 \
 
 ## License
 
-See repository license file when added.
+**Nebular OS is source-available, not open source.** It is licensed under the
+[Nebular OS Private Non-Commercial License (NOCL-1.0)](LICENSE).
+
+### Free use (no fee)
+
+You may use Nebular OS **without a commercial license** only when **all** of the
+following apply:
+
+- **Private** — not distributed, not published as open source, not offered as a
+  hosted service to third parties, and not embedded in a product offered to others
+- **Non-profit** — you are an individual in a personal, non-commercial capacity,
+  or a registered non-profit organization not controlled by a for-profit entity
+- **Non-commercial** — not primarily for monetary or commercial advantage
+
+This covers self-hosted deployment and use as a Rust library dependency (`nebular_os`)
+in qualifying private projects.
+
+### Commercial license required
+
+Any other use requires a **written Commercial License Agreement** and **fee**,
+including but not limited to:
+
+- Use by or for a **for-profit company** (even internal/private repositories)
+- **Distribution** (public forks, packages, binaries, open source release)
+- **Hosted services** for customers, tenants, or users
+- Products or services that incorporate or expose Nebular OS to third parties
+
+See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) and
+[open a GitHub issue](https://github.com/AsP3X/nebular-os/issues/new).
+
+### Licensor
+
+Niklas Vorberg retains unrestricted rights to the Software. Copyright notice:
+[NOTICE](NOTICE).

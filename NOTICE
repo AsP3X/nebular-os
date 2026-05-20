@@ -1,0 +1,14 @@
+Nebular OS
+Copyright (c) 2026 Niklas Vorberg. All Rights Reserved.
+
+This software is licensed under the Nebular OS Private Non-Commercial License
+(NOCL-1.0). See the LICENSE file in this repository for the full terms.
+
+Commercial use, distribution, and for-profit use require a separate written
+Commercial License Agreement from the Licensor. See COMMERCIAL-LICENSE.md.
+
+Contact: open a GitHub issue at https://github.com/AsP3X/nebular-os/issues/new
+
+Third-party components included in this software may be subject to separate
+license terms. See dependency manifests (Cargo.toml, Cargo.lock) and upstream
+project licenses for details.
