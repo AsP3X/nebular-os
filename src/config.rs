@@ -10,6 +10,7 @@ pub struct NosConfig {
     pub jwt_secret: String,
     pub signing_secret: Option<String>,
     pub max_body_size: usize,
+    pub upload_buffer_size: usize,
     pub allow_public_read: bool,
 }
 
@@ -22,6 +23,7 @@ impl fmt::Debug for NosConfig {
             .field("jwt_secret", &"[REDACTED]")
             .field("signing_secret", &"[REDACTED]")
             .field("max_body_size", &self.max_body_size)
+            .field("upload_buffer_size", &self.upload_buffer_size)
             .field("allow_public_read", &self.allow_public_read)
             .finish()
     }
@@ -41,6 +43,14 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_MAX_BODY_SIZE must be a valid usize"))
                 .transpose()?
                 .unwrap_or(104_857_600),
+            upload_buffer_size: env::var("NOS_UPLOAD_BUFFER_SIZE")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_UPLOAD_BUFFER_SIZE must be a valid usize")
+                })
+                .transpose()?
+                .unwrap_or(256 * 1024),
             allow_public_read: env::var("NOS_ALLOW_PUBLIC_READ")
                 .ok()
                 .map(|s| s.eq_ignore_ascii_case("true") || s == "1")

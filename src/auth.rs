@@ -1,17 +1,18 @@
 use axum::{
-    extract::Request,
-    http::StatusCode,
+    extract::{Request, State},
+    http::{header, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
-use axum::http::header;
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
 use std::sync::Arc;
+
+use crate::routes::AppState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -39,7 +40,13 @@ type HmacSha256 = Hmac<Sha256>;
 /// Generates a presigned URL signature.
 /// The signed payload format is: "{METHOD}\n{bucket}\n{key}\n{expires}"
 /// Keys must not contain newlines (enforced by sanitize_key).
-pub fn generate_signature(method: &str, secret: &str, bucket: &str, key: &str, expires: u64) -> anyhow::Result<String> {
+pub fn generate_signature(
+    method: &str,
+    secret: &str,
+    bucket: &str,
+    key: &str,
+    expires: u64,
+) -> anyhow::Result<String> {
     let payload = format!("{}\n{}\n{}\n{}", method.to_uppercase(), bucket, key, expires);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes())?;
     mac.update(payload.as_bytes());
@@ -58,7 +65,14 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     result == 0
 }
 
-pub fn verify_signature(method: &str, secret: &str, bucket: &str, key: &str, expires: u64, signature: &str) -> bool {
+pub fn verify_signature(
+    method: &str,
+    secret: &str,
+    bucket: &str,
+    key: &str,
+    expires: u64,
+    signature: &str,
+) -> bool {
     let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_secs(),
         Err(_) => return false,
@@ -73,16 +87,38 @@ pub fn verify_signature(method: &str, secret: &str, bucket: &str, key: &str, exp
     constant_time_eq(signature, &expected)
 }
 
+/// True for object GET/HEAD paths (`/{bucket}/{key}`), not bucket list or system routes.
+fn is_public_object_read(req: &Request) -> bool {
+    let method = req.method();
+    if method != Method::GET && method != Method::HEAD {
+        return false;
+    }
+    let path = req.uri().path().trim_start_matches('/');
+    if path == "health" || path == "metrics" {
+        return false;
+    }
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    segments.len() >= 2
+}
+
 pub async fn presigned_or_jwt_middleware(
-    jwt_secret: Arc<JwtSecret>,
-    signing_secret: Option<Arc<String>>,
+    State(state): State<Arc<AppState>>,
     mut req: Request,
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
 
-    // Try JWT first
+    // Human: Public-read mode allows unauthenticated GET/HEAD on objects only.
+    // Agent: READS allow_public_read; BYPASS auth for GET|HEAD with >=2 path segments; LIST /{bucket} still requires JWT/presigned.
+    if state.allow_public_read && is_public_object_read(&req) {
+        tracing::info!(%path, %method, "public read accepted");
+        return next.run(req).await;
+    }
+
+    let jwt_secret = state.jwt_secret.clone();
+    let signing_secret = state.signing_secret.clone();
+
     let auth_header = req
         .headers()
         .get("authorization")
@@ -109,7 +145,6 @@ pub async fn presigned_or_jwt_middleware(
         }
     }
 
-    // Fallback to presigned URL
     let Some(secret) = signing_secret else {
         tracing::warn!(%path, %method, "auth failed: no signing_secret configured and no valid JWT");
         return unauthorized();
@@ -134,7 +169,7 @@ pub async fn presigned_or_jwt_middleware(
 
     let path_segments = req.uri().path();
     let segments: Vec<&str> = path_segments.trim_start_matches('/').splitn(2, '/').collect();
-    let bucket = segments.get(0).copied().unwrap_or("");
+    let bucket = segments.first().copied().unwrap_or("");
     let key = segments.get(1).copied().unwrap_or("");
 
     let bucket = urlencoding::decode(bucket).unwrap_or_else(|_| bucket.into());

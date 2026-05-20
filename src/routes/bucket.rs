@@ -1,11 +1,9 @@
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
-use serde_json::json;
 use std::sync::Arc;
 
 use crate::routes::AppState;
@@ -42,11 +40,7 @@ pub async fn list_objects(
         }
         Err(e) => {
             tracing::error!(%bucket, error = %e, "list_objects failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": e.to_string()})),
-            )
-                .into_response()
+            crate::routes::errors::map_storage_error(e).into_response()
         }
     }
 }

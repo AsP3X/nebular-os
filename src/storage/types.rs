@@ -25,6 +25,12 @@ pub struct ListItem {
 #[derive(Debug, Clone, Serialize)]
 pub struct ListResult {
     pub items: Vec<ListItem>,
+    /// Folder-like prefixes when `delimiter` is set (S3-style `CommonPrefixes`).
+    pub common_prefixes: Vec<String>,
     pub prefix: Option<String>,
     pub delimiter: Option<String>,
+    /// True when more keys exist beyond this page.
+    pub is_truncated: bool,
+    /// Pass as `start_after` on the next list request when `is_truncated` is true.
+    pub next_start_after: Option<String>,
 }
