@@ -1,6 +1,11 @@
 pub mod engine;
 pub mod error;
+pub mod multipart;
+pub mod range;
+pub mod reconcile;
 pub mod types;
+
+pub use engine::{GetObjectOutcome, StorageEngine};
 
 use std::path::PathBuf;
 
