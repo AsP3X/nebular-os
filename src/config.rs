@@ -15,6 +15,11 @@ pub struct NosConfig {
     pub reconcile_on_startup: bool,
     pub reconcile_interval_secs: u64,
     pub soft_delete_ttl_secs: i64,
+    pub soft_delete_drop_blob: bool,
+    pub multipart_upload_ttl_secs: i64,
+    pub recompress_on_startup: bool,
+    pub recompress_interval_secs: u64,
+    pub recompress_batch_size: usize,
     pub metrics_token: Option<String>,
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
@@ -38,6 +43,11 @@ impl fmt::Debug for NosConfig {
             .field("reconcile_on_startup", &self.reconcile_on_startup)
             .field("reconcile_interval_secs", &self.reconcile_interval_secs)
             .field("soft_delete_ttl_secs", &self.soft_delete_ttl_secs)
+            .field("soft_delete_drop_blob", &self.soft_delete_drop_blob)
+            .field("multipart_upload_ttl_secs", &self.multipart_upload_ttl_secs)
+            .field("recompress_on_startup", &self.recompress_on_startup)
+            .field("recompress_interval_secs", &self.recompress_interval_secs)
+            .field("recompress_batch_size", &self.recompress_batch_size)
             .field("metrics_token", &self.metrics_token.as_ref().map(|_| "[REDACTED]"))
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("rate_limit_burst", &self.rate_limit_burst)
@@ -90,6 +100,32 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_SOFT_DELETE_TTL_SECS must be a valid i64"))
                 .transpose()?
                 .unwrap_or(86_400),
+            soft_delete_drop_blob: env::var("NOS_SOFT_DELETE_DROP_BLOB")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(false),
+            multipart_upload_ttl_secs: env::var("NOS_MULTIPART_UPLOAD_TTL_SECS")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_MULTIPART_UPLOAD_TTL_SECS must be a valid i64")
+                })
+                .transpose()?
+                .unwrap_or(86_400),
+            recompress_on_startup: env::var("NOS_RECOMPRESS_ON_STARTUP")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(false),
+            recompress_interval_secs: env::var("NOS_RECOMPRESS_INTERVAL_SECS")
+                .ok()
+                .map(|s| s.parse().context("NOS_RECOMPRESS_INTERVAL_SECS must be a valid u64"))
+                .transpose()?
+                .unwrap_or(0),
+            recompress_batch_size: env::var("NOS_RECOMPRESS_BATCH_SIZE")
+                .ok()
+                .map(|s| s.parse().context("NOS_RECOMPRESS_BATCH_SIZE must be a valid usize"))
+                .transpose()?
+                .unwrap_or(100),
             metrics_token: env::var("NOS_METRICS_TOKEN").ok().filter(|s| !s.is_empty()),
             rate_limit_rps: env::var("NOS_RATE_LIMIT_RPS")
                 .ok()

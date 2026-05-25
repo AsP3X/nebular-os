@@ -47,6 +47,11 @@ fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<N
         reconcile_on_startup: false,
         reconcile_interval_secs: 0,
         soft_delete_ttl_secs: 86_400,
+        soft_delete_drop_blob: false,
+        multipart_upload_ttl_secs: 86_400,
+        recompress_on_startup: false,
+        recompress_interval_secs: 0,
+        recompress_batch_size: 100,
         metrics_token: None,
         rate_limit_rps: 0,
         rate_limit_burst: 50,
@@ -72,10 +77,8 @@ async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (
         &data_dir_str,
         EngineOptions {
             upload_buffer_size: 64 * 1024,
-            list_scan_cap: 4096,
-            multipart_part_size: 8 * 1024 * 1024,
-            soft_delete_ttl_secs: 86_400,
             read_pool_size: 2,
+            ..EngineOptions::default()
         },
     )
     .await
@@ -482,10 +485,8 @@ async fn test_payload_too_large_returns_413() {
         &data_dir_str,
         EngineOptions {
             upload_buffer_size: 4096,
-            list_scan_cap: 4096,
-            multipart_part_size: 8 * 1024 * 1024,
-            soft_delete_ttl_secs: 86_400,
             read_pool_size: 2,
+            ..EngineOptions::default()
         },
     )
     .await
@@ -792,10 +793,8 @@ async fn test_metrics_requires_token_when_configured() {
         &data_dir_str,
         EngineOptions {
             upload_buffer_size: 64 * 1024,
-            list_scan_cap: 4096,
-            multipart_part_size: 8 * 1024 * 1024,
-            soft_delete_ttl_secs: 86_400,
             read_pool_size: 2,
+            ..EngineOptions::default()
         },
     )
     .await
@@ -826,4 +825,167 @@ async fn test_metrics_requires_token_when_configured() {
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(text.contains("nos_objects_total"));
+}
+
+async fn setup_engine(opts: EngineOptions) -> (StorageEngine, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("blobs");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
+    let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
+    let storage = StorageEngine::with_full_options(&meta_path_str, &data_dir_str, opts)
+        .await
+        .unwrap();
+    (storage, tmp)
+}
+
+#[tokio::test]
+async fn test_hard_delete_reclaims_blob_immediately() {
+    use nebular_os::storage::blob_path;
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        soft_delete_ttl_secs: 0,
+        ..EngineOptions::default()
+    })
+    .await;
+
+    let data_dir = tmp.path().join("blobs");
+    let mut body = std::io::Cursor::new(b"ephemeral");
+    storage
+        .put_object("music", "tmp.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    let path = blob_path(&data_dir.to_string_lossy(), "music", "tmp.bin");
+    assert!(path.exists());
+
+    storage.delete_object("music", "tmp.bin").await.unwrap();
+    assert!(!path.exists());
+    assert!(!storage.object_exists("music", "tmp.bin").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_soft_delete_drop_blob_removes_file() {
+    use nebular_os::storage::blob_path;
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        soft_delete_drop_blob: true,
+        ..EngineOptions::default()
+    })
+    .await;
+
+    let data_dir = tmp.path().join("blobs");
+    let mut body = std::io::Cursor::new(b"drop-me");
+    storage
+        .put_object("music", "gone.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    let path = blob_path(&data_dir.to_string_lossy(), "music", "gone.bin");
+    storage.delete_object("music", "gone.bin").await.unwrap();
+    assert!(!path.exists());
+    assert!(!storage.object_exists("music", "gone.bin").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_purge_stale_multipart_uploads() {
+    let (storage, tmp) = setup_engine(EngineOptions {
+        multipart_upload_ttl_secs: 3_600,
+        ..EngineOptions::default()
+    })
+    .await;
+
+    let init = storage
+        .init_multipart("music", "stale.bin", None)
+        .await
+        .unwrap();
+    let upload_id = init.upload_id.clone();
+    let part_dir = tmp.path().join("blobs").join(".multipart").join(&upload_id);
+    assert!(part_dir.exists());
+
+    let stale = chrono::Utc::now().timestamp() - 7_200;
+    sqlx::query("UPDATE multipart_uploads SET created_at = ? WHERE upload_id = ?")
+        .bind(stale)
+        .bind(&upload_id)
+        .execute(storage.write_pool())
+        .await
+        .unwrap();
+
+    let purged = storage.purge_stale_multipart_uploads().await.unwrap();
+    assert_eq!(purged, 1);
+    assert!(!part_dir.exists());
+}
+
+#[tokio::test]
+async fn test_recompress_legacy_raw_blob() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::is_compressed_blob;
+
+    let (storage, tmp) = setup_engine(EngineOptions::default()).await;
+    let logical = b"legacy raw payload ".repeat(200);
+    let mut body = std::io::Cursor::new(&logical[..]);
+    storage
+        .put_object("music", "legacy.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    let path = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "legacy.bin",
+    );
+    std::fs::write(&path, &logical[..]).unwrap();
+    assert!(!is_compressed_blob(&std::fs::read(&path).unwrap()));
+
+    let report = storage.recompress_legacy_blobs(10).await.unwrap();
+    assert_eq!(report.recompressed, 1);
+    let on_disk = std::fs::read(&path).unwrap();
+    assert!(is_compressed_blob(&on_disk));
+    assert!(on_disk.len() < logical.len());
+
+    let outcome = storage
+        .get_object("music", "legacy.bin", None, None, None)
+        .await
+        .unwrap();
+    match outcome {
+        nebular_os::storage::GetObjectOutcome::Content { stream, .. } => {
+            let bytes = axum::body::to_bytes(
+                axum::body::Body::from_stream(stream),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes.as_ref(), &logical[..]);
+        }
+        _ => panic!("expected content"),
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_copy_object_shares_storage_via_hard_link() {
+    use nebular_os::storage::blob_ops::same_inode;
+    use nebular_os::storage::blob_path;
+
+    let (storage, tmp) = setup_engine(EngineOptions::default()).await;
+    let data_dir = tmp.path().join("blobs");
+    let mut body = std::io::Cursor::new(b"shared-bytes");
+    storage
+        .put_object("music", "original.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    storage
+        .copy_object("music", "original.bin", "music", "copy.bin")
+        .await
+        .unwrap();
+
+    let src = blob_path(&data_dir.to_string_lossy(), "music", "original.bin");
+    let dst = blob_path(&data_dir.to_string_lossy(), "music", "copy.bin");
+    assert!(same_inode(&src, &dst));
+
+    storage.delete_object("music", "copy.bin").await.unwrap();
+    assert!(src.exists());
+    assert!(storage.object_exists("music", "original.bin").await.unwrap());
 }

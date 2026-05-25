@@ -35,7 +35,12 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_ALLOW_PUBLIC_READ` | Allow unauthenticated GET/HEAD on `/{bucket}/{key}` when `true` (default `false`) |
 | `NOS_RECONCILE_ON_STARTUP` | Run metadata/blob reconciliation at boot (default `false`) |
 | `NOS_RECONCILE_INTERVAL_SECS` | Periodic reconciliation interval; `0` disables (default `0`) |
-| `NOS_SOFT_DELETE_TTL_SECS` | Seconds before purging soft-deleted objects (default `86400`) |
+| `NOS_SOFT_DELETE_TTL_SECS` | Seconds before purging soft-deleted metadata; `0` hard-deletes immediately (default `86400`) |
+| `NOS_SOFT_DELETE_DROP_BLOB` | Remove blob file on soft-delete while keeping tombstone until TTL (default `false`) |
+| `NOS_MULTIPART_UPLOAD_TTL_SECS` | Purge abandoned multipart sessions after this many seconds (default `86400`; `0` disables) |
+| `NOS_RECOMPRESS_ON_STARTUP` | Re-compress legacy raw blobs at boot (default `false`) |
+| `NOS_RECOMPRESS_INTERVAL_SECS` | Periodic legacy blob recompression interval; `0` disables (default `0`) |
+| `NOS_RECOMPRESS_BATCH_SIZE` | Max objects scanned per recompression pass (default `100`) |
 | `NOS_METRICS_TOKEN` | Bearer token required for `/metrics` when set |
 | `NOS_RATE_LIMIT_RPS` | Per-IP request limit; `0` disables (default `0`) |
 | `NOS_RATE_LIMIT_BURST` | Burst size for rate limiting (default `50`) |
@@ -54,7 +59,7 @@ See [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
 | `PUT` | `/:bucket/*key` | Bearer JWT | Stream upload; `x-nd-copy-source` for server-side copy |
 | `GET` | `/:bucket/*key` | Bearer JWT or presigned query | Download (`Range`, `If-None-Match`, suffix ranges) |
 | `HEAD` | `/:bucket/*key` | Bearer JWT | Metadata + `x-nd-custom-meta-*` headers |
-| `DELETE` | `/:bucket/*key` | Bearer JWT | Soft delete (purged after TTL) |
+| `DELETE` | `/:bucket/*key` | Bearer JWT | Soft delete (or hard delete when TTL is `0`) |
 | `GET` | `/:bucket` | Bearer JWT | List objects with pagination + delimiter prefixes |
 | `POST` | `/:bucket/_multipart?key=...` | Bearer JWT | Init multipart upload |
 | `PUT` | `/:bucket/_multipart/{upload_id}/parts/{n}` | Bearer JWT | Upload part |

@@ -1,12 +1,15 @@
+pub mod blob_ops;
 pub mod compression;
 pub mod engine;
 pub mod error;
+pub mod maintenance;
 pub mod multipart;
 pub mod range;
 pub mod reconcile;
 pub mod types;
 
 pub use engine::{GetObjectOutcome, StorageEngine};
+pub use maintenance::RecompressReport;
 
 use std::path::PathBuf;
 

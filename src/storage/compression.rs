@@ -26,6 +26,16 @@ pub fn compress_blob(uncompressed: &[u8]) -> Result<Vec<u8>, StorageError> {
     Ok(out)
 }
 
+// Human: Pick zstd-wrapped storage when smaller than raw; otherwise keep bytes unwrapped for incompressible payloads.
+// Agent: CALLS compress_blob; IF compressed.len < raw.len THEN NOSZ ELSE raw Vec (no header).
+pub fn encode_blob_for_storage(uncompressed: &[u8]) -> Result<Vec<u8>, StorageError> {
+    let compressed = compress_blob(uncompressed)?;
+    if compressed.len() < uncompressed.len() {
+        Ok(compressed)
+    } else {
+        Ok(uncompressed.to_vec())
+    }
+}
 // Human: Turn on-disk bytes back into the original object payload, or pass through legacy raw blobs unchanged.
 // Agent: IF magic NOSZ THEN zstd decode and verify len==expected_size ELSE return data as-is (pre-compression objects).
 pub fn decompress_blob(blob: &[u8], expected_size: u64) -> Result<Vec<u8>, StorageError> {
@@ -77,9 +87,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_object_roundtrip() {
-        let blob = compress_blob(&[]).unwrap();
-        let restored = decompress_blob(&blob, 0).unwrap();
-        assert!(restored.is_empty());
+    fn incompressible_payload_stays_raw() {
+        let payload = b"x".to_vec();
+        let compressed = compress_blob(&payload).unwrap();
+        assert!(compressed.len() > payload.len());
+        let stored = encode_blob_for_storage(&payload).unwrap();
+        assert!(!is_compressed_blob(&stored));
+        assert_eq!(stored, payload);
     }
 }

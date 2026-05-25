@@ -31,6 +31,9 @@ async fn main() -> Result<()> {
             list_scan_cap: cfg.list_scan_cap,
             multipart_part_size: cfg.multipart_part_size,
             soft_delete_ttl_secs: cfg.soft_delete_ttl_secs,
+            soft_delete_drop_blob: cfg.soft_delete_drop_blob,
+            multipart_upload_ttl_secs: cfg.multipart_upload_ttl_secs,
+            recompress_batch_size: cfg.recompress_batch_size,
             read_pool_size: cfg.read_pool_size,
         },
     )
@@ -40,6 +43,13 @@ async fn main() -> Result<()> {
     if cfg.reconcile_on_startup {
         let report = storage.reconcile().await?;
         tracing::info!(?report, "Startup reconciliation finished");
+    }
+
+    if cfg.recompress_on_startup {
+        let report = storage
+            .recompress_legacy_blobs(cfg.recompress_batch_size)
+            .await?;
+        tracing::info!(?report, "Startup legacy blob recompression finished");
     }
 
     if cfg.reconcile_interval_secs > 0 {
@@ -57,20 +67,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    if cfg.soft_delete_ttl_secs > 0 {
-        let engine = storage.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(300));
-            loop {
-                ticker.tick().await;
-                match engine.purge_soft_deleted().await {
-                    Ok(n) if n > 0 => tracing::info!(purged = n, "Soft-delete purge completed"),
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "Soft-delete purge failed"),
-                }
-            }
-        });
-    }
+    spawn_storage_maintenance(storage.clone(), cfg.clone());
 
     let app = server::create_app(storage, cfg.clone()).await?;
 
@@ -79,4 +76,48 @@ async fn main() -> Result<()> {
 
     serve(listener, app).await?;
     Ok(())
+}
+
+fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::NosConfig>) {
+    let purge_soft = cfg.soft_delete_ttl_secs > 0;
+    let purge_multipart = cfg.multipart_upload_ttl_secs > 0;
+    let recompress = cfg.recompress_interval_secs > 0;
+    if !purge_soft && !purge_multipart && !recompress {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            ticker.tick().await;
+            if purge_soft {
+                match storage.purge_soft_deleted().await {
+                    Ok(n) if n > 0 => tracing::info!(purged = n, "Soft-delete purge completed"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "Soft-delete purge failed"),
+                }
+            }
+            if purge_multipart {
+                match storage.purge_stale_multipart_uploads().await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(purged = n, "Stale multipart upload purge completed")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "Stale multipart upload purge failed"),
+                }
+            }
+            if recompress {
+                match storage
+                    .recompress_legacy_blobs(cfg.recompress_batch_size)
+                    .await
+                {
+                    Ok(report) if report.recompressed > 0 => {
+                        tracing::info!(?report, "Periodic legacy blob recompression finished")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "Legacy blob recompression failed"),
+                }
+            }
+        }
+    });
 }

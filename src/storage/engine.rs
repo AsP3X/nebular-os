@@ -8,7 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use xxhash_rust::xxh3::Xxh3;
 
-use super::compression::{compress_blob, decompress_blob};
+use super::blob_ops::link_or_copy_blob;
+use super::compression::{decompress_blob, encode_blob_for_storage};
 use super::error::{internal, map_io_error, StorageError};
 use super::range::parse_content_range;
 use super::types::{ListItem, ListResult, ObjectMetadata};
@@ -42,7 +43,25 @@ pub struct EngineOptions {
     pub list_scan_cap: i64,
     pub multipart_part_size: usize,
     pub soft_delete_ttl_secs: i64,
+    pub soft_delete_drop_blob: bool,
+    pub multipart_upload_ttl_secs: i64,
+    pub recompress_batch_size: usize,
     pub read_pool_size: u32,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            upload_buffer_size: DEFAULT_UPLOAD_BUFFER,
+            list_scan_cap: DEFAULT_LIST_SCAN_CAP,
+            multipart_part_size: 8 * 1024 * 1024,
+            soft_delete_ttl_secs: 86_400,
+            soft_delete_drop_blob: false,
+            multipart_upload_ttl_secs: 86_400,
+            recompress_batch_size: 100,
+            read_pool_size: 4,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -54,6 +73,9 @@ pub struct StorageEngine {
     list_scan_cap: i64,
     multipart_part_size: usize,
     soft_delete_ttl_secs: i64,
+    soft_delete_drop_blob: bool,
+    multipart_upload_ttl_secs: i64,
+    recompress_batch_size: usize,
 }
 
 pub(crate) struct TempFileGuard {
@@ -83,10 +105,7 @@ impl StorageEngine {
             data_dir,
             EngineOptions {
                 upload_buffer_size,
-                list_scan_cap: DEFAULT_LIST_SCAN_CAP,
-                multipart_part_size: 8 * 1024 * 1024,
-                soft_delete_ttl_secs: 86_400,
-                read_pool_size: 4,
+                ..EngineOptions::default()
             },
         )
         .await
@@ -121,6 +140,9 @@ impl StorageEngine {
             list_scan_cap: opts.list_scan_cap.max(100),
             multipart_part_size: opts.multipart_part_size.max(1024 * 1024),
             soft_delete_ttl_secs: opts.soft_delete_ttl_secs.max(0),
+            soft_delete_drop_blob: opts.soft_delete_drop_blob,
+            multipart_upload_ttl_secs: opts.multipart_upload_ttl_secs.max(0),
+            recompress_batch_size: opts.recompress_batch_size.max(1),
         })
     }
 
@@ -237,6 +259,18 @@ impl StorageEngine {
         self.soft_delete_ttl_secs
     }
 
+    pub fn soft_delete_drop_blob(&self) -> bool {
+        self.soft_delete_drop_blob
+    }
+
+    pub fn multipart_upload_ttl_secs(&self) -> i64 {
+        self.multipart_upload_ttl_secs
+    }
+
+    pub fn recompress_batch_size(&self) -> usize {
+        self.recompress_batch_size
+    }
+
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -269,23 +303,10 @@ impl StorageEngine {
         let src_meta = self.fetch_active_metadata(&src_bucket, &src_key).await?;
         let src_path = blob_path(&self.data_dir, &src_bucket, &src_key);
         let dst_path = blob_path(&self.data_dir, &dst_bucket, &dst_key);
-        if let Some(parent) = dst_path.parent() {
-            fs::create_dir_all(parent).await.map_err(internal)?;
-        }
 
-        let tmp_path = format!("{}/.tmp/{}.tmp", self.data_dir, uuid::Uuid::new_v4());
-        let _guard = TempFileGuard {
-            path: PathBuf::from(&tmp_path),
-        };
-
-        // Human: Use the kernel fast path when available via tokio's fs::copy helper.
-        // Agent: CALLS tokio::fs::copy src->tmp; RENAME tmp->dst; NO client re-upload.
-        fs::copy(&src_path, &tmp_path).await.map_err(internal)?;
-
-        if dst_path.exists() {
-            fs::remove_file(&dst_path).await.map_err(internal)?;
-        }
-        fs::rename(&tmp_path, &dst_path).await.map_err(internal)?;
+        // Human: Hard-link the on-disk blob when possible so copies share storage on the same volume.
+        // Agent: CALLS link_or_copy_blob(src,dst); fallback fs::copy on EXDEV; metadata row for dst only.
+        link_or_copy_blob(&src_path, &dst_path).await?;
 
         let now = chrono::Utc::now();
         let unix_now = now.timestamp();
@@ -359,7 +380,7 @@ impl StorageEngine {
         }
 
         let size = uncompressed.len() as u64;
-        let blob = compress_blob(&uncompressed)?;
+        let blob = encode_blob_for_storage(&uncompressed)?;
         file.write_all(&blob).await.map_err(internal)?;
         file.flush().await.map_err(internal)?;
         drop(file);
@@ -523,6 +544,25 @@ impl StorageEngine {
             return Ok(());
         }
 
+        let path = blob_path(&self.data_dir, &bucket, &safe_key);
+
+        // Human: TTL 0 hard-deletes metadata and blob; otherwise soft-delete with optional immediate blob drop.
+        // Agent: IF soft_delete_ttl_secs==0 THEN DELETE row + remove_file; ELIF drop_blob THEN UPDATE deleted_at + remove_file; ELSE UPDATE deleted_at only.
+        if self.soft_delete_ttl_secs <= 0 {
+            let _ = fs::remove_file(&path).await;
+            sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
+                .bind(&bucket)
+                .bind(&safe_key)
+                .execute(&self.write_pool)
+                .await
+                .map_err(internal)?;
+            return Ok(());
+        }
+
+        if self.soft_delete_drop_blob {
+            let _ = fs::remove_file(&path).await;
+        }
+
         let now = chrono::Utc::now().timestamp();
         sqlx::query(&format!(
             "UPDATE objects SET deleted_at = ? WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
@@ -535,35 +575,6 @@ impl StorageEngine {
         .map_err(internal)?;
 
         Ok(())
-    }
-
-    /// Permanently removes soft-deleted rows past TTL and deletes their blobs.
-    pub async fn purge_soft_deleted(&self) -> Result<u64, StorageError> {
-        if self.soft_delete_ttl_secs <= 0 {
-            return Ok(0);
-        }
-        let cutoff = chrono::Utc::now().timestamp() - self.soft_delete_ttl_secs;
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT bucket, key FROM objects WHERE deleted_at IS NOT NULL AND deleted_at < ?",
-        )
-        .bind(cutoff)
-        .fetch_all(&self.read_pool)
-        .await
-        .map_err(internal)?;
-
-        let mut purged = 0u64;
-        for (bucket, key) in rows {
-            let path = blob_path(&self.data_dir, &bucket, &key);
-            let _ = fs::remove_file(&path).await;
-            sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
-                .bind(&bucket)
-                .bind(&key)
-                .execute(&self.write_pool)
-                .await
-                .map_err(internal)?;
-            purged += 1;
-        }
-        Ok(purged)
     }
 
     async fn fetch_active_metadata(

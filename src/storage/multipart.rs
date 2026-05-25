@@ -4,7 +4,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xxhash_rust::xxh3::Xxh3;
 
-use super::compression::compress_blob;
+use super::compression::encode_blob_for_storage;
 use super::engine::{StorageEngine, TempFileGuard};
 use super::error::{internal, map_io_error, StorageError};
 use super::{blob_path, sanitize_bucket, sanitize_key};
@@ -180,7 +180,7 @@ impl StorageEngine {
         }
 
         let total_size = uncompressed.len() as u64;
-        let blob = compress_blob(&uncompressed)?;
+        let blob = encode_blob_for_storage(&uncompressed)?;
         out.write_all(&blob).await.map_err(internal)?;
         out.flush().await.map_err(internal)?;
         drop(out);
@@ -300,5 +300,30 @@ impl StorageEngine {
             return Err(StorageError::NotFound);
         }
         Ok(MultipartSession { content_type })
+    }
+
+    /// Removes multipart sessions and staged part files older than the configured TTL.
+    pub async fn purge_stale_multipart_uploads(&self) -> Result<u64, StorageError> {
+        if self.multipart_upload_ttl_secs() <= 0 {
+            return Ok(0);
+        }
+        let cutoff = chrono::Utc::now().timestamp() - self.multipart_upload_ttl_secs();
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT upload_id FROM multipart_uploads WHERE created_at < ?",
+        )
+        .bind(cutoff)
+        .fetch_all(self.read_pool())
+        .await
+        .map_err(internal)?;
+
+        let mut purged = 0u64;
+        for (upload_id,) in rows {
+            self.cleanup_multipart(&upload_id).await?;
+            purged += 1;
+        }
+        if purged > 0 {
+            tracing::info!(purged, "storage::purge_stale_multipart_uploads completed");
+        }
+        Ok(purged)
     }
 }
