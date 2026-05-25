@@ -4,6 +4,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xxhash_rust::xxh3::Xxh3;
 
+use super::compression::compress_blob;
 use super::engine::{StorageEngine, TempFileGuard};
 use super::error::{internal, map_io_error, StorageError};
 use super::{blob_path, sanitize_bucket, sanitize_key};
@@ -158,8 +159,10 @@ impl StorageEngine {
             path: PathBuf::from(&tmp_path),
         };
         let mut hasher = Xxh3::new();
-        let mut total_size: u64 = 0;
+        let mut uncompressed = Vec::new();
 
+        // Human: Concatenate logical part bytes in memory, then compress once into the final object blob.
+        // Agent: READS numbered part files; XXH3 over concatenated bytes; WRITES compress_blob to final path.
         for (part_number,) in parts {
             let part_path = self
                 .multipart_dir(upload_id)
@@ -172,10 +175,13 @@ impl StorageEngine {
                     break;
                 }
                 hasher.update(&buf[..n]);
-                out.write_all(&buf[..n]).await.map_err(internal)?;
-                total_size += n as u64;
+                uncompressed.extend_from_slice(&buf[..n]);
             }
         }
+
+        let total_size = uncompressed.len() as u64;
+        let blob = compress_blob(&uncompressed)?;
+        out.write_all(&blob).await.map_err(internal)?;
         out.flush().await.map_err(internal)?;
         drop(out);
 

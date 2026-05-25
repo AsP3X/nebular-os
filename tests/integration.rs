@@ -348,6 +348,58 @@ async fn test_presigned_url_access() {
 }
 
 #[tokio::test]
+async fn test_storage_compression_transparent() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::{is_compressed_blob, BLOB_MAGIC};
+
+    let (app, token, tmp) = setup_app(None, false).await;
+    let content = "compressible payload ".repeat(500);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/compressed.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(content.clone()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let data_dir = tmp.path().join("blobs");
+    let on_disk = std::fs::read(blob_path(
+        &data_dir.to_string_lossy(),
+        "music",
+        "compressed.bin",
+    ))
+    .unwrap();
+    assert!(is_compressed_blob(&on_disk));
+    assert!(on_disk.starts_with(BLOB_MAGIC));
+    assert!(on_disk.len() < content.len());
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/compressed.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body, content.as_bytes());
+
+    let req = Request::builder()
+        .method("HEAD")
+        .uri("/music/compressed.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let cl = response.headers().get("content-length").unwrap();
+    assert_eq!(cl.to_str().unwrap(), content.len().to_string());
+}
+
+#[tokio::test]
 async fn test_expired_presigned_url_rejected() {
     let (app, token, _tmp) = setup_app(Some("test-signing-secret".into()), false).await;
     let secret = "test-signing-secret";

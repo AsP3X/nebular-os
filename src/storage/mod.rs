@@ -1,3 +1,4 @@
+pub mod compression;
 pub mod engine;
 pub mod error;
 pub mod multipart;

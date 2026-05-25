@@ -1,12 +1,14 @@
 use std::collections::BTreeSet;
+use std::io::Cursor;
 use std::path::PathBuf;
 
 use sqlx::{Pool, Sqlite, SqlitePool};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use xxhash_rust::xxh3::Xxh3;
 
+use super::compression::{compress_blob, decompress_blob};
 use super::error::{internal, map_io_error, StorageError};
 use super::range::parse_content_range;
 use super::types::{ListItem, ListResult, ObjectMetadata};
@@ -28,7 +30,7 @@ fn escape_like_pattern(s: &str) -> String {
 pub enum GetObjectOutcome {
     NotModified(ObjectMetadata),
     Content {
-        stream: ReaderStream<tokio::io::Take<fs::File>>,
+        stream: ReaderStream<Cursor<Vec<u8>>>,
         content_length: u64,
         total_size: u64,
         meta: ObjectMetadata,
@@ -342,18 +344,23 @@ impl StorageEngine {
             path: PathBuf::from(&tmp_path),
         };
         let mut hasher = Xxh3::new();
-        let mut size: u64 = 0;
+        let mut uncompressed = Vec::new();
         let mut buf = vec![0u8; self.upload_buffer_size];
 
+        // Human: Buffer logical bytes for hashing, then persist a zstd-wrapped blob instead of raw payload.
+        // Agent: READS upload stream; XXH3 over uncompressed; WRITES compress_blob to tmp; metadata size=logical len.
         loop {
             let n = body.read(&mut buf).await.map_err(map_io_error)?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
-            file.write_all(&buf[..n]).await.map_err(internal)?;
-            size += n as u64;
+            uncompressed.extend_from_slice(&buf[..n]);
         }
+
+        let size = uncompressed.len() as u64;
+        let blob = compress_blob(&uncompressed)?;
+        file.write_all(&blob).await.map_err(internal)?;
         file.flush().await.map_err(internal)?;
         drop(file);
 
@@ -428,10 +435,9 @@ impl StorageEngine {
 
         let total_size = meta.size as u64;
         let range = range_header.and_then(|h| parse_content_range(h, total_size));
-        let (start, _end, content_length) = Self::resolve_range(range, total_size)?;
 
         let path = blob_path(&self.data_dir, &meta.bucket, &meta.key);
-        let file = fs::File::open(&path).await.map_err(|e| {
+        let blob = fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StorageError::NotFound
             } else {
@@ -439,16 +445,20 @@ impl StorageEngine {
             }
         })?;
 
-        let mut file = file;
-        file.seek(std::io::SeekFrom::Start(start))
-            .await
-            .map_err(internal)?;
-        let stream = ReaderStream::new(file.take(content_length));
+        // Human: Decompress (or pass through legacy raw blobs) so range requests apply to logical object bytes.
+        // Agent: CALLS decompress_blob(blob, meta.size); slice Vec; streams via ReaderStream<Cursor>.
+        let logical = decompress_blob(&blob, total_size)?;
+        let (start, _end, content_length) = Self::resolve_range(range, logical.len() as u64)?;
+
+        let start_usize = start as usize;
+        let end_usize = start_usize + content_length as usize;
+        let slice = logical[start_usize..end_usize].to_vec();
+        let stream = ReaderStream::new(Cursor::new(slice));
 
         Ok(GetObjectOutcome::Content {
             stream,
             content_length,
-            total_size,
+            total_size: logical.len() as u64,
             meta,
         })
     }
