@@ -34,6 +34,8 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 urlencoding = "2"
 zstd = "0.13"
+bytes = "1"
+tokio-stream = "0.1"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "stream"] }

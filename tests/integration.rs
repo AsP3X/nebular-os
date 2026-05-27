@@ -59,6 +59,11 @@ fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<N
         multipart_part_size: 8 * 1024 * 1024,
         read_pool_size: 2,
         cors_origins: vec![],
+        zstd_level: 3,
+        s3_compat: false,
+        bucket_policy: nebular_os::config::BucketPolicy::default(),
+        s3_access_key: None,
+        s3_secret_key: None,
     })
 }
 
@@ -951,7 +956,7 @@ async fn test_recompress_legacy_raw_blob() {
     match outcome {
         nebular_os::storage::GetObjectOutcome::Content { stream, .. } => {
             let bytes = axum::body::to_bytes(
-                axum::body::Body::from_stream(stream),
+                axum::body::Body::from_stream(stream.stream),
                 usize::MAX,
             )
             .await
@@ -988,4 +993,131 @@ async fn test_copy_object_shares_storage_via_hard_link() {
     storage.delete_object("music", "copy.bin").await.unwrap();
     assert!(src.exists());
     assert!(storage.object_exists("music", "original.bin").await.unwrap());
+}
+
+fn listener_token() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = Claims {
+        sub: "listener-user".into(),
+        email: "listener@example.com".into(),
+        role: "listener".into(),
+        exp: now + 3600,
+        iat: now,
+    };
+    encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_listener_role_cannot_put() {
+    let (app, _token, _tmp) = setup_app(Some(TEST_SECRET.into()), false).await;
+    let listener = listener_token();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/forbidden.bin")
+        .header("authorization", format!("Bearer {listener}"))
+        .body(Body::from("data"))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_s3_list_objects_xml_when_compat_enabled() {
+    let mut cfg = (*test_config(Some(TEST_SECRET.into()), false)).clone();
+    cfg.s3_compat = true;
+    let cfg = Arc::new(cfg);
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("blobs");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
+    let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
+    let storage = StorageEngine::with_full_options(
+        &meta_path_str,
+        &data_dir_str,
+        EngineOptions::default(),
+    )
+    .await
+    .unwrap();
+    let app = create_app(storage, cfg).await.unwrap();
+    let token = make_token();
+
+    let put = Request::builder()
+        .method("PUT")
+        .uri("/music/s3obj.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("hello s3"))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(put).await.unwrap().status(), StatusCode::CREATED);
+
+    let list = Request::builder()
+        .method("GET")
+        .uri("/music?list-type=2")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let list_resp = app.oneshot(list).await.unwrap();
+    assert_eq!(list_resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(list_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("<ListBucketResult"));
+    assert!(text.contains("<Key>s3obj.bin</Key>"));
+}
+
+#[tokio::test]
+async fn test_bucket_policy_denies_other_bucket() {
+    let mut cfg = (*test_config(Some(TEST_SECRET.into()), false)).clone();
+    cfg.bucket_policy =
+        nebular_os::config::BucketPolicy::from_json(r#"{"user-1":["music"]}"#).unwrap();
+    let cfg = Arc::new(cfg);
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("blobs");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
+    let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
+    let storage = StorageEngine::with_full_options(
+        &meta_path_str,
+        &data_dir_str,
+        EngineOptions::default(),
+    )
+    .await
+    .unwrap();
+    let app = create_app(storage, cfg).await.unwrap();
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let claims = Claims {
+        sub: "user-1".into(),
+        email: "u@example.com".into(),
+        role: "admin".into(),
+        exp: now + 3600,
+        iat: now,
+    };
+    let token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &EncodingKey::from_secret(TEST_SECRET.as_bytes()),
+    )
+    .unwrap();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/other-bucket")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 }

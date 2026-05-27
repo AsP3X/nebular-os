@@ -4,7 +4,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xxhash_rust::xxh3::Xxh3;
 
-use super::compression::encode_blob_for_storage;
+use super::streaming::{finalize_temp_to_blob, hash_temp_file};
 use super::engine::{StorageEngine, TempFileGuard};
 use super::error::{internal, map_io_error, StorageError};
 use super::{blob_path, sanitize_bucket, sanitize_key};
@@ -154,15 +154,13 @@ impl StorageEngine {
             fs::create_dir_all(parent).await.map_err(internal)?;
         }
 
-        let mut out = fs::File::create(&tmp_path).await.map_err(internal)?;
         let _guard = TempFileGuard {
             path: PathBuf::from(&tmp_path),
         };
-        let mut hasher = Xxh3::new();
-        let mut uncompressed = Vec::new();
+        let mut out = fs::File::create(&tmp_path).await.map_err(internal)?;
 
-        // Human: Concatenate logical part bytes in memory, then compress once into the final object blob.
-        // Agent: READS numbered part files; XXH3 over concatenated bytes; WRITES compress_blob to final path.
+        // Human: Concatenate parts into a temp file on disk, then reuse the same compress-or-store path as PUT.
+        // Agent: WRITES parts into tmp_path; hash_temp_file; finalize_temp_to_blob; no full-RAM Vec.
         for (part_number,) in parts {
             let part_path = self
                 .multipart_dir(upload_id)
@@ -174,24 +172,24 @@ impl StorageEngine {
                 if n == 0 {
                     break;
                 }
-                hasher.update(&buf[..n]);
-                uncompressed.extend_from_slice(&buf[..n]);
+                out.write_all(&buf[..n]).await.map_err(internal)?;
             }
         }
-
-        let total_size = uncompressed.len() as u64;
-        let blob = encode_blob_for_storage(&uncompressed)?;
-        out.write_all(&blob).await.map_err(internal)?;
         out.flush().await.map_err(internal)?;
         drop(out);
 
-        let etag = format!("{:016x}", hasher.digest());
-        if final_path.exists() {
-            fs::remove_file(&final_path).await.map_err(internal)?;
-        }
-        fs::rename(&tmp_path, &final_path)
-            .await
-            .map_err(internal)?;
+        let (total_size, etag) = hash_temp_file(
+            PathBuf::from(&tmp_path).as_path(),
+            self.upload_buffer_size(),
+        )?;
+
+        finalize_temp_to_blob(
+            PathBuf::from(&tmp_path).as_path(),
+            &final_path,
+            total_size,
+            self.zstd_level(),
+        )
+        .await?;
 
         let now = chrono::Utc::now();
         let unix_now = now.timestamp();

@@ -75,7 +75,7 @@ impl StorageEngine {
                 report.skipped += 1;
                 continue;
             }
-            let encoded = encode_blob_for_storage(&blob)?;
+            let encoded = encode_blob_for_storage(&blob, self.zstd_level())?;
             if encoded.len() >= blob.len() {
                 report.skipped += 1;
                 continue;

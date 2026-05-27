@@ -1,6 +1,32 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use anyhow::{Context, Result};
+
+/// Human: Optional per-subject bucket allow-lists loaded from NOS_BUCKET_POLICY JSON.
+/// Agent: EMPTY map => allow all buckets; non-empty => sub must list bucket explicitly.
+#[derive(Clone, Default)]
+pub struct BucketPolicy(pub HashMap<String, Vec<String>>);
+
+impl BucketPolicy {
+    pub fn from_json(raw: &str) -> Result<Self> {
+        if raw.trim().is_empty() {
+            return Ok(Self::default());
+        }
+        let map: HashMap<String, Vec<String>> =
+            serde_json::from_str(raw).context("NOS_BUCKET_POLICY must be valid JSON object")?;
+        Ok(Self(map))
+    }
+
+    pub fn allows(&self, sub: &str, bucket: &str) -> bool {
+        if self.0.is_empty() {
+            return true;
+        }
+        self.0
+            .get(sub)
+            .is_some_and(|buckets| buckets.iter().any(|b| b == bucket))
+    }
+}
 
 #[derive(Clone)]
 pub struct NosConfig {
@@ -27,6 +53,11 @@ pub struct NosConfig {
     pub multipart_part_size: usize,
     pub read_pool_size: u32,
     pub cors_origins: Vec<String>,
+    pub zstd_level: i32,
+    pub s3_compat: bool,
+    pub bucket_policy: BucketPolicy,
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
 }
 
 impl fmt::Debug for NosConfig {
@@ -55,6 +86,13 @@ impl fmt::Debug for NosConfig {
             .field("multipart_part_size", &self.multipart_part_size)
             .field("read_pool_size", &self.read_pool_size)
             .field("cors_origins", &self.cors_origins)
+            .field("zstd_level", &self.zstd_level)
+            .field("s3_compat", &self.s3_compat)
+            .field(
+                "bucket_policy",
+                &self.bucket_policy.0.keys().collect::<Vec<_>>(),
+            )
+            .field("s3_access_key", &self.s3_access_key.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
@@ -161,6 +199,23 @@ impl NosConfig {
                         .collect()
                 })
                 .unwrap_or_default(),
+            zstd_level: env::var("NOS_ZSTD_LEVEL")
+                .ok()
+                .map(|s| s.parse().context("NOS_ZSTD_LEVEL must be a valid i32"))
+                .transpose()?
+                .map(crate::storage::compression::clamp_zstd_level)
+                .unwrap_or(crate::storage::compression::DEFAULT_ZSTD_LEVEL),
+            s3_compat: env::var("NOS_S3_COMPAT")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(false),
+            bucket_policy: env::var("NOS_BUCKET_POLICY")
+                .ok()
+                .map(|s| BucketPolicy::from_json(&s))
+                .transpose()?
+                .unwrap_or_default(),
+            s3_access_key: env::var("NOS_S3_ACCESS_KEY").ok().filter(|s| !s.is_empty()),
+            s3_secret_key: env::var("NOS_S3_SECRET_KEY").ok().filter(|s| !s.is_empty()),
         })
     }
 }

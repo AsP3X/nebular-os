@@ -5,6 +5,7 @@ use nebular_os::{config, secrets, server, storage};
 
 use anyhow::Result;
 use axum::serve;
+use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -35,6 +36,7 @@ async fn main() -> Result<()> {
             multipart_upload_ttl_secs: cfg.multipart_upload_ttl_secs,
             recompress_batch_size: cfg.recompress_batch_size,
             read_pool_size: cfg.read_pool_size,
+            zstd_level: cfg.zstd_level,
         },
     )
     .await?;
@@ -74,7 +76,13 @@ async fn main() -> Result<()> {
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!("Listening on {}", cfg.bind_addr);
 
-    serve(listener, app).await?;
+    // Human: Expose peer IP to rate-limit middleware via ConnectInfo<SocketAddr>.
+    // Agent: into_make_service_with_connect_info; REQUIRED for per-IP NOS_RATE_LIMIT_RPS.
+    serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

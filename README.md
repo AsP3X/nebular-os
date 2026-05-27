@@ -47,6 +47,10 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_LIST_SCAN_CAP` | Max keys scanned per delimiter listing page (default `4096`) |
 | `NOS_MULTIPART_PART_SIZE` | Max bytes per multipart part (default `8388608`) |
 | `NOS_READ_POOL_SIZE` | SQLite read pool connections (default `4`) |
+| `NOS_ZSTD_LEVEL` | zstd compression level 1–22 for blob writes (default `22`; lower = faster uploads) |
+| `NOS_S3_COMPAT` | Enable S3-style XML list/errors and `x-amz-copy-source` (default `false`) |
+| `NOS_BUCKET_POLICY` | JSON map of `sub` → allowed bucket names; empty = no extra restriction |
+| `NOS_S3_ACCESS_KEY` / `NOS_S3_SECRET_KEY` | Optional access-key auth via `Authorization: NOS <key>:<sig>` |
 | `NOS_CORS_ORIGINS` | Comma-separated allowed origins; empty = permissive |
 | `RUST_LOG` | Tracing filter (default `info`) |
 
