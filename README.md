@@ -60,16 +60,17 @@ See [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
 
 | Method | Route | Auth | Description |
 |--------|-------|------|-------------|
-| `PUT` | `/:bucket/*key` | Bearer JWT | Stream upload; `x-nd-copy-source` for server-side copy |
+| `PUT` | `/:bucket/*key` | Bearer JWT | Stream upload; `If-Match` / `If-None-Match`; `x-nd-copy-source` for server-side copy |
 | `GET` | `/:bucket/*key` | Bearer JWT or presigned query | Download (`Range`, `If-None-Match`, suffix ranges) |
 | `HEAD` | `/:bucket/*key` | Bearer JWT | Metadata + `x-nd-custom-meta-*` headers |
-| `DELETE` | `/:bucket/*key` | Bearer JWT | Soft delete (or hard delete when TTL is `0`) |
+| `DELETE` | `/:bucket/*key` | Bearer JWT | Soft delete (or hard delete when TTL is `0`); optional `If-Match` |
 | `GET` | `/:bucket` | Bearer JWT | List objects with pagination + delimiter prefixes |
 | `POST` | `/:bucket/_multipart?key=...` | Bearer JWT | Init multipart upload |
 | `PUT` | `/:bucket/_multipart/{upload_id}/parts/{n}` | Bearer JWT | Upload part |
 | `POST` | `/:bucket/_multipart/{upload_id}/complete` | Bearer JWT | Complete multipart upload |
 | `DELETE` | `/:bucket/_multipart/{upload_id}` | Bearer JWT | Abort multipart upload |
-| `GET` | `/health` | None | Health check |
+| `GET` | `/health` | None | Liveness check (process up) |
+| `GET` | `/health/ready` | None | Readiness check (SQLite + `NOS_DATA_DIR` writable) |
 | `GET` | `/metrics` | Optional Bearer (`NOS_METRICS_TOKEN`) | JSON or Prometheus (`Accept: text/plain`) |
 
 ## Use as a Rust dependency

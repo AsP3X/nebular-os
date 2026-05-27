@@ -309,6 +309,149 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn test_health_ready_endpoint() {
+    let (app, _token, _tmp) = setup_app(None, false).await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/health/ready")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["checks"]["sqlite_write"], true);
+    assert_eq!(json["checks"]["sqlite_read"], true);
+    assert_eq!(json["checks"]["data_dir_writable"], true);
+}
+
+#[tokio::test]
+async fn test_put_if_none_match_create_only() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/new-only.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("if-none-match", "*")
+        .body(Body::from("first"))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/new-only.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("if-none-match", "*")
+        .body(Body::from("second"))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "precondition failed");
+}
+
+#[tokio::test]
+async fn test_put_if_match_optimistic_update() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/versioned.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::from("v1"))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/versioned.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("if-match", "wrong-etag")
+        .body(Body::from("v2"))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/versioned.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("if-match", etag)
+        .body(Body::from("v2"))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/versioned.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"v2");
+}
+
+#[tokio::test]
+async fn test_delete_if_match() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/to-delete.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::from("bye"))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/music/to-delete.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("if-match", "stale")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/music/to-delete.txt")
+        .header("authorization", format!("Bearer {}", token))
+        .header("if-match", etag)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
 async fn test_metrics_endpoint() {
     let (app, _token, _tmp) = setup_app(None, false).await;
     let req = Request::builder()
@@ -865,7 +1008,10 @@ async fn test_hard_delete_reclaims_blob_immediately() {
     let path = blob_path(&data_dir.to_string_lossy(), "music", "tmp.bin");
     assert!(path.exists());
 
-    storage.delete_object("music", "tmp.bin").await.unwrap();
+    storage
+        .delete_object("music", "tmp.bin", None)
+        .await
+        .unwrap();
     assert!(!path.exists());
     assert!(!storage.object_exists("music", "tmp.bin").await.unwrap());
 }
@@ -888,7 +1034,10 @@ async fn test_soft_delete_drop_blob_removes_file() {
         .unwrap();
 
     let path = blob_path(&data_dir.to_string_lossy(), "music", "gone.bin");
-    storage.delete_object("music", "gone.bin").await.unwrap();
+    storage
+        .delete_object("music", "gone.bin", None)
+        .await
+        .unwrap();
     assert!(!path.exists());
     assert!(!storage.object_exists("music", "gone.bin").await.unwrap());
 }
@@ -982,7 +1131,7 @@ async fn test_copy_object_shares_storage_via_hard_link() {
         .unwrap();
 
     storage
-        .copy_object("music", "original.bin", "music", "copy.bin")
+        .copy_object("music", "original.bin", "music", "copy.bin", None, None)
         .await
         .unwrap();
 
@@ -990,7 +1139,10 @@ async fn test_copy_object_shares_storage_via_hard_link() {
     let dst = blob_path(&data_dir.to_string_lossy(), "music", "copy.bin");
     assert!(same_inode(&src, &dst));
 
-    storage.delete_object("music", "copy.bin").await.unwrap();
+    storage
+        .delete_object("music", "copy.bin", None)
+        .await
+        .unwrap();
     assert!(src.exists());
     assert!(storage.object_exists("music", "original.bin").await.unwrap());
 }

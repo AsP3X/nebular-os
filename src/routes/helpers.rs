@@ -57,7 +57,16 @@ pub fn parse_if_modified_since(headers: &HeaderMap) -> Option<i64> {
 
 /// Parses `If-None-Match` (first etag token only).
 pub fn parse_if_none_match(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(header::IF_NONE_MATCH)?.to_str().ok()?;
+    parse_etag_precondition(headers.get(header::IF_NONE_MATCH)?)
+}
+
+/// Parses `If-Match` (first etag token only).
+pub fn parse_if_match(headers: &HeaderMap) -> Option<String> {
+    parse_etag_precondition(headers.get(header::IF_MATCH)?)
+}
+
+fn parse_etag_precondition(value: &axum::http::HeaderValue) -> Option<String> {
+    let raw = value.to_str().ok()?;
     let token = raw.split(',').next()?.trim();
     if token == "*" {
         return Some("*".to_string());

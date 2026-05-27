@@ -8,10 +8,22 @@ servers:
 paths:
   /health:
     get:
-      summary: Health check
+      summary: Liveness check (process up; no storage I/O)
       responses:
         "200":
           description: OK
+  /health/ready:
+    get:
+      summary: Readiness check (SQLite + blob directory writable)
+      responses:
+        "200":
+          description: Ready to serve object traffic
+        "503":
+          description: Not ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /metrics:
     get:
       summary: Storage metrics (JSON or Prometheus)

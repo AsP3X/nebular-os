@@ -12,6 +12,7 @@ use super::range::parse_content_range;
 use super::streaming::{
     finalize_temp_to_blob, open_object_body_stream, stream_body_to_temp, GuardedObjectBodyStream,
 };
+use super::precondition::{check_write_preconditions, etag_matches};
 use super::types::{ListItem, ListResult, ObjectMetadata};
 use super::{blob_path, sanitize_bucket, sanitize_key};
 
@@ -28,6 +29,20 @@ fn escape_like_pattern(s: &str) -> String {
 }
 
 /// Outcome of GET after conditional header checks against stored metadata.
+/// Per-check results for `GET /health/ready`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReadinessChecks {
+    pub sqlite_write: bool,
+    pub sqlite_read: bool,
+    pub data_dir_writable: bool,
+}
+
+impl ReadinessChecks {
+    pub fn ready(&self) -> bool {
+        self.sqlite_write && self.sqlite_read && self.data_dir_writable
+    }
+}
+
 pub enum GetObjectOutcome {
     NotModified(ObjectMetadata),
     Content {
@@ -284,6 +299,39 @@ impl StorageEngine {
         self.zstd_level
     }
 
+    /// Human: Loads active object metadata when present, without treating a miss as an error.
+    /// Agent: SELECT objects WHERE deleted_at IS NULL; RETURNS Option (None = no live row).
+    pub async fn try_fetch_active_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<ObjectMetadata>, StorageError> {
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        let q = format!(
+            "SELECT {META_SELECT} FROM objects WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
+        );
+        sqlx::query_as(&q)
+            .bind(&bucket)
+            .bind(&safe_key)
+            .fetch_optional(&self.read_pool)
+            .await
+            .map_err(internal)
+    }
+
+    /// Human: Validates If-Match / If-None-Match against the current object before a write or delete.
+    /// Agent: READS try_fetch_active_metadata; CALLS precondition::check_write_preconditions.
+    pub async fn ensure_write_preconditions(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let existing = self.try_fetch_active_metadata(bucket, key).await?;
+        check_write_preconditions(existing.as_ref(), if_match, if_none_match)
+    }
+
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -307,11 +355,18 @@ impl StorageEngine {
         src_key: &str,
         dst_bucket: &str,
         dst_key: &str,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
     ) -> Result<ObjectMetadata, StorageError> {
         let src_bucket = sanitize_bucket(src_bucket).map_err(|_| StorageError::InvalidBucket)?;
         let src_key = sanitize_key(src_key).map_err(|_| StorageError::InvalidKey)?;
         let dst_bucket = sanitize_bucket(dst_bucket).map_err(|_| StorageError::InvalidBucket)?;
         let dst_key = sanitize_key(dst_key).map_err(|_| StorageError::InvalidKey)?;
+
+        if if_match.is_some() || if_none_match.is_some() {
+            self.ensure_write_preconditions(&dst_bucket, &dst_key, if_match, if_none_match)
+                .await?;
+        }
 
         let src_meta = self.fetch_active_metadata(&src_bucket, &src_key).await?;
         let src_path = blob_path(&self.data_dir, &src_bucket, &src_key);
@@ -502,12 +557,10 @@ impl StorageEngine {
             if etag == "*" {
                 return true;
             }
-            if let Some(stored) = &meta.etag {
-                let candidate = etag.trim().trim_matches('"');
-                if stored == candidate || stored == etag.trim() {
+            if let Some(stored) = &meta.etag
+                && etag_matches(stored, etag) {
                     return true;
                 }
-            }
         }
         if let Some(since) = if_modified_since
             && meta.updated_at.timestamp() <= since {
@@ -516,9 +569,19 @@ impl StorageEngine {
         false
     }
 
-    pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+    pub async fn delete_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        if_match: Option<&str>,
+    ) -> Result<(), StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+
+        if if_match.is_some() {
+            self.ensure_write_preconditions(&bucket, &safe_key, if_match, None)
+                .await?;
+        }
 
         let exists: i64 = sqlx::query_scalar(&format!(
             "SELECT COUNT(*) FROM objects WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
@@ -564,6 +627,36 @@ impl StorageEngine {
         .map_err(internal)?;
 
         Ok(())
+    }
+
+    /// Human: Probes SQLite pools and blob directory writability for orchestrator readiness checks.
+    /// Agent: SELECT 1 on write+read pools; WRITE+DELETE probe file under NOS_DATA_DIR/.nos-ready-probe.
+    pub async fn probe_readiness(&self) -> ReadinessChecks {
+        let sqlite_write = sqlx::query("SELECT 1")
+            .fetch_one(&self.write_pool)
+            .await
+            .is_ok();
+        let sqlite_read = sqlx::query("SELECT 1")
+            .fetch_one(&self.read_pool)
+            .await
+            .is_ok();
+        let data_dir_writable = Self::probe_data_dir_writable(&self.data_dir).await;
+        ReadinessChecks {
+            sqlite_write,
+            sqlite_read,
+            data_dir_writable,
+        }
+    }
+
+    async fn probe_data_dir_writable(data_dir: &str) -> bool {
+        let probe = PathBuf::from(data_dir).join(".nos-ready-probe");
+        if fs::create_dir_all(data_dir).await.is_err() {
+            return false;
+        }
+        if fs::write(&probe, b"1").await.is_err() {
+            return false;
+        }
+        fs::remove_file(&probe).await.is_ok()
     }
 
     async fn fetch_active_metadata(

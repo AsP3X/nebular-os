@@ -5,6 +5,7 @@ pub mod streaming;
 pub mod error;
 pub mod maintenance;
 pub mod multipart;
+pub mod precondition;
 pub mod range;
 pub mod reconcile;
 pub mod types;
