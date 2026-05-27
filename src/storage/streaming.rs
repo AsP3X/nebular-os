@@ -22,6 +22,8 @@ pub struct LimitedAsyncRead<R> {
     remaining: u64,
 }
 
+// Human: Constructor binds the byte window for a Range response (skip logical offset, cap length).
+// Agent: new(inner, skip, limit); remaining=limit; skip consumed in poll_read before user buffer fills.
 impl<R: AsyncRead + Unpin> LimitedAsyncRead<R> {
     pub fn new(inner: R, skip: u64, limit: u64) -> Self {
         Self {
@@ -32,15 +34,21 @@ impl<R: AsyncRead + Unpin> LimitedAsyncRead<R> {
     }
 }
 
+// Human: AsyncRead that seeks past `skip` bytes then returns at most `remaining` bytes to the caller.
+// Agent: poll_read phases: (1) drain skip via discard buffer (2) read min(remaining, buf) into caller.
 impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        // Human: Range fully satisfied — signal EOF without reading more from disk.
+        // Agent: remaining==0 => Ready(Ok(())) with empty buf (HTTP body complete).
         if self.remaining == 0 {
             return Poll::Ready(Ok(()));
         }
+        // Human: Skip bytes before the range start by reading into a throwaway buffer (no copy to client).
+        // Agent: WHILE skip>0 poll inner into 8KiB discard; EOF on inner ends poll early.
         if self.skip > 0 {
             let mut discard = [0u8; 8192];
             while self.skip > 0 {
@@ -59,6 +67,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
                 }
             }
         }
+        // Human: Read only the slice of the range that still fits in this response chunk.
+        // Agent: max=min(remaining, buf.remaining()); sub-read then decrement remaining.
         let max = (self.remaining as usize).min(buf.remaining());
         if max == 0 {
             return Poll::Ready(Ok(()));
