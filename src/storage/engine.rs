@@ -1,17 +1,17 @@
 use std::collections::BTreeSet;
-use std::io::Cursor;
 use std::path::PathBuf;
 
+use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::{Pool, Sqlite, SqlitePool};
 use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_util::io::ReaderStream;
-use xxhash_rust::xxh3::Xxh3;
 
 use super::blob_ops::link_or_copy_blob;
-use super::compression::{decompress_blob, encode_blob_for_storage};
-use super::error::{internal, map_io_error, StorageError};
+use super::compression::{self, DEFAULT_ZSTD_LEVEL};
+use super::error::{internal, StorageError};
 use super::range::parse_content_range;
+use super::streaming::{
+    finalize_temp_to_blob, open_object_body_stream, stream_body_to_temp, GuardedObjectBodyStream,
+};
 use super::types::{ListItem, ListResult, ObjectMetadata};
 use super::{blob_path, sanitize_bucket, sanitize_key};
 
@@ -31,7 +31,7 @@ fn escape_like_pattern(s: &str) -> String {
 pub enum GetObjectOutcome {
     NotModified(ObjectMetadata),
     Content {
-        stream: ReaderStream<Cursor<Vec<u8>>>,
+        stream: GuardedObjectBodyStream,
         content_length: u64,
         total_size: u64,
         meta: ObjectMetadata,
@@ -47,6 +47,7 @@ pub struct EngineOptions {
     pub multipart_upload_ttl_secs: i64,
     pub recompress_batch_size: usize,
     pub read_pool_size: u32,
+    pub zstd_level: i32,
 }
 
 impl Default for EngineOptions {
@@ -60,6 +61,7 @@ impl Default for EngineOptions {
             multipart_upload_ttl_secs: 86_400,
             recompress_batch_size: 100,
             read_pool_size: 4,
+            zstd_level: DEFAULT_ZSTD_LEVEL,
         }
     }
 }
@@ -76,6 +78,7 @@ pub struct StorageEngine {
     soft_delete_drop_blob: bool,
     multipart_upload_ttl_secs: i64,
     recompress_batch_size: usize,
+    zstd_level: i32,
 }
 
 pub(crate) struct TempFileGuard {
@@ -118,7 +121,14 @@ impl StorageEngine {
     ) -> Result<Self, StorageError> {
         let conn_str = Self::resolve_conn_str(meta_path).await?;
         let write_pool = SqlitePool::connect(&conn_str).await.map_err(internal)?;
-        let read_pool = SqlitePool::connect(&conn_str).await.map_err(internal)?;
+        // Human: Size the read pool from NOS_READ_POOL_SIZE so list/GET metadata queries do not share one connection.
+        // Agent: READS opts.read_pool_size; SqlitePoolOptions::max_connections; separate pool from write_pool.
+        let read_pool_size = opts.read_pool_size.max(1);
+        let read_pool = SqlitePoolOptions::new()
+            .max_connections(read_pool_size)
+            .connect(&conn_str)
+            .await
+            .map_err(internal)?;
 
         Self::init_schema(&write_pool).await?;
 
@@ -129,8 +139,6 @@ impl StorageEngine {
         fs::create_dir_all(format!("{}/.multipart", data_dir))
             .await
             .map_err(internal)?;
-
-        let _ = opts.read_pool_size;
 
         Ok(Self {
             write_pool,
@@ -143,6 +151,7 @@ impl StorageEngine {
             soft_delete_drop_blob: opts.soft_delete_drop_blob,
             multipart_upload_ttl_secs: opts.multipart_upload_ttl_secs.max(0),
             recompress_batch_size: opts.recompress_batch_size.max(1),
+            zstd_level: compression::clamp_zstd_level(opts.zstd_level),
         })
     }
 
@@ -271,6 +280,10 @@ impl StorageEngine {
         self.recompress_batch_size
     }
 
+    pub fn zstd_level(&self) -> i32 {
+        self.zstd_level
+    }
+
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -356,42 +369,23 @@ impl StorageEngine {
     ) -> Result<(ObjectMetadata, String), StorageError> {
         let tmp_path = format!("{}/.tmp/{}.tmp", self.data_dir, uuid::Uuid::new_v4());
         let final_path = blob_path(&self.data_dir, bucket, safe_key);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).await.map_err(internal)?;
-        }
-
-        let mut file = fs::File::create(&tmp_path).await.map_err(internal)?;
-        let _guard = TempFileGuard {
+        let _tmp_guard = TempFileGuard {
             path: PathBuf::from(&tmp_path),
         };
-        let mut hasher = Xxh3::new();
-        let mut uncompressed = Vec::new();
-        let mut buf = vec![0u8; self.upload_buffer_size];
 
-        // Human: Buffer logical bytes for hashing, then persist a zstd-wrapped blob instead of raw payload.
-        // Agent: READS upload stream; XXH3 over uncompressed; WRITES compress_blob to tmp; metadata size=logical len.
-        loop {
-            let n = body.read(&mut buf).await.map_err(map_io_error)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            uncompressed.extend_from_slice(&buf[..n]);
-        }
+        // Human: Stream upload to a temp file, hash on the fly, then compress to the final blob without buffering the whole object in RAM.
+        // Agent: CALLS stream_body_to_temp; finalize_temp_to_blob(zstd_level); metadata size=logical bytes; TempFileGuard cleans tmp.
+        let (size, etag) =
+            stream_body_to_temp(body, PathBuf::from(&tmp_path).as_path(), self.upload_buffer_size)
+                .await?;
 
-        let size = uncompressed.len() as u64;
-        let blob = encode_blob_for_storage(&uncompressed)?;
-        file.write_all(&blob).await.map_err(internal)?;
-        file.flush().await.map_err(internal)?;
-        drop(file);
-
-        let etag = format!("{:016x}", hasher.digest());
-        if final_path.exists() {
-            fs::remove_file(&final_path).await.map_err(internal)?;
-        }
-        fs::rename(&tmp_path, &final_path)
-            .await
-            .map_err(internal)?;
+        finalize_temp_to_blob(
+            PathBuf::from(&tmp_path).as_path(),
+            &final_path,
+            size,
+            self.zstd_level(),
+        )
+        .await?;
 
         let now = chrono::Utc::now();
         let unix_now = now.timestamp();
@@ -458,28 +452,23 @@ impl StorageEngine {
         let range = range_header.and_then(|h| parse_content_range(h, total_size));
 
         let path = blob_path(&self.data_dir, &meta.bucket, &meta.key);
-        let blob = fs::read(&path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound
-            } else {
-                StorageError::Internal(e.into())
-            }
-        })?;
+        let (start, _end, content_length) = Self::resolve_range(range, total_size)?;
 
-        // Human: Decompress (or pass through legacy raw blobs) so range requests apply to logical object bytes.
-        // Agent: CALLS decompress_blob(blob, meta.size); slice Vec; streams via ReaderStream<Cursor>.
-        let logical = decompress_blob(&blob, total_size)?;
-        let (start, _end, content_length) = Self::resolve_range(range, logical.len() as u64)?;
-
-        let start_usize = start as usize;
-        let end_usize = start_usize + content_length as usize;
-        let slice = logical[start_usize..end_usize].to_vec();
-        let stream = ReaderStream::new(Cursor::new(slice));
+        // Human: Stream object bytes from disk, decompressing via spill file or channel when the blob is zstd-wrapped.
+        // Agent: CALLS open_object_body_stream(path, logical_size, range_start, content_length, data_dir); no full-blob RAM buffer.
+        let stream = open_object_body_stream(
+            path.as_path(),
+            total_size,
+            start,
+            content_length,
+            &self.data_dir,
+        )
+        .await?;
 
         Ok(GetObjectOutcome::Content {
             stream,
             content_length,
-            total_size: logical.len() as u64,
+            total_size,
             meta,
         })
     }

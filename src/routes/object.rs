@@ -68,7 +68,13 @@ fn extract_custom_meta(headers: &HeaderMap) -> Option<String> {
 }
 
 fn parse_copy_source(headers: &HeaderMap) -> Option<(String, String)> {
-    let raw = headers.get("x-nd-copy-source")?.to_str().ok()?;
+    // Human: Accept Nebular and S3 copy-source headers so compat clients can use CopyObject semantics.
+    // Agent: READS x-nd-copy-source OR x-amz-copy-source; PARSES bucket/key from "bucket/key" value.
+    let raw = headers
+        .get("x-nd-copy-source")
+        .or_else(|| headers.get("x-amz-copy-source"))?
+        .to_str()
+        .ok()?;
     let (bucket, key) = raw.split_once('/')?;
     if bucket.is_empty() || key.is_empty() {
         return None;

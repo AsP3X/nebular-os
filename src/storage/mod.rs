@@ -1,6 +1,7 @@
 pub mod blob_ops;
 pub mod compression;
 pub mod engine;
+pub mod streaming;
 pub mod error;
 pub mod maintenance;
 pub mod multipart;
