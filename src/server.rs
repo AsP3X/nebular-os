@@ -80,7 +80,9 @@ pub async fn create_app(storage: StorageEngine, cfg: Arc<NosConfig>) -> anyhow::
         ));
     }
 
-    let public_routes = Router::new().route("/health", get(health::health));
+    let public_routes = Router::new()
+        .route("/health", get(health::health))
+        .route("/health/ready", get(health::ready));
 
     let cors = build_cors(&cfg);
 

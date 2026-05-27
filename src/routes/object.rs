@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 use crate::routes::errors::{map_storage_error, PayloadTooLarge};
 use crate::routes::helpers::{
-    apply_object_headers, parse_if_modified_since, parse_if_none_match,
+    apply_object_headers, parse_if_match, parse_if_modified_since, parse_if_none_match,
 };
 use crate::routes::AppState;
 use crate::storage::engine::GetObjectOutcome;
@@ -90,11 +90,34 @@ pub async fn put_object(
     tracing::info!(bucket = %params.bucket, key = %params.key, "put_object started");
     let headers = req.headers().clone();
     let custom_meta = extract_custom_meta(&headers);
+    let if_match = parse_if_match(&headers);
+    let if_none_match = parse_if_none_match(&headers);
+
+    if let Err(e) = state
+        .storage
+        .ensure_write_preconditions(
+            &params.bucket,
+            &params.key,
+            if_match.as_deref(),
+            if_none_match.as_deref(),
+        )
+        .await
+    {
+        state.metrics.inc_errors();
+        return map_storage_error(e).into_response();
+    }
 
     if let Some((src_bucket, src_key)) = parse_copy_source(&headers) {
         match state
             .storage
-            .copy_object(&src_bucket, &src_key, &params.bucket, &params.key)
+            .copy_object(
+                &src_bucket,
+                &src_key,
+                &params.bucket,
+                &params.key,
+                if_match.as_deref(),
+                if_none_match.as_deref(),
+            )
             .await
         {
             Ok(meta) => {
@@ -255,8 +278,14 @@ pub async fn head_object(
 pub async fn delete_object(
     State(state): State<Arc<AppState>>,
     Path(params): Path<ObjectParams>,
+    req: Request,
 ) -> Response {
-    match state.storage.delete_object(&params.bucket, &params.key).await {
+    let if_match = parse_if_match(req.headers());
+    match state
+        .storage
+        .delete_object(&params.bucket, &params.key, if_match.as_deref())
+        .await
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
             state.metrics.inc_errors();

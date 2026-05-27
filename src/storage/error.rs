@@ -43,6 +43,8 @@ pub enum StorageError {
     InvalidBucket,
     #[error("invalid key")]
     InvalidKey,
+    #[error("precondition failed")]
+    PreconditionFailed,
     #[error("storage error")]
     Internal(#[from] anyhow::Error),
 }
@@ -54,6 +56,7 @@ impl StorageError {
             StorageError::RangeNotSatisfiable => "range not satisfiable",
             StorageError::PayloadTooLarge => "payload too large",
             StorageError::InvalidBucket | StorageError::InvalidKey => "invalid request",
+            StorageError::PreconditionFailed => "precondition failed",
             StorageError::Internal(_) => "storage error",
         }
     }
