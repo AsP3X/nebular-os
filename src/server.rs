@@ -99,6 +99,10 @@ pub async fn create_app(backend: StorageBackend, cfg: Arc<NosConfig>) -> anyhow:
             )
             .route("/_cluster/replicate", post(replicate::replicate))
             .route(
+                "/_cluster/assignment/resolve",
+                post(cluster_routes::assignment_resolve),
+            )
+            .route(
                 "/_cluster/objects/{bucket}/{*key}",
                 axum::routing::head(cluster_routes::cluster_object_head),
             )

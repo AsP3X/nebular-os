@@ -88,7 +88,35 @@ fn cluster_test_config(
             replication_role: role.into(),
             replication_factor,
             replication_pending_events: 0,
+            default_storage_class: "default".into(),
+            assignment_rules_raw: None,
+            assignment_forward: false,
         },
+    })
+}
+
+fn assigned_rules_json() -> String {
+    r#"{"rules":[
+        {"storage_class":"hls-hot","prefix":"users/","mime_prefix":"video/","assigned_node":"node-hot"},
+        {"storage_class":"cold","assigned_node":"node-cold"}
+    ]}"#
+    .into()
+}
+
+fn assigned_test_config(
+    node_id: &str,
+    storage_classes: &[&str],
+    peers: &str,
+) -> Arc<NosConfig> {
+    let base = cluster_test_config(node_id, peers, "member", 1);
+    Arc::new(NosConfig {
+        cluster: ClusterConfig {
+            mode: ClusterMode::Assigned,
+            storage_classes: storage_classes.iter().map(|s| (*s).to_string()).collect(),
+            assignment_rules_raw: Some(assigned_rules_json()),
+            ..base.cluster.clone()
+        },
+        ..(*base).clone()
     })
 }
 
@@ -260,4 +288,49 @@ async fn cluster_replicate_eventually() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("object not replicated to peer within timeout");
+}
+
+#[tokio::test]
+async fn assigned_routes_video_to_hot() {
+    let tmp_hot = TempDir::new().unwrap();
+    let tmp_cold = TempDir::new().unwrap();
+    let peers = "node-hot=http://127.0.0.1:1,node-cold=http://127.0.0.1:2";
+
+    let cfg_hot = assigned_test_config("node-hot", &["hls-hot", "default"], peers);
+    let (backend_hot, _) = engine_and_backend(&cfg_hot, &tmp_hot).await;
+    let app_hot = create_app(backend_hot, cfg_hot).await.unwrap();
+    let token = make_token();
+
+    let put_hot = Request::builder()
+        .method("PUT")
+        .uri("/music/users/clip.mp4")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "video/mp4")
+        .body(Body::from("video-bytes"))
+        .unwrap();
+    assert_eq!(
+        app_hot.oneshot(put_hot).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let cfg_cold = assigned_test_config("node-cold", &["cold"], peers);
+    let (backend_cold, _) = engine_and_backend(&cfg_cold, &tmp_cold).await;
+    let app_cold = create_app(backend_cold, cfg_cold).await.unwrap();
+
+    let put_cold = Request::builder()
+        .method("PUT")
+        .uri("/music/users/clip.mp4")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "video/mp4")
+        .body(Body::from("video-bytes"))
+        .unwrap();
+    let response = app_cold.oneshot(put_cold).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "object not assigned to this node");
+    assert_eq!(json["storage_class"], "hls-hot");
+    assert_eq!(json["assigned_node"], "node-hot");
 }

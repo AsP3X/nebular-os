@@ -1,4 +1,3 @@
-use anyhow::Context;
 use std::sync::Arc;
 
 use crate::config::NosConfig;
@@ -7,16 +6,18 @@ use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
 use crate::storage::types::{ListResult, ObjectMetadata};
 
-use super::peer::PeerRegistry;
+use super::assigned::{AssignedBackend, AssignedInner};
+use super::assignment::WriteContext;
 use super::replicated::ReplicatedBackend;
 use super::standalone::StandaloneBackend;
 
-/// Human: Single entry point for route handlers — standalone or replicated local engine.
-/// Agent: StorageBackend enum; routes use backend.*; build_backend selects variant from ClusterMode.
+/// Human: Single entry point for route handlers — standalone, replicated, or assigned placement.
+/// Agent: StorageBackend enum; build_backend selects variant from ClusterMode.
 #[derive(Clone)]
 pub enum StorageBackend {
     Standalone(StandaloneBackend),
     Replicated(ReplicatedBackend),
+    Assigned(AssignedBackend),
 }
 
 impl StorageBackend {
@@ -28,6 +29,7 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.engine(),
             Self::Replicated(b) => b.engine(),
+            Self::Assigned(b) => b.engine(),
         }
     }
 
@@ -35,6 +37,7 @@ impl StorageBackend {
         match self {
             Self::Standalone(_) => Ok(0),
             Self::Replicated(b) => b.pending_replication_events().await,
+            Self::Assigned(b) => b.pending_replication_events().await,
         }
     }
 
@@ -44,6 +47,7 @@ impl StorageBackend {
         key: &str,
         if_match: Option<&str>,
         if_none_match: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<(), StorageError> {
         match self {
             Self::Standalone(b) => {
@@ -52,6 +56,10 @@ impl StorageBackend {
             }
             Self::Replicated(b) => {
                 b.ensure_write_preconditions(bucket, key, if_match, if_none_match)
+                    .await
+            }
+            Self::Assigned(b) => {
+                b.ensure_write_preconditions(bucket, key, if_match, if_none_match, write_ctx)
                     .await
             }
         }
@@ -64,6 +72,7 @@ impl StorageBackend {
         content_type: Option<&str>,
         custom_meta: Option<&str>,
         body: impl tokio::io::AsyncRead + Unpin,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
         match self {
             Self::Standalone(b) => {
@@ -72,6 +81,10 @@ impl StorageBackend {
             }
             Self::Replicated(b) => {
                 b.put_object(bucket, key, content_type, custom_meta, body)
+                    .await
+            }
+            Self::Assigned(b) => {
+                b.put_object(bucket, key, content_type, custom_meta, body, write_ctx)
                     .await
             }
         }
@@ -85,6 +98,7 @@ impl StorageBackend {
         dst_key: &str,
         if_match: Option<&str>,
         if_none_match: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
         match self {
             Self::Standalone(b) => {
@@ -106,6 +120,18 @@ impl StorageBackend {
                     dst_key,
                     if_match,
                     if_none_match,
+                )
+                .await
+            }
+            Self::Assigned(b) => {
+                b.copy_object(
+                    src_bucket,
+                    src_key,
+                    dst_bucket,
+                    dst_key,
+                    if_match,
+                    if_none_match,
+                    write_ctx,
                 )
                 .await
             }
@@ -141,6 +167,16 @@ impl StorageBackend {
                 )
                 .await
             }
+            Self::Assigned(b) => {
+                b.get_object(
+                    bucket,
+                    key,
+                    range_header,
+                    if_none_match,
+                    if_modified_since,
+                )
+                .await
+            }
         }
     }
 
@@ -160,6 +196,10 @@ impl StorageBackend {
                 b.head_object(bucket, key, if_none_match, if_modified_since)
                     .await
             }
+            Self::Assigned(b) => {
+                b.head_object(bucket, key, if_none_match, if_modified_since)
+                    .await
+            }
         }
     }
 
@@ -168,10 +208,12 @@ impl StorageBackend {
         bucket: &str,
         key: &str,
         if_match: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<(), StorageError> {
         match self {
             Self::Standalone(b) => b.delete_object(bucket, key, if_match).await,
             Self::Replicated(b) => b.delete_object(bucket, key, if_match).await,
+            Self::Assigned(b) => b.delete_object(bucket, key, if_match, write_ctx).await,
         }
     }
 
@@ -192,6 +234,10 @@ impl StorageBackend {
                 b.list_objects(bucket, prefix, delimiter, limit, start_after)
                     .await
             }
+            Self::Assigned(b) => {
+                b.list_objects(bucket, prefix, delimiter, limit, start_after)
+                    .await
+            }
         }
     }
 
@@ -199,6 +245,7 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.probe_readiness().await,
             Self::Replicated(b) => b.probe_readiness().await,
+            Self::Assigned(b) => b.probe_readiness().await,
         }
     }
 
@@ -206,6 +253,7 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.object_count().await,
             Self::Replicated(b) => b.object_count().await,
+            Self::Assigned(b) => b.object_count().await,
         }
     }
 
@@ -213,6 +261,7 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.total_bytes().await,
             Self::Replicated(b) => b.total_bytes().await,
+            Self::Assigned(b) => b.total_bytes().await,
         }
     }
 
@@ -221,10 +270,12 @@ impl StorageBackend {
         bucket: &str,
         key: &str,
         content_type: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<InitMultipartResult, StorageError> {
         match self {
             Self::Standalone(b) => b.init_multipart(bucket, key, content_type).await,
             Self::Replicated(b) => b.init_multipart(bucket, key, content_type).await,
+            Self::Assigned(b) => b.init_multipart(bucket, key, content_type, write_ctx).await,
         }
     }
 
@@ -245,6 +296,10 @@ impl StorageBackend {
                 b.upload_part(bucket, key, upload_id, part_number, body)
                     .await
             }
+            Self::Assigned(b) => {
+                b.upload_part(bucket, key, upload_id, part_number, body)
+                    .await
+            }
         }
     }
 
@@ -254,6 +309,7 @@ impl StorageBackend {
         key: &str,
         upload_id: &str,
         custom_meta: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
         match self {
             Self::Standalone(b) => {
@@ -262,6 +318,10 @@ impl StorageBackend {
             }
             Self::Replicated(b) => {
                 b.complete_multipart(bucket, key, upload_id, custom_meta)
+                    .await
+            }
+            Self::Assigned(b) => {
+                b.complete_multipart(bucket, key, upload_id, custom_meta, write_ctx)
                     .await
             }
         }
@@ -276,6 +336,7 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.abort_multipart(bucket, key, upload_id).await,
             Self::Replicated(b) => b.abort_multipart(bucket, key, upload_id).await,
+            Self::Assigned(b) => b.abort_multipart(bucket, key, upload_id).await,
         }
     }
 
@@ -283,6 +344,7 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.multipart_key_for_upload(upload_id).await,
             Self::Replicated(b) => b.multipart_key_for_upload(upload_id).await,
+            Self::Assigned(b) => b.multipart_key_for_upload(upload_id).await,
         }
     }
 
@@ -290,27 +352,44 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.multipart_part_size(),
             Self::Replicated(b) => b.multipart_part_size(),
+            Self::Assigned(b) => b.multipart_part_size(),
         }
     }
 }
 
 /// Human: Construct the storage facade from engine + config.
-/// Agent: Standalone | Assigned => passthrough; Replicated* => ReplicatedBackend + worker.
+/// Agent: Standalone passthrough; Replicated* / Assigned* per ClusterMode flags.
 pub fn build_backend(engine: StorageEngine, cfg: &NosConfig) -> anyhow::Result<StorageBackend> {
-    if !cfg.cluster.mode_includes_replication() {
+    if cfg.cluster.is_standalone() {
         return Ok(StorageBackend::standalone(engine));
     }
 
-    let peers_raw = cfg
-        .cluster
-        .peers_raw
-        .as_deref()
-        .context("NOS_CLUSTER_PEERS is required for replicated cluster mode")?;
-    let peers = PeerRegistry::from_peers_raw(peers_raw)?;
+    let cluster = Arc::new(cfg.cluster.clone());
+    let peers = cfg.cluster.peer_registry()?;
 
-    Ok(StorageBackend::Replicated(ReplicatedBackend::new(
-        engine,
-        Arc::new(cfg.cluster.clone()),
-        peers,
-    )))
+    let inner = if cfg.cluster.mode_includes_replication() {
+        AssignedInner::Replicated(ReplicatedBackend::new(
+            engine,
+            cluster.clone(),
+            peers.clone(),
+        ))
+    } else {
+        AssignedInner::Standalone(StandaloneBackend::new(engine))
+    };
+
+    if cfg.cluster.mode_includes_assignment() {
+        let rules = cfg.cluster.assignment_rules()?;
+        return Ok(StorageBackend::Assigned(AssignedBackend::new(
+            inner,
+            cluster,
+            rules,
+            peers,
+        )));
+    }
+
+    if let AssignedInner::Replicated(r) = inner {
+        return Ok(StorageBackend::Replicated(r));
+    }
+
+    anyhow::bail!("unsupported cluster mode {:?}", cfg.cluster.mode)
 }

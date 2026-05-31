@@ -7,6 +7,8 @@ use axum::{
 use serde::Serialize;
 use std::sync::Arc;
 
+use crate::cluster::assignment::WriteContext;
+use crate::cluster::backend::StorageBackend;
 use crate::routes::AppState;
 
 #[derive(Serialize)]
@@ -79,6 +81,61 @@ pub struct ClusterCapabilitiesResponse {
 
 /// Human: Peers discover node capabilities without user JWT.
 /// Agent: GET /_cluster/capabilities; same auth as /_cluster/health.
+#[derive(serde::Deserialize)]
+pub struct AssignmentResolveRequest {
+    pub bucket: String,
+    pub key: String,
+    #[serde(default)]
+    pub content_type: Option<String>,
+    #[serde(default)]
+    pub storage_class_header: Option<String>,
+    #[serde(default)]
+    pub content_length: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+pub struct AssignmentResolveResponse {
+    pub storage_class: String,
+    pub assigned_node: Option<String>,
+    pub accept_local: bool,
+}
+
+/// Human: Debug endpoint for Ownly/admin to preview placement before upload.
+/// Agent: POST /_cluster/assignment/resolve; Bearer cluster token; no write.
+pub async fn assignment_resolve(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AssignmentResolveRequest>,
+) -> axum::response::Response {
+    let resolution = match &state.backend {
+        StorageBackend::Assigned(b) => {
+            let ctx = WriteContext {
+                storage_class_header: body.storage_class_header.clone(),
+                content_type: body.content_type.clone(),
+                custom_meta_storage_class: None,
+                content_length: body.content_length,
+            };
+            b.resolve(&body.bucket, &body.key, Some(&ctx))
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "assignment resolve requires assigned cluster mode" })),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(AssignmentResolveResponse {
+            storage_class: resolution.storage_class,
+            assigned_node: resolution.assigned_node,
+            accept_local: resolution.accept_local,
+        }),
+    )
+        .into_response()
+}
+
 pub async fn cluster_capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cluster = &state.config.cluster;
     (

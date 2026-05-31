@@ -2,6 +2,9 @@ use std::env;
 
 use anyhow::{bail, Context, Result};
 
+use super::assignment::AssignmentRules;
+use super::peer::PeerRegistry;
+
 /// Human: Deployment topology for Nebular — standalone is the default and ignores cluster env.
 /// Agent: ClusterMode parsed from NOS_CLUSTER_MODE; Standalone => no /_cluster routes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,9 @@ pub struct ClusterConfig {
     pub replication_role: String,
     pub replication_factor: u32,
     pub replication_pending_events: u64,
+    pub default_storage_class: String,
+    pub assignment_rules_raw: Option<String>,
+    pub assignment_forward: bool,
 }
 
 impl ClusterConfig {
@@ -67,7 +73,26 @@ impl ClusterConfig {
             replication_role: "member".into(),
             replication_factor: 1,
             replication_pending_events: 0,
+            default_storage_class: "default".into(),
+            assignment_rules_raw: None,
+            assignment_forward: false,
         }
+    }
+
+    pub fn assignment_rules(&self) -> Result<AssignmentRules> {
+        let raw = self
+            .assignment_rules_raw
+            .as_deref()
+            .context("NOS_ASSIGNMENT_RULES is required for assigned cluster modes")?;
+        AssignmentRules::load(raw, &self.default_storage_class)
+    }
+
+    pub fn peer_registry(&self) -> Result<PeerRegistry> {
+        let raw = self
+            .peers_raw
+            .as_deref()
+            .context("NOS_CLUSTER_PEERS is required when NOS_CLUSTER_MODE is not standalone")?;
+        PeerRegistry::from_peers_raw(raw)
     }
 
     pub fn is_standalone(&self) -> bool {
@@ -85,6 +110,15 @@ impl ClusterConfig {
 
     pub fn is_readonly_replica(&self) -> bool {
         self.replication_role.eq_ignore_ascii_case("readonly")
+    }
+
+    /// Human: True when writes are gated by storage class and assignment rules.
+    /// Agent: Assigned or ReplicatedAssigned modes.
+    pub fn mode_includes_assignment(&self) -> bool {
+        matches!(
+            self.mode,
+            ClusterMode::Assigned | ClusterMode::ReplicatedAssigned
+        )
     }
 
     pub fn from_env() -> Result<Self> {
@@ -132,6 +166,22 @@ impl ClusterConfig {
             .transpose()?
             .unwrap_or(1);
 
+        let default_storage_class =
+            env::var("NOS_DEFAULT_STORAGE_CLASS").unwrap_or_else(|_| "default".into());
+        let assignment_rules_raw = env::var("NOS_ASSIGNMENT_RULES")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let assignment_forward = env::var("NOS_ASSIGNMENT_FORWARD")
+            .ok()
+            .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+            .unwrap_or(false);
+
+        if matches!(mode, ClusterMode::Assigned | ClusterMode::ReplicatedAssigned)
+            && assignment_rules_raw.is_none()
+        {
+            bail!("NOS_ASSIGNMENT_RULES is required when NOS_CLUSTER_MODE is assigned or replicated+assigned");
+        }
+
         Ok(Self {
             mode,
             node_id,
@@ -144,6 +194,9 @@ impl ClusterConfig {
             replication_role,
             replication_factor,
             replication_pending_events: 0,
+            default_storage_class,
+            assignment_rules_raw,
+            assignment_forward,
         })
     }
 }

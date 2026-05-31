@@ -11,6 +11,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::routes::errors::map_storage_error;
+use crate::routes::helpers::write_context_from_headers;
 use crate::routes::object::LimitReader;
 use crate::routes::AppState;
 
@@ -43,14 +44,20 @@ pub async fn init_multipart(
     Query(query): Query<InitQuery>,
     req: Request,
 ) -> Response {
-    let content_type = req
-        .headers()
+    let headers = req.headers();
+    let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
+    let write_ctx = write_context_from_headers(headers, None);
 
     match state
         .backend
-        .init_multipart(&params.bucket, &query.key, content_type)
+        .init_multipart(
+            &params.bucket,
+            &query.key,
+            content_type,
+            Some(&write_ctx),
+        )
         .await
     {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
@@ -127,6 +134,7 @@ pub async fn complete_multipart(
     } else {
         Some(serde_json::to_string(&custom_meta_map).unwrap_or_default())
     };
+    let write_ctx = write_context_from_headers(req.headers(), custom_meta.as_deref());
 
     match state
         .backend
@@ -135,6 +143,7 @@ pub async fn complete_multipart(
             &key,
             &params.upload_id,
             custom_meta.as_deref(),
+            Some(&write_ctx),
         )
         .await
     {

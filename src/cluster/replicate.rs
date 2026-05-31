@@ -113,6 +113,9 @@ async fn apply_multipart(
 fn replication_log(state: &AppState) -> Result<&crate::cluster::replicated::ReplicationLog, StorageError> {
     match &state.backend {
         StorageBackend::Replicated(r) => Ok(r.replication_log()),
+        StorageBackend::Assigned(b) => b
+            .replication_log()
+            .ok_or_else(|| internal(anyhow::anyhow!("replicate on assigned standalone inner"))),
         StorageBackend::Standalone(_) => {
             Err(internal(anyhow::anyhow!("replicate on non-replicated backend")))
         }

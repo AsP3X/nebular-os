@@ -2,6 +2,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
+use crate::cluster::assignment::WriteContext;
 use crate::storage::types::ObjectMetadata;
 
 /// Replays stored custom metadata as `x-nd-custom-meta-*` response headers.
@@ -77,4 +78,36 @@ fn parse_etag_precondition(value: &axum::http::HeaderValue) -> Option<String> {
 /// Parses RFC 7233 range values including suffix form `bytes=-N`.
 pub fn parse_range(value: &str, total_size: u64) -> Option<(u64, u64)> {
     crate::storage::range::parse_content_range(value, total_size)
+}
+
+/// Human: Collect optional assignment hints from object upload headers.
+/// Agent: READS x-nd-storage-class, Content-Type, Content-Length, x-nd-custom-meta-storage-class.
+pub fn write_context_from_headers(
+    headers: &HeaderMap,
+    custom_meta_json: Option<&str>,
+) -> WriteContext {
+    let storage_class_header = headers
+        .get("x-nd-storage-class")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+    let custom_meta_storage_class = custom_meta_json.and_then(|raw| {
+        let map: Map<String, Value> = serde_json::from_str(raw).ok()?;
+        map.get("storage-class")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    WriteContext {
+        storage_class_header,
+        content_type,
+        custom_meta_storage_class,
+        content_length,
+    }
 }

@@ -1,3 +1,5 @@
+pub mod assigned;
+pub mod assignment;
 pub mod auth;
 pub mod backend;
 pub mod config;
@@ -7,6 +9,7 @@ pub mod replicated;
 pub mod routes;
 pub mod standalone;
 
+pub use assignment::WriteContext;
 pub use backend::{build_backend, StorageBackend};
 pub use config::{ClusterConfig, ClusterMode};
 pub use replicated::{

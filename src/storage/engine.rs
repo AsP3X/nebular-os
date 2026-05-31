@@ -274,6 +274,13 @@ impl StorageEngine {
         .await
         .map_err(internal)?;
 
+        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN storage_class TEXT DEFAULT 'default'")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN origin_node TEXT")
+            .execute(pool)
+            .await;
+
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(pool)
             .await
@@ -884,5 +891,29 @@ impl StorageEngine {
             .await
             .map_err(internal)?;
         Ok(total)
+    }
+
+    /// Human: Records which storage class and node own an object after assignment accepts a write.
+    /// Agent: UPDATE objects SET storage_class, origin_node for active row matching bucket/key.
+    pub async fn set_object_placement(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_class: &str,
+        origin_node: &str,
+    ) -> Result<(), StorageError> {
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        sqlx::query(
+            "UPDATE objects SET storage_class = ?, origin_node = ? WHERE bucket = ? AND key = ? AND deleted_at IS NULL",
+        )
+        .bind(storage_class)
+        .bind(origin_node)
+        .bind(&bucket)
+        .bind(&safe_key)
+        .execute(&self.write_pool)
+        .await
+        .map_err(internal)?;
+        Ok(())
     }
 }

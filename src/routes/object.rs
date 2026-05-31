@@ -17,6 +17,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use crate::routes::errors::{map_storage_error, PayloadTooLarge};
 use crate::routes::helpers::{
     apply_object_headers, parse_if_match, parse_if_modified_since, parse_if_none_match,
+    write_context_from_headers,
 };
 use crate::routes::AppState;
 use crate::storage::engine::GetObjectOutcome;
@@ -90,6 +91,7 @@ pub async fn put_object(
     tracing::info!(bucket = %params.bucket, key = %params.key, "put_object started");
     let headers = req.headers().clone();
     let custom_meta = extract_custom_meta(&headers);
+    let write_ctx = write_context_from_headers(&headers, custom_meta.as_deref());
     let if_match = parse_if_match(&headers);
     let if_none_match = parse_if_none_match(&headers);
 
@@ -100,6 +102,7 @@ pub async fn put_object(
             &params.key,
             if_match.as_deref(),
             if_none_match.as_deref(),
+            Some(&write_ctx),
         )
         .await
     {
@@ -117,6 +120,7 @@ pub async fn put_object(
                 &params.key,
                 if_match.as_deref(),
                 if_none_match.as_deref(),
+                Some(&write_ctx),
             )
             .await
         {
@@ -156,6 +160,7 @@ pub async fn put_object(
             content_type.as_deref(),
             custom_meta.as_deref(),
             body_reader,
+            Some(&write_ctx),
         )
         .await
     {
@@ -281,9 +286,15 @@ pub async fn delete_object(
     req: Request,
 ) -> Response {
     let if_match = parse_if_match(req.headers());
+    let write_ctx = write_context_from_headers(req.headers(), None);
     match state
         .backend
-        .delete_object(&params.bucket, &params.key, if_match.as_deref())
+        .delete_object(
+            &params.bucket,
+            &params.key,
+            if_match.as_deref(),
+            Some(&write_ctx),
+        )
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

@@ -69,6 +69,23 @@ fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<N
     })
 }
 
+#[tokio::test]
+async fn standalone_ignores_storage_class_header() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/local.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-nd-storage-class", "hls-hot")
+        .header("content-type", "video/mp4")
+        .body(Body::from("local"))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
 async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (axum::Router, String, TempDir) {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("blobs");
