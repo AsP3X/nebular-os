@@ -22,8 +22,11 @@ use crate::middleware::{
 use crate::observability::NosMetrics;
 use crate::routes::{bucket, capabilities, health, metrics, multipart, object, AppState};
 
-pub async fn create_app(backend: StorageBackend, cfg: Arc<NosConfig>) -> anyhow::Result<Router> {
-    let metrics = NosMetrics::new();
+pub async fn create_app(
+    backend: StorageBackend,
+    cfg: Arc<NosConfig>,
+    metrics: Arc<NosMetrics>,
+) -> anyhow::Result<Router> {
     let state = Arc::new(AppState {
         backend,
         config: cfg.clone(),

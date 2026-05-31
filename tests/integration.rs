@@ -5,6 +5,7 @@ use axum::http::{Request, StatusCode};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use nebular_os::auth::Claims;
 use nebular_os::cluster::{build_backend, ClusterConfig};
+use nebular_os::observability::NosMetrics;
 use nebular_os::config::NosConfig;
 use nebular_os::server::create_app;
 use nebular_os::storage::engine::{EngineOptions, StorageEngine};
@@ -109,8 +110,9 @@ async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (
     .unwrap();
 
     let cfg = test_config(signing_secret, allow_public_read);
-    let backend = build_backend(storage, &cfg).unwrap();
-    let app = create_app(backend, cfg).await.unwrap();
+    let metrics = NosMetrics::new();
+    let backend = build_backend(storage, &cfg, metrics.clone()).unwrap();
+    let app = create_app(backend, cfg, metrics).await.unwrap();
 
     (app, make_token(), tmp)
 }
@@ -662,8 +664,9 @@ async fn test_payload_too_large_returns_413() {
     let mut cfg = (*test_config(None, false)).clone();
     cfg.max_body_size = 8;
     let cfg = Arc::new(cfg);
-    let backend = build_backend(storage, &cfg).unwrap();
-    let app = create_app(backend, cfg).await.unwrap();
+    let metrics = NosMetrics::new();
+    let backend = build_backend(storage, &cfg, metrics.clone()).unwrap();
+    let app = create_app(backend, cfg, metrics).await.unwrap();
     let token = make_token();
 
     let req = Request::builder()
@@ -972,8 +975,9 @@ async fn test_metrics_requires_token_when_configured() {
     let mut cfg = (*test_config(None, false)).clone();
     cfg.metrics_token = Some("metrics-secret".into());
     let cfg = Arc::new(cfg);
-    let backend = build_backend(storage, &cfg).unwrap();
-    let app = create_app(backend, cfg).await.unwrap();
+    let metrics = NosMetrics::new();
+    let backend = build_backend(storage, &cfg, metrics.clone()).unwrap();
+    let app = create_app(backend, cfg, metrics).await.unwrap();
 
     let req = Request::builder()
         .method("GET")
@@ -1223,8 +1227,9 @@ async fn test_s3_list_objects_xml_when_compat_enabled() {
     )
     .await
     .unwrap();
-    let backend = build_backend(storage, &cfg).unwrap();
-    let app = create_app(backend, cfg).await.unwrap();
+    let metrics = NosMetrics::new();
+    let backend = build_backend(storage, &cfg, metrics.clone()).unwrap();
+    let app = create_app(backend, cfg, metrics).await.unwrap();
     let token = make_token();
 
     let put = Request::builder()
@@ -1270,8 +1275,9 @@ async fn test_bucket_policy_denies_other_bucket() {
     )
     .await
     .unwrap();
-    let backend = build_backend(storage, &cfg).unwrap();
-    let app = create_app(backend, cfg).await.unwrap();
+    let metrics = NosMetrics::new();
+    let backend = build_backend(storage, &cfg, metrics.clone()).unwrap();
+    let app = create_app(backend, cfg, metrics).await.unwrap();
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

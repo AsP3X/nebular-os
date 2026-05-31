@@ -57,9 +57,31 @@ paths:
       summary: Apply idempotent replication event from peer
       security:
         - clusterToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            description: Delete replication event (JSON body)
+          multipart/form-data:
+            description: Put replication — parts `event` (JSON) and `blob` (octet-stream)
+            schema:
+              type: object
+              properties:
+                event:
+                  type: string
+                  description: JSON-serialized ReplicationEvent
+                blob:
+                  type: string
+                  format: binary
       responses:
         "200":
           description: Applied or duplicate event_id
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /_cluster/assignment/resolve:
     post:
       summary: Preview storage class assignment (assigned modes)
@@ -154,6 +176,9 @@ paths:
         - in: header
           name: x-nd-storage-class
           schema: { type: string, description: "Ignored in standalone mode" }
+        - in: header
+          name: x-nd-replication-group
+          schema: { type: string, description: "Override NOS_REPLICATION_GROUP for replication enqueue" }
         - in: header
           name: x-nd-copy-source
           schema: { type: string, example: music/source.mp3 }

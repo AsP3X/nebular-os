@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+use crate::cluster::assignment::{replication_group_for_write, WriteContext};
 use crate::cluster::config::ClusterConfig;
-use crate::cluster::peer::PeerRegistry;
+use crate::cluster::peer::{PeerRegistry, spawn_peer_health_checks};
 use crate::cluster::read_repair;
+use crate::observability::NosMetrics;
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
@@ -28,6 +30,7 @@ impl ReplicatedBackend {
         engine: StorageEngine,
         cluster: Arc<ClusterConfig>,
         peers: PeerRegistry,
+        metrics: Arc<NosMetrics>,
     ) -> Self {
         let token = cluster
             .cluster_token
@@ -41,7 +44,14 @@ impl ReplicatedBackend {
         let inner = InnerBackend::new(engine);
 
         let peers = Arc::new(peers);
-        spawn_replication_worker(log.clone(), peers.clone(), cluster.clone(), token);
+        spawn_replication_worker(
+            log.clone(),
+            peers.clone(),
+            cluster.clone(),
+            token.clone(),
+            metrics,
+        );
+        spawn_peer_health_checks(peers.clone(), token, cluster.node_id.clone());
 
         Self {
             inner,
@@ -49,6 +59,16 @@ impl ReplicatedBackend {
             cluster,
             peers,
         }
+    }
+
+    fn replication_group<'a>(&self, ctx: Option<&'a WriteContext>) -> String {
+        replication_group_for_write(ctx, &self.cluster)
+    }
+
+    fn storage_class_for_write<'a>(&self, ctx: Option<&'a WriteContext>) -> String {
+        ctx.and_then(|c| c.storage_class_header.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| self.cluster.default_storage_class.clone())
     }
 
     pub fn engine(&self) -> &StorageEngine {
@@ -106,11 +126,14 @@ impl ReplicatedBackend {
         content_type: Option<&str>,
         custom_meta: Option<&str>,
         body: impl tokio::io::AsyncRead + Unpin,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
         let meta = self
             .put_object_local(bucket, key, content_type, custom_meta, body)
             .await?;
-        self.log.enqueue_put(&meta, "default").await?;
+        let class = self.storage_class_for_write(write_ctx);
+        let group = self.replication_group(write_ctx);
+        self.log.enqueue_put(&meta, &class, &group).await?;
         Ok(meta)
     }
 
@@ -144,6 +167,7 @@ impl ReplicatedBackend {
         dst_key: &str,
         if_match: Option<&str>,
         if_none_match: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
         let meta = self
             .copy_object_local(
@@ -155,7 +179,9 @@ impl ReplicatedBackend {
                 if_none_match,
             )
             .await?;
-        self.log.enqueue_put(&meta, "default").await?;
+        let class = self.storage_class_for_write(write_ctx);
+        let group = self.replication_group(write_ctx);
+        self.log.enqueue_put(&meta, &class, &group).await?;
         Ok(meta)
     }
 
@@ -220,10 +246,20 @@ impl ReplicatedBackend {
         bucket: &str,
         key: &str,
         if_match: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<(), StorageError> {
         self.ensure_writable()?;
+        let storage_class = self
+            .inner
+            .engine()
+            .active_storage_class(bucket, key)
+            .await?
+            .unwrap_or_else(|| "default".into());
+        let group = self.replication_group(write_ctx);
         self.inner.delete_object(bucket, key, if_match).await?;
-        self.log.enqueue_delete(bucket, key).await?;
+        self.log
+            .enqueue_delete(bucket, key, &storage_class, &group)
+            .await?;
         Ok(())
     }
 
@@ -295,11 +331,14 @@ impl ReplicatedBackend {
         key: &str,
         upload_id: &str,
         custom_meta: Option<&str>,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
         let meta = self
             .complete_multipart_local(bucket, key, upload_id, custom_meta)
             .await?;
-        self.log.enqueue_put(&meta, "default").await?;
+        let class = self.storage_class_for_write(write_ctx);
+        let group = self.replication_group(write_ctx);
+        self.log.enqueue_put(&meta, &class, &group).await?;
         Ok(meta)
     }
 

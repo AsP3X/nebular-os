@@ -40,6 +40,16 @@ pub fn apply_object_headers(headers: &mut HeaderMap, meta: &ObjectMetadata) {
     if let Ok(v) = HeaderValue::from_str(&meta.updated_at.to_rfc2822()) {
         headers.insert(header::LAST_MODIFIED, v);
     }
+    if let Some(class) = &meta.storage_class
+        && let Ok(v) = HeaderValue::from_str(class)
+    {
+        headers.insert(HeaderName::from_static("x-nd-storage-class"), v);
+    }
+    if let Some(node) = &meta.origin_node
+        && let Ok(v) = HeaderValue::from_str(node)
+    {
+        headers.insert(HeaderName::from_static("x-nd-origin-node"), v);
+    }
     apply_custom_meta_headers(headers, meta);
 }
 
@@ -104,10 +114,20 @@ pub fn write_context_from_headers(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let replication_group_header = headers
+        .get("x-nd-replication-group")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     WriteContext {
         storage_class_header,
         content_type,
         custom_meta_storage_class,
         content_length,
+        authorization,
+        replication_group_header,
     }
 }

@@ -14,6 +14,18 @@ pub struct WriteContext {
     pub content_type: Option<String>,
     pub custom_meta_storage_class: Option<String>,
     pub content_length: Option<u64>,
+    /// Caller `Authorization` header value (used for NOS_ASSIGNMENT_FORWARD).
+    pub authorization: Option<String>,
+    /// Optional override for replication peer group selection (`x-nd-replication-group`).
+    pub replication_group_header: Option<String>,
+}
+
+/// Human: Replication group for enqueue/worker — header wins over NOS_REPLICATION_GROUP.
+/// Agent: READS WriteContext.replication_group_header else ClusterConfig.replication_group.
+pub fn replication_group_for_write(ctx: Option<&WriteContext>, cluster: &ClusterConfig) -> String {
+    ctx.and_then(|c| c.replication_group_header.clone())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cluster.replication_group.clone())
 }
 
 /// Human: JSON rules that map object shape to a storage class (and optional target node hint).

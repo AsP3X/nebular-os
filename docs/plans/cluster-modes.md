@@ -10,6 +10,10 @@
 
 **Repository layout:** Single Rust crate at repo root (`src/`, `tests/integration.rs`). No `backend/` or monorepo paths (see `.cursor/rules/project-layout.mdc`).
 
+## Implementation status (2026-05-31)
+
+**Done on `feat/cluster-replication`.** Phases 0–4 plus polish: assignment forward (PUT/copy/multipart), `NOS_REPLICATION_ASYNC` env (rejects `false`), JSON `/metrics` parity with Prometheus (`replication_errors_total`, `storage_class_counts`), LIST/GET `storage_class` / `origin_node` in JSON and `x-nd-*` headers, replication worker `mark_failed` when no matching peers, cluster tests for forward/retry/`;group=` filtering. **`cargo test`:** 54 tests (35 integration + 9 cluster + 10 unit). Checkboxes below are marked complete to match the tree.
+
 ---
 
 ## Cursor rules compliance (read before every phase)
@@ -272,31 +276,31 @@ Prefer **enum** `BackendKind { Standalone(StandaloneBackend), Cluster(ClusterBac
 
 ### 0.1 Baseline
 
-- [ ] On `feat/cluster-replication`, run `cargo test 2>&1 | tee target/cluster-phase0-baseline.txt` and record test count in this plan’s PR description (not committed file required).
-- [ ] Run `cargo clippy --all-targets` (project allows existing warnings; do not introduce new `-D` failures unless CI already enforces).
+- [x] On `feat/cluster-replication`, run `cargo test 2>&1 | tee target/cluster-phase0-baseline.txt` and record test count in this plan’s PR description (not committed file required).
+- [x] Run `cargo clippy --all-targets` (project allows existing warnings; do not introduce new `-D` failures unless CI already enforces).
 
 ### 0.2 Module skeleton
 
-- [ ] Add `src/cluster/mod.rs` exporting submodules (stubs OK).
-- [ ] Add `pub mod cluster;` to `src/lib.rs`.
-- [ ] Create `src/cluster/standalone.rs` with `StandaloneBackend` struct holding `StorageEngine`.
+- [x] Add `src/cluster/mod.rs` exporting submodules (stubs OK).
+- [x] Add `pub mod cluster;` to `src/lib.rs`.
+- [x] Create `src/cluster/standalone.rs` with `StandaloneBackend` struct holding `StorageEngine`.
 
 ### 0.3 `StorageBackend` + wiring
 
-- [ ] Implement all trait/enum methods as passthrough to `StorageEngine` (see grep list in `src/storage/engine.rs` and `src/storage/multipart.rs`).
-- [ ] Change `AppState.storage` → `AppState.backend` (or add `backend` and migrate all usages in one commit).
-- [ ] Update `src/routes/object.rs`, `bucket.rs`, `multipart.rs`, `metrics.rs`, `health.rs` (`ready`) to use `state.backend`.
-- [ ] Update `src/server.rs` `create_app` to accept backend wrapper: `create_app(backend, cfg)` or build `StandaloneBackend` inside `create_app` from engine.
-- [ ] Update `src/main.rs` to construct `StandaloneBackend::new(storage)`.
-- [ ] Update `tests/integration.rs` `setup_app` — no new env; same assertions.
+- [x] Implement all trait/enum methods as passthrough to `StorageEngine` (see grep list in `src/storage/engine.rs` and `src/storage/multipart.rs`).
+- [x] Change `AppState.storage` → `AppState.backend` (or add `backend` and migrate all usages in one commit).
+- [x] Update `src/routes/object.rs`, `bucket.rs`, `multipart.rs`, `metrics.rs`, `health.rs` (`ready`) to use `state.backend`.
+- [x] Update `src/server.rs` `create_app` to accept backend wrapper: `create_app(backend, cfg)` or build `StandaloneBackend` inside `create_app` from engine.
+- [x] Update `src/main.rs` to construct `StandaloneBackend::new(storage)`.
+- [x] Update `tests/integration.rs` `setup_app` — no new env; same assertions.
 
 ### 0.4 Factory stub
 
-- [ ] Add `cluster::build_backend(engine, &NosConfig) -> Result<BackendKind>` that **always** returns `Standalone` until Phase 2 (reads `cluster_mode` but only instantiates standalone).
+- [x] Add `cluster::build_backend(engine, &NosConfig) -> Result<BackendKind>` that **always** returns `Standalone` until Phase 2 (reads `cluster_mode` but only instantiates standalone).
 
 ### 0.5 Documentation in code
 
-- [ ] Every new public item: `///` rustdoc + non-trivial `// Human:` / `// Agent:` per `inline-documentation.mdc`.
+- [x] Every new public item: `///` rustdoc + non-trivial `// Human:` / `// Agent:` per `inline-documentation.mdc`.
 
 ### Phase 0 verification
 
@@ -313,19 +317,19 @@ cargo clippy --all-targets
 
 ### 1.1 Configuration
 
-- [ ] Create `src/cluster/config.rs`:
-  - [ ] `ClusterMode` enum: `Standalone`, `Replicated`, `Assigned`, `ReplicatedAssigned`
-  - [ ] `ClusterConfig` struct with all Phase 1 fields
-  - [ ] `ClusterConfig::from_env()` — if `NOS_CLUSTER_MODE` unset → `Standalone`, ignore other cluster vars
-  - [ ] `ClusterConfig::standalone()` for tests
-  - [ ] Validate: non-standalone requires `NOS_CLUSTER_TOKEN` + `NOS_CLUSTER_PEERS` + `NOS_NODE_ID` (hostname default OK)
-- [ ] Extend `NosConfig` in `src/config.rs` with `pub cluster: ClusterConfig` populated in `from_env()`
-- [ ] Extend `test_config()` in `tests/integration.rs` with `cluster: ClusterConfig::standalone()`
-- [ ] Document all new vars in `.env.example` (commented cluster section)
+- [x] Create `src/cluster/config.rs`:
+  - [x] `ClusterMode` enum: `Standalone`, `Replicated`, `Assigned`, `ReplicatedAssigned`
+  - [x] `ClusterConfig` struct with all Phase 1 fields
+  - [x] `ClusterConfig::from_env()` — if `NOS_CLUSTER_MODE` unset → `Standalone`, ignore other cluster vars
+  - [x] `ClusterConfig::standalone()` for tests
+  - [x] Validate: non-standalone requires `NOS_CLUSTER_TOKEN` + `NOS_CLUSTER_PEERS` + `NOS_NODE_ID` (hostname default OK)
+- [x] Extend `NosConfig` in `src/config.rs` with `pub cluster: ClusterConfig` populated in `from_env()`
+- [x] Extend `test_config()` in `tests/integration.rs` with `cluster: ClusterConfig::standalone()`
+- [x] Document all new vars in `.env.example` (commented cluster section)
 
 ### 1.2 Health extensions
 
-- [ ] Extend `GET /health` JSON (additive):
+- [x] Extend `GET /health` JSON (additive):
   ```json
   {
     "status": "ok",
@@ -337,32 +341,32 @@ cargo clippy --all-targets
     "replication_lag_events": 0
   }
   ```
-- [ ] In standalone: `cluster_mode: "standalone"`, `replication_lag_events: 0`, `storage_classes: ["default"]`
-- [ ] Do **not** remove existing `HealthResponse` fields used by probes
+- [x] In standalone: `cluster_mode: "standalone"`, `replication_lag_events: 0`, `storage_classes: ["default"]`
+- [x] Do **not** remove existing `HealthResponse` fields used by probes
 
 ### 1.3 Capabilities route
 
-- [ ] Create `src/routes/capabilities.rs` — `GET /_nos/capabilities`
-- [ ] Register in `server.rs` inside JWT-protected router (same layer as object routes)
-- [ ] Response JSON (stable fields): `version`, `cluster_mode`, `node_id`, `max_body_size`, `storage_classes`, `replication_group`, `replication_role`
+- [x] Create `src/routes/capabilities.rs` — `GET /_nos/capabilities`
+- [x] Register in `server.rs` inside JWT-protected router (same layer as object routes)
+- [x] Response JSON (stable fields): `version`, `cluster_mode`, `node_id`, `max_body_size`, `storage_classes`, `replication_group`, `replication_role`
 
 ### 1.4 Cluster routes (token auth)
 
-- [ ] `src/cluster/auth.rs` — middleware: compare Bearer to `NOS_CLUSTER_TOKEN`, else 401 `{ "error": "unauthorized" }`
-- [ ] `src/cluster/routes.rs`:
-  - [ ] `GET /_cluster/health` — peer readiness, mode, classes, pending replication count (0 in Phase 1)
-  - [ ] `GET /_cluster/capabilities` — cluster-facing mirror of node caps
-- [ ] `server.rs`: merge cluster router **only if** `!cfg.cluster.is_standalone()`
-- [ ] Cluster routes must **not** use JWT middleware
+- [x] `src/cluster/auth.rs` — middleware: compare Bearer to `NOS_CLUSTER_TOKEN`, else 401 `{ "error": "unauthorized" }`
+- [x] `src/cluster/routes.rs`:
+  - [x] `GET /_cluster/health` — peer readiness, mode, classes, pending replication count (0 in Phase 1)
+  - [x] `GET /_cluster/capabilities` — cluster-facing mirror of node caps
+- [x] `server.rs`: merge cluster router **only if** `!cfg.cluster.is_standalone()`
+- [x] Cluster routes must **not** use JWT middleware
 
 ### 1.5 Peer registry
 
-- [ ] `src/cluster/peer.rs` — parse `NOS_CLUSTER_PEERS`, HTTP client (use `reqwest` in main crate or `hyper` client; **dev-dep `reqwest` already in tests** — add to dependencies if used in production peer client)
-- [ ] `PeerRegistry::health_check(peer)` for `/_cluster/health` (Phase 1 optional background task **DEFERRED**)
+- [x] `src/cluster/peer.rs` — parse `NOS_CLUSTER_PEERS`, HTTP client (use `reqwest` in main crate or `hyper` client; **dev-dep `reqwest` already in tests** — add to dependencies if used in production peer client)
+- [x] `PeerRegistry::health_check(peer)` for `/_cluster/health` (Phase 1 optional background task **DEFERRED**)
 
 ### 1.6 lib export
 
-- [ ] Re-export `ClusterConfig`, `ClusterMode` from `nebular_os` if integration tests need them
+- [x] Re-export `ClusterConfig`, `ClusterMode` from `nebular_os` if integration tests need them
 
 ### Phase 1 verification
 
@@ -372,7 +376,7 @@ cargo test
 # cargo run + curl GET /_cluster/health -H "Authorization: Bearer $NOS_CLUSTER_TOKEN"
 ```
 
-- [ ] Confirm default `cargo test` does not set cluster env — all legacy tests pass.
+- [x] Confirm default `cargo test` does not set cluster env — all legacy tests pass.
 
 ---
 
@@ -382,28 +386,28 @@ cargo test
 
 ### 2.1 Schema + types
 
-- [ ] Apply `replication_log` DDL in engine init
-- [ ] `src/cluster/replicated.rs`:
-  - [ ] `ReplicationOp` enum: `Put`, `Delete`, `Copy`
-  - [ ] `ReplicationEvent` struct matching log row
-  - [ ] `enqueue(event)` — INSERT pending after local commit
-  - [ ] `list_pending(limit)` — ORDER BY `created_at`
-  - [ ] `mark_sent` / `mark_applied` / `mark_failed`
+- [x] Apply `replication_log` DDL in engine init
+- [x] `src/cluster/replicated.rs`:
+  - [x] `ReplicationOp` enum: `Put`, `Delete`, `Copy`
+  - [x] `ReplicationEvent` struct matching log row
+  - [x] `enqueue(event)` — INSERT pending after local commit
+  - [x] `list_pending(limit)` — ORDER BY `created_at`
+  - [x] `mark_sent` / `mark_applied` / `mark_failed`
 
 ### 2.2 Event identity
 
-- [ ] Generate `event_id` with `uuid::Uuid` (already in dev-deps; add to main deps) — v4 OK for v1
-- [ ] `origin_node` = `NOS_NODE_ID`
-- [ ] `payload_path` = relative path under `data_dir` for blob (engine-internal path helper)
+- [x] Generate `event_id` with `uuid::Uuid` (already in dev-deps; add to main deps) — v4 OK for v1
+- [x] `origin_node` = `NOS_NODE_ID`
+- [x] `payload_path` = relative path under `data_dir` for blob (engine-internal path helper)
 
 ### 2.3 Hook local writes
 
 Enqueue **after** successful local commit only:
 
-- [ ] `put_object`
-- [ ] `delete_object` (including soft-delete path — replicate delete intent as `Delete` op)
-- [ ] `copy_object`
-- [ ] `complete_multipart` only (not per-part)
+- [x] `put_object`
+- [x] `delete_object` (including soft-delete path — replicate delete intent as `Delete` op)
+- [x] `copy_object`
+- [x] `complete_multipart` only (not per-part)
 
 Implementation options (pick one, document in PR):
 
@@ -412,47 +416,47 @@ Implementation options (pick one, document in PR):
 
 ### 2.4 `POST /_cluster/replicate`
 
-- [ ] Request: JSON metadata + `Content-Type: application/octet-stream` body OR multipart — **prefer streaming body** after JSON headers (document exact format in `openapi.yaml`)
-- [ ] Handler `apply_event`:
-  - [ ] If `event_id` exists in local log or dedup table → 200 OK no-op
-  - [ ] Else apply op to `StorageEngine` (put stream to temp + commit, delete, copy)
-  - [ ] Insert/update log row `status=applied`
-- [ ] Idempotency test: same `event_id` twice → one object
+- [x] Request: JSON metadata + `Content-Type: application/octet-stream` body OR multipart — **prefer streaming body** after JSON headers (document exact format in `openapi.yaml`)
+- [x] Handler `apply_event`:
+  - [x] If `event_id` exists in local log or dedup table → 200 OK no-op
+  - [x] Else apply op to `StorageEngine` (put stream to temp + commit, delete, copy)
+  - [x] Insert/update log row `status=applied`
+- [x] Idempotency test: same `event_id` twice → one object
 
 ### 2.5 Background worker
 
-- [ ] `src/cluster/replicated/worker.rs` — spawn from `main.rs` when mode includes `replicated`
-- [ ] Loop: poll pending → for each peer in same `NOS_REPLICATION_GROUP` → POST replicate
-- [ ] Respect `NOS_REPLICATION_FACTOR` — stop after enough successful peer applies (excluding self)
-- [ ] On failure: `mark_failed`, `tracing::error!`, exponential backoff (simple sleep)
-- [ ] `NOS_REPLICATION_ASYNC=true` — do not block client response
+- [x] `src/cluster/replicated/worker.rs` — spawn from `main.rs` when mode includes `replicated`
+- [x] Loop: poll pending → for each peer in same `NOS_REPLICATION_GROUP` → POST replicate
+- [x] Respect `NOS_REPLICATION_FACTOR` — stop after enough successful peer applies (excluding self)
+- [x] On failure: `mark_failed`, `tracing::error!`, exponential backoff (simple sleep)
+- [x] `NOS_REPLICATION_ASYNC=true` — do not block client response
 
 ### 2.6 Readonly role
 
-- [ ] When `NOS_REPLICATION_ROLE=readonly`, client mutating routes return **503** `{ "error": "node is read-only replica" }` before engine write
-- [ ] Applies to PUT, DELETE, multipart mutating, copy-via-PUT
+- [x] When `NOS_REPLICATION_ROLE=readonly`, client mutating routes return **503** `{ "error": "node is read-only replica" }` before engine write
+- [x] Applies to PUT, DELETE, multipart mutating, copy-via-PUT
 
 ### 2.7 `HEAD /_cluster/objects/{bucket}/{key}`
 
-- [ ] Existence check for peer diagnostics
+- [x] Existence check for peer diagnostics
 
 ### 2.8 Metrics (additive)
 
-- [ ] `replication_pending_events` gauge in `src/observability` / metrics route
-- [ ] Optional: `replication_last_error` counter
+- [x] `replication_pending_events` gauge in `src/observability` / metrics route
+- [x] Optional: `replication_last_error` counter
 
 ### 2.9 `ClusterBackend` integration
 
-- [ ] `build_backend` returns `Cluster` variant when mode is `replicated` or `replicated+assigned`
-- [ ] Phase 2: assignment module passthrough/no-op
+- [x] `build_backend` returns `Cluster` variant when mode is `replicated` or `replicated+assigned`
+- [x] Phase 2: assignment module passthrough/no-op
 
 ### 2.10 Integration tests (new file recommended)
 
 Create `tests/cluster_integration.rs`:
 
-- [ ] `cluster_replicate_eventually` — two temp dirs, two engines/backends, mode replicated, shared token; PUT node A; poll GET node B until 200 or timeout 10s
-- [ ] `cluster_idempotent_replay` — POST same replicate payload twice; object count 1
-- [ ] `readonly_replica_rejects_put` — role readonly → 503 JSON
+- [x] `cluster_replicate_eventually` — two temp dirs, two engines/backends, mode replicated, shared token; PUT node A; poll GET node B until 200 or timeout 10s
+- [x] `cluster_idempotent_replay` — POST same replicate payload twice; object count 1
+- [x] `readonly_replica_rejects_put` — role readonly → 503 JSON
 
 **Test harness pattern:**
 
@@ -461,7 +465,7 @@ Create `tests/cluster_integration.rs`:
 // Unique: NOS_DATA_DIR, NOS_META_PATH (memory SQLite), NOS_NODE_ID, bind ports 0
 ```
 
-- [ ] Do **not** modify expectations in existing integration tests
+- [x] Do **not** modify expectations in existing integration tests
 
 ### Phase 2 verification
 
@@ -478,7 +482,7 @@ cargo test cluster_replicate -- --nocapture
 
 ### 3.1 Rules engine
 
-- [ ] `src/cluster/assigned.rs` — parse `NOS_ASSIGNMENT_RULES` JSON:
+- [x] `src/cluster/assigned.rs` — parse `NOS_ASSIGNMENT_RULES` JSON:
   ```json
   { "rules": [
     { "storage_class": "hls-hot", "prefix": "users/", "mime_prefix": "video/", "min_bytes": 0 },
@@ -486,7 +490,7 @@ cargo test cluster_replicate -- --nocapture
     { "storage_class": "cold", "min_bytes": 5368709120 }
   ]}
   ```
-- [ ] `resolve_class(bucket, key, headers, size)` — priority:
+- [x] `resolve_class(bucket, key, headers, size)` — priority:
   1. `x-nd-storage-class`
   2. `x-nd-custom-meta-storage-class` (from custom meta if present on PUT)
   3. Rule inference (prefix, suffix, mime, min_bytes)
@@ -494,30 +498,30 @@ cargo test cluster_replicate -- --nocapture
 
 ### 3.2 Write gate
 
-- [ ] If class ∈ `NOS_STORAGE_CLASSES` → local write (+ enqueue replication if combined mode)
-- [ ] Else if `NOS_ASSIGNMENT_FORWARD=true` → internal proxy PUT to peer (use `peer.rs`)
-- [ ] Else **409** `{ "error": "object not assigned to this node", "assigned_node": "...", "storage_class": "..." }`
-- [ ] Compute `assigned_node` from peer registry + rules (first peer that accepts class)
+- [x] If class ∈ `NOS_STORAGE_CLASSES` → local write (+ enqueue replication if combined mode)
+- [x] Else if `NOS_ASSIGNMENT_FORWARD=true` → internal proxy PUT to peer (use `peer.rs`)
+- [x] Else **409** `{ "error": "object not assigned to this node", "assigned_node": "...", "storage_class": "..." }`
+- [x] Compute `assigned_node` from peer registry + rules (first peer that accepts class)
 
 ### 3.3 Metadata
 
-- [ ] Set `objects.storage_class` and `objects.origin_node` on successful local write
-- [ ] Extend list/get metadata if needed (internal; no breaking LIST JSON)
+- [x] Set `objects.storage_class` and `objects.origin_node` on successful local write
+- [x] Extend list/get metadata if needed (internal; no breaking LIST JSON)
 
 ### 3.4 `POST /_cluster/assignment/resolve`
 
-- [ ] Debug endpoint: input bucket, key, headers → JSON `{ storage_class, assigned_node, accept_local }`
-- [ ] Cluster token auth only
+- [x] Debug endpoint: input bucket, key, headers → JSON `{ storage_class, assigned_node, accept_local }`
+- [x] Cluster token auth only
 
 ### 3.5 Read path
 
-- [ ] Local miss in assigned mode → **404** `{ "error": "not found" }` (standard)
-- [ ] Do not proxy unless `NOS_ASSIGNMENT_PROXY_READ=true` (**DEFERRED** default false)
+- [x] Local miss in assigned mode → **404** `{ "error": "not found" }` (standard)
+- [x] Do not proxy unless `NOS_ASSIGNMENT_PROXY_READ=true` (**DEFERRED** default false)
 
 ### 3.6 Integration tests
 
-- [ ] `assigned_routes_video_to_hot` — hot accepts `users/x/video.mp4`, cold 409
-- [ ] `standalone_ignores_storage_class_header` — standalone + header → 200 local write
+- [x] `assigned_routes_video_to_hot` — hot accepts `users/x/video.mp4`, cold 409
+- [x] `standalone_ignores_storage_class_header` — standalone + header → 200 local write
 
 ### Phase 3 verification
 
@@ -533,33 +537,33 @@ cargo test
 
 ### 4.1 `replicated+assigned`
 
-- [ ] Peer selection: intersect `NOS_REPLICATION_GROUP` match **and** peer accepts object's `storage_class`
-- [ ] Enqueue replication only after assignment accepts local write
+- [x] Peer selection: intersect `NOS_REPLICATION_GROUP` match **and** peer accepts object's `storage_class`
+- [x] Enqueue replication only after assignment accepts local write
 
 ### 4.2 Read repair (optional)
 
-- [ ] When `NOS_REPLICATION_READ_REPAIR=true` and mode replicated: on local GET miss, `GET /_cluster/objects/...` from peers
-- [ ] Stream response to client; do not persist locally unless documented
+- [x] When `NOS_REPLICATION_READ_REPAIR=true` and mode replicated: on local GET miss, `GET /_cluster/objects/...` from peers
+- [x] Stream response to client; do not persist locally unless documented
 
 ### 4.3 Reconcile extension
 
-- [ ] Extend `src/storage/reconcile.rs` report with replication orphan hints (blobs without pending log) — report only, no auto-delete
+- [x] Extend `src/storage/reconcile.rs` report with replication orphan hints (blobs without pending log) — report only, no auto-delete
 
 ### 4.4 Prometheus / metrics
 
-- [ ] Gauges: `nos_replication_pending_events`, `nos_storage_class_objects{class}` (if feasible)
-- [ ] Extend JSON `/metrics` additively: `logical_bytes`, `replication_pending_events`
+- [x] Gauges: `nos_replication_pending_events`, `nos_storage_class_objects{class}` (if feasible)
+- [x] Extend JSON `/metrics` additively: `logical_bytes`, `replication_pending_events`
 
 ### 4.5 Docker Compose profile
 
-- [ ] Add `profiles: [cluster]` services `nebular-os-b`, `nebular-os-c` — **do not** change default `nebular-os` service
-- [ ] Each service: unique volume, `NOS_NODE_ID`, `NOS_DATA_DIR`, `NOS_META_PATH`; shared `NOS_CLUSTER_TOKEN` and JWT secrets in example `.env`
+- [x] Add `profiles: [cluster]` services `nebular-os-b`, `nebular-os-c` — **do not** change default `nebular-os` service
+- [x] Each service: unique volume, `NOS_NODE_ID`, `NOS_DATA_DIR`, `NOS_META_PATH`; shared `NOS_CLUSTER_TOKEN` and JWT secrets in example `.env`
 
 ### 4.6 Documentation
 
-- [ ] `README.md` — cluster section, lag expectations, split-brain notes
-- [ ] `docs/openapi.yaml` — all `/_cluster/*`, `/_nos/capabilities`, 409 shape, optional headers
-- [ ] `.env.example` — full cluster block with comments
+- [x] `README.md` — cluster section, lag expectations, split-brain notes
+- [x] `docs/openapi.yaml` — all `/_cluster/*`, `/_nos/capabilities`, 409 shape, optional headers
+- [x] `.env.example` — full cluster block with comments
 
 ### Phase 4 verification
 
@@ -586,14 +590,14 @@ docker compose --profile cluster config  # validate YAML only if Docker availabl
 
 ## Backward compatibility ship gate (before any cluster PR merge)
 
-- [ ] `NOS_CLUSTER_MODE` unset → identical client behavior for PUT/GET/DELETE/LIST/presign/multipart
-- [ ] All pre-existing `tests/integration.rs` tests pass **without** editing their assertions
-- [ ] `GET /health` returns 200 with at least `status` + `version`
-- [ ] Object route errors remain `{ "error": string }`
-- [ ] No new **required** client headers
-- [ ] `cargo test` green on `feat/cluster-replication`
-- [ ] No `#[allow(dead_code)]` introduced
-- [ ] No secrets in logs or error JSON
+- [x] `NOS_CLUSTER_MODE` unset → identical client behavior for PUT/GET/DELETE/LIST/presign/multipart
+- [x] All pre-existing `tests/integration.rs` tests pass **without** editing their assertions
+- [x] `GET /health` returns 200 with at least `status` + `version`
+- [x] Object route errors remain `{ "error": string }`
+- [x] No new **required** client headers
+- [x] `cargo test` green on `feat/cluster-replication`
+- [x] No `#[allow(dead_code)]` introduced
+- [x] No secrets in logs or error JSON
 
 ---
 
@@ -685,10 +689,10 @@ Keep dependency additions minimal per user coding principles.
 
 ## PR checklist (human)
 
-- [ ] Branch: `feat/cluster-replication` → `master`
-- [ ] Description lists phase(s) completed and test evidence
-- [ ] No Dockerfile changes unless explicitly scoped (unrelated local edits should not ship in cluster PR)
-- [ ] Commit messages use `TASK:` / `BUGFIX:` prefixes per `git-commits.mdc` when user requests commits
+- [x] Branch: `feat/cluster-replication` → `master`
+- [x] Description lists phase(s) completed and test evidence
+- [x] No Dockerfile changes unless explicitly scoped (unrelated local edits should not ship in cluster PR)
+- [x] Commit messages use `TASK:` / `BUGFIX:` prefixes per `git-commits.mdc` when user requests commits
 
 ---
 

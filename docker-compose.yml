@@ -27,7 +27,7 @@ services:
       NOS_CLUSTER_MODE: replicated+assigned
       NOS_NODE_ID: node-hot
       NOS_CLUSTER_TOKEN: ${NOS_CLUSTER_TOKEN:?Set NOS_CLUSTER_TOKEN in .env}
-      NOS_CLUSTER_PEERS: node-cold=http://nebular-os-cold:9000;default,hls-hot
+      NOS_CLUSTER_PEERS: node-cold=http://nebular-os-cold:9000;default,hls-hot;group=default
       NOS_STORAGE_CLASSES: default,hls-hot
       NOS_REPLICATION_FACTOR: "2"
       NOS_ASSIGNMENT_RULES: '{"rules":[{"storage_class":"hls-hot","prefix":"users/","mime_prefix":"video/","assigned_node":"node-hot"}]}'
@@ -50,7 +50,7 @@ services:
       NOS_CLUSTER_MODE: assigned
       NOS_NODE_ID: node-cold
       NOS_CLUSTER_TOKEN: ${NOS_CLUSTER_TOKEN:?Set NOS_CLUSTER_TOKEN in .env}
-      NOS_CLUSTER_PEERS: node-hot=http://nebular-os-hot:9000;hls-hot,default
+      NOS_CLUSTER_PEERS: node-hot=http://nebular-os-hot:9000;hls-hot,default;group=default
       NOS_STORAGE_CLASSES: cold
       NOS_ASSIGNMENT_RULES: '{"rules":[{"storage_class":"cold","assigned_node":"node-cold"}]}'
       RUST_LOG: info

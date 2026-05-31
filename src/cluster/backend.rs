@@ -8,6 +8,7 @@ use crate::storage::types::{ListResult, ObjectMetadata};
 
 use super::assigned::{AssignedBackend, AssignedInner};
 use super::assignment::WriteContext;
+use crate::observability::NosMetrics;
 use super::replicated::ReplicatedBackend;
 use super::standalone::StandaloneBackend;
 
@@ -80,7 +81,7 @@ impl StorageBackend {
                     .await
             }
             Self::Replicated(b) => {
-                b.put_object(bucket, key, content_type, custom_meta, body)
+                b.put_object(bucket, key, content_type, custom_meta, body, write_ctx)
                     .await
             }
             Self::Assigned(b) => {
@@ -120,6 +121,7 @@ impl StorageBackend {
                     dst_key,
                     if_match,
                     if_none_match,
+                    write_ctx,
                 )
                 .await
             }
@@ -212,7 +214,7 @@ impl StorageBackend {
     ) -> Result<(), StorageError> {
         match self {
             Self::Standalone(b) => b.delete_object(bucket, key, if_match).await,
-            Self::Replicated(b) => b.delete_object(bucket, key, if_match).await,
+            Self::Replicated(b) => b.delete_object(bucket, key, if_match, write_ctx).await,
             Self::Assigned(b) => b.delete_object(bucket, key, if_match, write_ctx).await,
         }
     }
@@ -286,6 +288,7 @@ impl StorageBackend {
         upload_id: &str,
         part_number: i32,
         body: impl tokio::io::AsyncRead + Unpin,
+        write_ctx: Option<&WriteContext>,
     ) -> Result<PartUploadResult, StorageError> {
         match self {
             Self::Standalone(b) => {
@@ -297,7 +300,7 @@ impl StorageBackend {
                     .await
             }
             Self::Assigned(b) => {
-                b.upload_part(bucket, key, upload_id, part_number, body)
+                b.upload_part(bucket, key, upload_id, part_number, body, write_ctx)
                     .await
             }
         }
@@ -317,7 +320,7 @@ impl StorageBackend {
                     .await
             }
             Self::Replicated(b) => {
-                b.complete_multipart(bucket, key, upload_id, custom_meta)
+                b.complete_multipart(bucket, key, upload_id, custom_meta, write_ctx)
                     .await
             }
             Self::Assigned(b) => {
@@ -359,19 +362,30 @@ impl StorageBackend {
 
 /// Human: Construct the storage facade from engine + config.
 /// Agent: Standalone passthrough; Replicated* / Assigned* per ClusterMode flags.
-pub fn build_backend(engine: StorageEngine, cfg: &NosConfig) -> anyhow::Result<StorageBackend> {
+pub fn build_backend(
+    engine: StorageEngine,
+    cfg: &NosConfig,
+    metrics: Arc<NosMetrics>,
+) -> anyhow::Result<StorageBackend> {
     if cfg.cluster.is_standalone() {
         return Ok(StorageBackend::standalone(engine));
     }
 
     let cluster = Arc::new(cfg.cluster.clone());
     let peers = cfg.cluster.peer_registry()?;
+    if !peers.peers.contains_key(&cluster.node_id) {
+        tracing::warn!(
+            node_id = %cluster.node_id,
+            "NOS_NODE_ID is not listed in NOS_CLUSTER_PEERS (asymmetric peering)"
+        );
+    }
 
     let inner = if cfg.cluster.mode_includes_replication() {
         AssignedInner::Replicated(ReplicatedBackend::new(
             engine,
             cluster.clone(),
             peers.clone(),
+            metrics,
         ))
     } else {
         AssignedInner::Standalone(StandaloneBackend::new(engine))

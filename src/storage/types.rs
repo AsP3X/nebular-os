@@ -13,6 +13,10 @@ pub struct ObjectMetadata {
     pub custom_meta: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_node: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -22,6 +26,10 @@ pub struct ListItem {
     pub mime_type: Option<String>,
     pub etag: Option<String>,
     pub last_modified: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin_node: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

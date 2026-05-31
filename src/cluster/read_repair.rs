@@ -105,6 +105,8 @@ pub async fn fetch_from_peers(
             updated_at: epoch,
             custom_meta: None,
             deleted_at: None,
+            storage_class: None,
+            origin_node: None,
         };
 
         if status == StatusCode::NOT_MODIFIED {

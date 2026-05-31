@@ -8,6 +8,7 @@ pub struct NosMetrics {
     pub http_errors_total: AtomicU64,
     pub bytes_uploaded_total: AtomicU64,
     pub bytes_downloaded_total: AtomicU64,
+    pub replication_errors_total: AtomicU64,
 }
 
 impl NosMetrics {
@@ -31,14 +32,23 @@ impl NosMetrics {
         self.bytes_downloaded_total.fetch_add(n, Ordering::Relaxed);
     }
 
+    pub fn inc_replication_errors(&self) {
+        self.replication_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn replication_errors_total(&self) -> u64 {
+        self.replication_errors_total.load(Ordering::Relaxed)
+    }
+
     /// Renders Prometheus exposition format for scrape targets.
     pub fn render_prometheus(
         &self,
         total_objects: i64,
         total_bytes: i64,
         replication_pending_events: u64,
+        storage_class_counts: &[(String, i64)],
     ) -> String {
-        format!(
+        let mut out = format!(
             "# HELP nos_http_requests_total Total HTTP requests handled.\n\
              # TYPE nos_http_requests_total counter\n\
              nos_http_requests_total {}\n\
@@ -62,7 +72,10 @@ impl NosMetrics {
              nos_logical_bytes_total {}\n\
              # HELP nos_replication_pending_events Pending replication_log rows.\n\
              # TYPE nos_replication_pending_events gauge\n\
-             nos_replication_pending_events {}\n",
+             nos_replication_pending_events {}\n\
+             # HELP nos_replication_errors_total Replication push failures.\n\
+             # TYPE nos_replication_errors_total counter\n\
+             nos_replication_errors_total {}\n",
             self.http_requests_total.load(Ordering::Relaxed),
             self.http_errors_total.load(Ordering::Relaxed),
             self.bytes_uploaded_total.load(Ordering::Relaxed),
@@ -71,6 +84,23 @@ impl NosMetrics {
             total_bytes,
             total_bytes,
             replication_pending_events,
-        )
+            self.replication_errors_total.load(Ordering::Relaxed),
+        );
+        out.push_str(
+            "# HELP nos_storage_class_objects Objects per storage_class label.\n\
+             # TYPE nos_storage_class_objects gauge\n",
+        );
+        for (class, count) in storage_class_counts {
+            out.push_str(&format!(
+                "nos_storage_class_objects{{class=\"{}\"}} {}\n",
+                escape_label(class),
+                count
+            ));
+        }
+        out
     }
+}
+
+fn escape_label(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }

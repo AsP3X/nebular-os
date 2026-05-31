@@ -46,6 +46,7 @@ pub struct ReplicationEvent {
     pub size: Option<i64>,
     pub payload_path: Option<String>,
     pub storage_class: String,
+    pub replication_group: String,
     pub created_at: i64,
 }
 
@@ -88,6 +89,7 @@ impl ReplicationLog {
         &self,
         meta: &ObjectMetadata,
         storage_class: &str,
+        replication_group: &str,
     ) -> Result<ReplicationEvent, StorageError> {
         let event = ReplicationEvent {
             event_id: Uuid::new_v4().to_string(),
@@ -99,6 +101,7 @@ impl ReplicationLog {
             size: Some(meta.size),
             payload_path: Some(self.relative_blob_path(&meta.bucket, &meta.key)),
             storage_class: storage_class.to_string(),
+            replication_group: replication_group.to_string(),
             created_at: Utc::now().timestamp(),
         };
         self.insert_pending(&event).await?;
@@ -109,6 +112,8 @@ impl ReplicationLog {
         &self,
         bucket: &str,
         key: &str,
+        storage_class: &str,
+        replication_group: &str,
     ) -> Result<ReplicationEvent, StorageError> {
         let event = ReplicationEvent {
             event_id: Uuid::new_v4().to_string(),
@@ -119,7 +124,8 @@ impl ReplicationLog {
             etag: None,
             size: None,
             payload_path: None,
-            storage_class: "default".into(),
+            storage_class: storage_class.to_string(),
+            replication_group: replication_group.to_string(),
             created_at: Utc::now().timestamp(),
         };
         self.insert_pending(&event).await?;
@@ -128,8 +134,8 @@ impl ReplicationLog {
 
     async fn insert_pending(&self, event: &ReplicationEvent) -> Result<(), StorageError> {
         sqlx::query(
-            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, created_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, replication_group, created_at, status, attempts, next_retry_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL)",
         )
         .bind(&event.event_id)
         .bind(&event.origin_node)
@@ -140,6 +146,7 @@ impl ReplicationLog {
         .bind(event.size)
         .bind(&event.payload_path)
         .bind(&event.storage_class)
+        .bind(&event.replication_group)
         .bind(event.created_at)
         .execute(&self.pool)
         .await
@@ -148,17 +155,30 @@ impl ReplicationLog {
     }
 
     pub async fn list_pending(&self, limit: i64) -> Result<Vec<ReplicationEvent>, StorageError> {
+        let now = Utc::now().timestamp();
         let rows = sqlx::query_as::<_, ReplicationRow>(
-            "SELECT event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, created_at
+            "SELECT event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, COALESCE(replication_group, 'default') AS replication_group, created_at, status
              FROM replication_log
              WHERE status = 'pending'
+                OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= ?))
              ORDER BY created_at ASC
              LIMIT ?",
         )
+        .bind(now)
         .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(internal)?;
+
+        for row in &rows {
+            if row.status.as_deref() == Some("failed") {
+                sqlx::query("UPDATE replication_log SET status = 'pending' WHERE event_id = ?")
+                    .bind(&row.event_id)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
 
         rows.into_iter()
             .map(ReplicationRow::into_event)
@@ -166,11 +186,16 @@ impl ReplicationLog {
     }
 
     pub async fn count_pending(&self) -> Result<u64, StorageError> {
-        let row: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM replication_log WHERE status = 'pending'")
-                .fetch_one(&self.pool)
-                .await
-                .map_err(internal)?;
+        let now = Utc::now().timestamp();
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM replication_log
+             WHERE status = 'pending'
+                OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= ?))",
+        )
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(internal)?;
         Ok(row.0.max(0) as u64)
     }
 
@@ -184,19 +209,33 @@ impl ReplicationLog {
     }
 
     pub async fn mark_failed(&self, event_id: &str) -> Result<(), StorageError> {
-        sqlx::query("UPDATE replication_log SET status = 'failed' WHERE event_id = ?")
-            .bind(event_id)
-            .execute(&self.pool)
-            .await
-            .map_err(internal)?;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT attempts FROM replication_log WHERE event_id = ?",
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(internal)?;
+        let attempts = row.map(|(a,)| a).unwrap_or(0) + 1;
+        let backoff = (1i64 << attempts.min(10)).min(3600);
+        let next_retry_at = Utc::now().timestamp() + backoff;
+        sqlx::query(
+            "UPDATE replication_log SET status = 'failed', attempts = ?, next_retry_at = ? WHERE event_id = ?",
+        )
+        .bind(attempts)
+        .bind(next_retry_at)
+        .bind(event_id)
+        .execute(&self.pool)
+        .await
+        .map_err(internal)?;
         Ok(())
     }
 
     pub async fn record_applied(&self, event: &ReplicationEvent) -> Result<bool, StorageError> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, created_at, applied_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied')
+            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, replication_group, created_at, applied_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied')
              ON CONFLICT(event_id) DO NOTHING",
         )
         .bind(&event.event_id)
@@ -208,6 +247,7 @@ impl ReplicationLog {
         .bind(event.size)
         .bind(&event.payload_path)
         .bind(&event.storage_class)
+        .bind(&event.replication_group)
         .bind(event.created_at)
         .bind(now)
         .execute(&self.pool)
@@ -239,7 +279,9 @@ struct ReplicationRow {
     size: Option<i64>,
     payload_path: Option<String>,
     storage_class: String,
+    replication_group: String,
     created_at: i64,
+    status: Option<String>,
 }
 
 impl ReplicationRow {
@@ -257,6 +299,7 @@ impl ReplicationRow {
             size: self.size,
             payload_path: self.payload_path,
             storage_class: self.storage_class,
+            replication_group: self.replication_group,
             created_at: self.created_at,
         })
     }

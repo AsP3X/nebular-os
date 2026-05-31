@@ -79,6 +79,7 @@ pub async fn upload_part(
         Err(e) => return map_storage_error(e).into_response(),
     };
 
+    let write_ctx = write_context_from_headers(req.headers(), None);
     let max_part = state.backend.multipart_part_size();
     let body_stream = req.into_body().into_data_stream();
     let body_reader = tokio_util::io::StreamReader::new(
@@ -99,6 +100,7 @@ pub async fn upload_part(
             &params.upload_id,
             params.part_number,
             body_reader,
+            Some(&write_ctx),
         )
         .await
     {

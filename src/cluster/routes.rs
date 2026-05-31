@@ -174,6 +174,8 @@ pub async fn assignment_resolve(
                 content_type: body.content_type.clone(),
                 custom_meta_storage_class: None,
                 content_length: body.content_length,
+                authorization: None,
+                replication_group_header: None,
             };
             b.resolve(&body.bucket, &body.key, Some(&ctx))
         }

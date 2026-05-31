@@ -3,6 +3,7 @@ pub mod assignment;
 pub mod auth;
 pub mod backend;
 pub mod config;
+pub mod forward;
 pub mod peer;
 pub mod read_repair;
 pub mod replicate;

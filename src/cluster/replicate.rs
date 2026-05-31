@@ -29,10 +29,10 @@ pub async fn replicate(
     let result = if content_type.starts_with("multipart/") {
         let mut multipart = match Multipart::from_request(req, state.as_ref()).await {
             Ok(m) => m,
-            Err(e) => {
+            Err(_) => {
                 return (
                     StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": e.to_string() })),
+                    Json(json!({ "error": "invalid request" })),
                 )
                     .into_response();
             }

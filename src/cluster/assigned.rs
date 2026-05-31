@@ -5,7 +5,10 @@ use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
 use crate::storage::types::{ListResult, ObjectMetadata};
 
-use super::assignment::{AssignmentResolution, AssignmentRules, WriteContext};
+use super::assignment::{
+    replication_group_for_write, AssignmentResolution, AssignmentRules, WriteContext,
+};
+use super::forward;
 use super::config::ClusterConfig;
 use super::peer::PeerRegistry;
 use super::replicated::ReplicatedBackend;
@@ -81,17 +84,20 @@ impl AssignedBackend {
         ctx: Option<&WriteContext>,
     ) -> Result<AssignmentResolution, StorageError> {
         let resolution = self.resolve(bucket, key, ctx);
-        if resolution.accept_local {
+        if resolution.accept_local || self.cluster.assignment_forward {
             return Ok(resolution);
-        }
-        if self.cluster.assignment_forward {
-            // Human: Forwarding is opt-in; Phase 3 keeps it off by default.
-            // Agent: DEFERRED forward path — return NotAssigned until NOS_ASSIGNMENT_FORWARD is implemented.
         }
         Err(StorageError::NotAssigned {
             assigned_node: resolution.assigned_node.unwrap_or_else(|| "unknown".into()),
             storage_class: resolution.storage_class,
         })
+    }
+
+    fn not_assigned(resolution: &AssignmentResolution) -> StorageError {
+        StorageError::NotAssigned {
+            assigned_node: resolution.assigned_node.clone().unwrap_or_else(|| "unknown".into()),
+            storage_class: resolution.storage_class.clone(),
+        }
     }
 
     async fn record_placement(&self, bucket: &str, key: &str, class: &str) -> Result<(), StorageError> {
@@ -127,10 +133,30 @@ impl AssignedBackend {
         key: &str,
         content_type: Option<&str>,
         custom_meta: Option<&str>,
-        body: impl tokio::io::AsyncRead + Unpin,
+        mut body: impl tokio::io::AsyncRead + Unpin,
         ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
-        let resolution = self.ensure_placement(bucket, key, ctx)?;
+        let resolution = self.resolve(bucket, key, ctx);
+        if !resolution.accept_local {
+            if self.cluster.assignment_forward {
+                let mut buf = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut body, &mut buf)
+                    .await
+                    .map_err(crate::storage::error::map_io_error)?;
+                return forward::proxy_put(
+                    &self.peers,
+                    &resolution,
+                    bucket,
+                    key,
+                    content_type,
+                    custom_meta,
+                    buf,
+                    ctx,
+                )
+                .await;
+            }
+            return Err(Self::not_assigned(&resolution));
+        }
         let meta = match &self.inner {
             AssignedInner::Standalone(b) => {
                 b.put_object(bucket, key, content_type, custom_meta, body)
@@ -140,8 +166,9 @@ impl AssignedBackend {
                 let meta = b
                     .put_object_local(bucket, key, content_type, custom_meta, body)
                     .await?;
+                let group = replication_group_for_write(ctx, &self.cluster);
                 b.replication_log()
-                    .enqueue_put(&meta, &resolution.storage_class)
+                    .enqueue_put(&meta, &resolution.storage_class, &group)
                     .await?;
                 meta
             }
@@ -161,7 +188,24 @@ impl AssignedBackend {
         if_none_match: Option<&str>,
         ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
-        let resolution = self.ensure_placement(dst_bucket, dst_key, ctx)?;
+        let resolution = self.resolve(dst_bucket, dst_key, ctx);
+        if !resolution.accept_local {
+            if self.cluster.assignment_forward {
+                return forward::proxy_copy(
+                    &self.peers,
+                    &resolution,
+                    src_bucket,
+                    src_key,
+                    dst_bucket,
+                    dst_key,
+                    if_match,
+                    if_none_match,
+                    ctx,
+                )
+                .await;
+            }
+            return Err(Self::not_assigned(&resolution));
+        }
         let meta = match &self.inner {
             AssignedInner::Standalone(b) => {
                 b.copy_object(
@@ -185,8 +229,9 @@ impl AssignedBackend {
                         if_none_match,
                     )
                     .await?;
+                let group = replication_group_for_write(ctx, &self.cluster);
                 b.replication_log()
-                    .enqueue_put(&meta, &resolution.storage_class)
+                    .enqueue_put(&meta, &resolution.storage_class, &group)
                     .await?;
                 meta
             }
@@ -257,7 +302,7 @@ impl AssignedBackend {
         self.ensure_placement(bucket, key, ctx)?;
         match &self.inner {
             AssignedInner::Standalone(b) => b.delete_object(bucket, key, if_match).await,
-            AssignedInner::Replicated(b) => b.delete_object(bucket, key, if_match).await,
+            AssignedInner::Replicated(b) => b.delete_object(bucket, key, if_match, ctx).await,
         }
     }
 
@@ -309,7 +354,21 @@ impl AssignedBackend {
         content_type: Option<&str>,
         ctx: Option<&WriteContext>,
     ) -> Result<InitMultipartResult, StorageError> {
-        self.ensure_placement(bucket, key, ctx)?;
+        let resolution = self.resolve(bucket, key, ctx);
+        if !resolution.accept_local {
+            if self.cluster.assignment_forward {
+                return forward::proxy_init_multipart(
+                    &self.peers,
+                    &resolution,
+                    bucket,
+                    key,
+                    content_type,
+                    ctx,
+                )
+                .await;
+            }
+            return Err(Self::not_assigned(&resolution));
+        }
         match &self.inner {
             AssignedInner::Standalone(b) => b.init_multipart(bucket, key, content_type).await,
             AssignedInner::Replicated(b) => b.init_multipart(bucket, key, content_type).await,
@@ -322,8 +381,30 @@ impl AssignedBackend {
         key: &str,
         upload_id: &str,
         part_number: i32,
-        body: impl tokio::io::AsyncRead + Unpin,
+        mut body: impl tokio::io::AsyncRead + Unpin,
+        ctx: Option<&WriteContext>,
     ) -> Result<PartUploadResult, StorageError> {
+        let resolution = self.resolve(bucket, key, ctx);
+        if !resolution.accept_local {
+            if self.cluster.assignment_forward {
+                let mut buf = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut body, &mut buf)
+                    .await
+                    .map_err(crate::storage::error::map_io_error)?;
+                return forward::proxy_upload_part(
+                    &self.peers,
+                    &resolution,
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    buf,
+                    ctx,
+                )
+                .await;
+            }
+            return Err(Self::not_assigned(&resolution));
+        }
         match &self.inner {
             AssignedInner::Standalone(b) => {
                 b.upload_part(bucket, key, upload_id, part_number, body)
@@ -344,7 +425,22 @@ impl AssignedBackend {
         custom_meta: Option<&str>,
         ctx: Option<&WriteContext>,
     ) -> Result<ObjectMetadata, StorageError> {
-        let resolution = self.ensure_placement(bucket, key, ctx)?;
+        let resolution = self.resolve(bucket, key, ctx);
+        if !resolution.accept_local {
+            if self.cluster.assignment_forward {
+                return forward::proxy_complete_multipart(
+                    &self.peers,
+                    &resolution,
+                    bucket,
+                    key,
+                    upload_id,
+                    custom_meta,
+                    ctx,
+                )
+                .await;
+            }
+            return Err(Self::not_assigned(&resolution));
+        }
         let meta = match &self.inner {
             AssignedInner::Standalone(b) => {
                 b.complete_multipart(bucket, key, upload_id, custom_meta)
@@ -354,8 +450,9 @@ impl AssignedBackend {
                 let meta = b
                     .complete_multipart_local(bucket, key, upload_id, custom_meta)
                     .await?;
+                let group = replication_group_for_write(ctx, &self.cluster);
                 b.replication_log()
-                    .enqueue_put(&meta, &resolution.storage_class)
+                    .enqueue_put(&meta, &resolution.storage_class, &group)
                     .await?;
                 meta
             }
