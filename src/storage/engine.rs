@@ -280,6 +280,11 @@ impl StorageEngine {
         let _ = sqlx::query("ALTER TABLE objects ADD COLUMN origin_node TEXT")
             .execute(pool)
             .await;
+        let _ = sqlx::query(
+            "ALTER TABLE replication_log ADD COLUMN storage_class TEXT DEFAULT 'default'",
+        )
+        .execute(pool)
+        .await;
 
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(pool)

@@ -79,7 +79,9 @@ impl ReplicatedBackend {
             .await
     }
 
-    pub async fn put_object(
+    /// Human: Local put without replication enqueue (used by AssignedBackend with explicit class).
+    /// Agent: CALLS inner.put_object only; NO replication_log insert.
+    pub async fn put_object_local(
         &self,
         bucket: &str,
         key: &str,
@@ -88,12 +90,46 @@ impl ReplicatedBackend {
         body: impl tokio::io::AsyncRead + Unpin,
     ) -> Result<ObjectMetadata, StorageError> {
         self.ensure_writable()?;
-        let meta = self
-            .inner
+        self.inner
             .put_object(bucket, key, content_type, custom_meta, body)
+            .await
+    }
+
+    pub async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        custom_meta: Option<&str>,
+        body: impl tokio::io::AsyncRead + Unpin,
+    ) -> Result<ObjectMetadata, StorageError> {
+        let meta = self
+            .put_object_local(bucket, key, content_type, custom_meta, body)
             .await?;
-        self.log.enqueue_put(&meta).await?;
+        self.log.enqueue_put(&meta, "default").await?;
         Ok(meta)
+    }
+
+    pub async fn copy_object_local(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        if_match: Option<&str>,
+        if_none_match: Option<&str>,
+    ) -> Result<ObjectMetadata, StorageError> {
+        self.ensure_writable()?;
+        self.inner
+            .copy_object(
+                src_bucket,
+                src_key,
+                dst_bucket,
+                dst_key,
+                if_match,
+                if_none_match,
+            )
+            .await
     }
 
     pub async fn copy_object(
@@ -105,10 +141,8 @@ impl ReplicatedBackend {
         if_match: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<ObjectMetadata, StorageError> {
-        self.ensure_writable()?;
         let meta = self
-            .inner
-            .copy_object(
+            .copy_object_local(
                 src_bucket,
                 src_key,
                 dst_bucket,
@@ -117,7 +151,7 @@ impl ReplicatedBackend {
                 if_none_match,
             )
             .await?;
-        self.log.enqueue_put(&meta).await?;
+        self.log.enqueue_put(&meta, "default").await?;
         Ok(meta)
     }
 
@@ -213,7 +247,7 @@ impl ReplicatedBackend {
             .await
     }
 
-    pub async fn complete_multipart(
+    pub async fn complete_multipart_local(
         &self,
         bucket: &str,
         key: &str,
@@ -221,11 +255,22 @@ impl ReplicatedBackend {
         custom_meta: Option<&str>,
     ) -> Result<ObjectMetadata, StorageError> {
         self.ensure_writable()?;
-        let meta = self
-            .inner
+        self.inner
             .complete_multipart(bucket, key, upload_id, custom_meta)
+            .await
+    }
+
+    pub async fn complete_multipart(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        custom_meta: Option<&str>,
+    ) -> Result<ObjectMetadata, StorageError> {
+        let meta = self
+            .complete_multipart_local(bucket, key, upload_id, custom_meta)
             .await?;
-        self.log.enqueue_put(&meta).await?;
+        self.log.enqueue_put(&meta, "default").await?;
         Ok(meta)
     }
 

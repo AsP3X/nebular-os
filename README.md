@@ -54,6 +54,24 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_CORS_ORIGINS` | Comma-separated allowed origins; empty = permissive |
 | `RUST_LOG` | Tracing filter (default `info`) |
 
+### Cluster modes (optional)
+
+Unset `NOS_CLUSTER_MODE` for standalone (default). See [docs/plans/cluster-modes.md](docs/plans/cluster-modes.md).
+
+| Variable | Description |
+|----------|-------------|
+| `NOS_CLUSTER_MODE` | `standalone` (default), `replicated`, `assigned`, or `replicated+assigned` |
+| `NOS_NODE_ID` | Stable node identity |
+| `NOS_CLUSTER_TOKEN` | Bearer token for `/_cluster/*` routes |
+| `NOS_CLUSTER_PEERS` | `node-b=http://host:9000;class-a,class-b` (optional `;classes` per peer) |
+| `NOS_STORAGE_CLASSES` | Comma-separated classes this node accepts |
+| `NOS_REPLICATION_FACTOR` | Target copies including self (`1` = no peer copies) |
+| `NOS_ASSIGNMENT_RULES` | JSON rules file path or inline JSON |
+| `NOS_DEFAULT_STORAGE_CLASS` | Default class when no rule matches |
+| `x-nd-storage-class` | Optional client header (ignored in standalone) |
+
+Multi-node local dev: `docker compose --profile cluster up --build` (hot on port 9001, cold on 9002; default single-node service unchanged on 9000).
+
 ## HTTP API
 
 See [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
@@ -71,7 +89,10 @@ See [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
 | `DELETE` | `/:bucket/_multipart/{upload_id}` | Bearer JWT | Abort multipart upload |
 | `GET` | `/health` | None | Liveness check (process up) |
 | `GET` | `/health/ready` | None | Readiness check (SQLite + `NOS_DATA_DIR` writable) |
+| `GET` | `/_nos/capabilities` | Bearer JWT | Node limits and cluster mode (when enabled) |
 | `GET` | `/metrics` | Optional Bearer (`NOS_METRICS_TOKEN`) | JSON or Prometheus (`Accept: text/plain`) |
+
+Cluster-only routes (require `NOS_CLUSTER_TOKEN`): `GET /_cluster/health`, `POST /_cluster/replicate`, `POST /_cluster/assignment/resolve`, etc.
 
 ## Use as a Rust dependency
 

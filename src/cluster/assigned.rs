@@ -137,8 +137,13 @@ impl AssignedBackend {
                     .await?
             }
             AssignedInner::Replicated(b) => {
-                b.put_object(bucket, key, content_type, custom_meta, body)
-                    .await?
+                let meta = b
+                    .put_object_local(bucket, key, content_type, custom_meta, body)
+                    .await?;
+                b.replication_log()
+                    .enqueue_put(&meta, &resolution.storage_class)
+                    .await?;
+                meta
             }
         };
         self.record_placement(bucket, &meta.key, &resolution.storage_class)
@@ -170,15 +175,20 @@ impl AssignedBackend {
                 .await?
             }
             AssignedInner::Replicated(b) => {
-                b.copy_object(
-                    src_bucket,
-                    src_key,
-                    dst_bucket,
-                    dst_key,
-                    if_match,
-                    if_none_match,
-                )
-                .await?
+                let meta = b
+                    .copy_object_local(
+                        src_bucket,
+                        src_key,
+                        dst_bucket,
+                        dst_key,
+                        if_match,
+                        if_none_match,
+                    )
+                    .await?;
+                b.replication_log()
+                    .enqueue_put(&meta, &resolution.storage_class)
+                    .await?;
+                meta
             }
         };
         self.record_placement(dst_bucket, &meta.key, &resolution.storage_class)
@@ -341,8 +351,13 @@ impl AssignedBackend {
                     .await?
             }
             AssignedInner::Replicated(b) => {
-                b.complete_multipart(bucket, key, upload_id, custom_meta)
-                    .await?
+                let meta = b
+                    .complete_multipart_local(bucket, key, upload_id, custom_meta)
+                    .await?;
+                b.replication_log()
+                    .enqueue_put(&meta, &resolution.storage_class)
+                    .await?;
+                meta
             }
         };
         self.record_placement(bucket, &meta.key, &resolution.storage_class)

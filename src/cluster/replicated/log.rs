@@ -45,6 +45,7 @@ pub struct ReplicationEvent {
     pub etag: Option<String>,
     pub size: Option<i64>,
     pub payload_path: Option<String>,
+    pub storage_class: String,
     pub created_at: i64,
 }
 
@@ -83,7 +84,11 @@ impl ReplicationLog {
 
     /// Human: Record a successful local write so the worker can push to peers.
     /// Agent: INSERT replication_log status=pending; event_id UUID v4.
-    pub async fn enqueue_put(&self, meta: &ObjectMetadata) -> Result<ReplicationEvent, StorageError> {
+    pub async fn enqueue_put(
+        &self,
+        meta: &ObjectMetadata,
+        storage_class: &str,
+    ) -> Result<ReplicationEvent, StorageError> {
         let event = ReplicationEvent {
             event_id: Uuid::new_v4().to_string(),
             origin_node: self.origin_node.clone(),
@@ -93,6 +98,7 @@ impl ReplicationLog {
             etag: meta.etag.clone(),
             size: Some(meta.size),
             payload_path: Some(self.relative_blob_path(&meta.bucket, &meta.key)),
+            storage_class: storage_class.to_string(),
             created_at: Utc::now().timestamp(),
         };
         self.insert_pending(&event).await?;
@@ -113,6 +119,7 @@ impl ReplicationLog {
             etag: None,
             size: None,
             payload_path: None,
+            storage_class: "default".into(),
             created_at: Utc::now().timestamp(),
         };
         self.insert_pending(&event).await?;
@@ -121,8 +128,8 @@ impl ReplicationLog {
 
     async fn insert_pending(&self, event: &ReplicationEvent) -> Result<(), StorageError> {
         sqlx::query(
-            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, created_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, created_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
         )
         .bind(&event.event_id)
         .bind(&event.origin_node)
@@ -132,6 +139,7 @@ impl ReplicationLog {
         .bind(&event.etag)
         .bind(event.size)
         .bind(&event.payload_path)
+        .bind(&event.storage_class)
         .bind(event.created_at)
         .execute(&self.pool)
         .await
@@ -141,7 +149,7 @@ impl ReplicationLog {
 
     pub async fn list_pending(&self, limit: i64) -> Result<Vec<ReplicationEvent>, StorageError> {
         let rows = sqlx::query_as::<_, ReplicationRow>(
-            "SELECT event_id, origin_node, op, bucket, key, etag, size, payload_path, created_at
+            "SELECT event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, created_at
              FROM replication_log
              WHERE status = 'pending'
              ORDER BY created_at ASC
@@ -187,8 +195,8 @@ impl ReplicationLog {
     pub async fn record_applied(&self, event: &ReplicationEvent) -> Result<bool, StorageError> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, created_at, applied_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied')
+            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, created_at, applied_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied')
              ON CONFLICT(event_id) DO NOTHING",
         )
         .bind(&event.event_id)
@@ -199,6 +207,7 @@ impl ReplicationLog {
         .bind(&event.etag)
         .bind(event.size)
         .bind(&event.payload_path)
+        .bind(&event.storage_class)
         .bind(event.created_at)
         .bind(now)
         .execute(&self.pool)
@@ -229,6 +238,7 @@ struct ReplicationRow {
     etag: Option<String>,
     size: Option<i64>,
     payload_path: Option<String>,
+    storage_class: String,
     created_at: i64,
 }
 
@@ -246,6 +256,7 @@ impl ReplicationRow {
             etag: self.etag,
             size: self.size,
             payload_path: self.payload_path,
+            storage_class: self.storage_class,
             created_at: self.created_at,
         })
     }

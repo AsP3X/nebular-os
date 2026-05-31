@@ -55,12 +55,12 @@ pub async fn drain_once(
 
         let mut successes = 0u32;
         let mut attempts = 0u32;
-        for (peer_id, base_url) in &peers.peers {
+        for (peer_id, peer) in peers.peers_for_class(&event.storage_class) {
             if peer_id == &cluster.node_id {
                 continue;
             }
             attempts += 1;
-            match push_event(client, log, base_url, token, &event).await {
+            match push_event(client, log, &peer.url, token, &event).await {
                 Ok(()) => {
                     successes += 1;
                     if successes >= needed_peer_successes {

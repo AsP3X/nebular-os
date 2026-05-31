@@ -175,6 +175,7 @@ async fn cluster_idempotent_replay() {
         etag: Some("dummy".into()),
         size: Some(10),
         payload_path: None,
+        storage_class: "default".into(),
         created_at: 1,
     };
 

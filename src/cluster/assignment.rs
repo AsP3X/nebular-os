@@ -129,7 +129,7 @@ impl AssignmentRules {
         peers
             .peers
             .keys()
-            .find(|id| *id != self_id)
+            .find(|id| id.as_str() != self_id)
             .cloned()
     }
 }
