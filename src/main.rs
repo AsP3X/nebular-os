@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
 
     spawn_storage_maintenance(storage.clone(), cfg.clone());
 
-    let backend = cluster::build_backend(storage, &cfg);
+    let backend = cluster::build_backend(storage, &cfg)?;
     let app = server::create_app(backend, cfg.clone()).await?;
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;

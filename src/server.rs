@@ -12,7 +12,7 @@ use tower_http::{
 };
 
 use crate::auth::{presigned_or_jwt_middleware, JwtSecret};
-use crate::cluster::{auth as cluster_auth, routes as cluster_routes};
+use crate::cluster::{auth as cluster_auth, replicate, routes as cluster_routes};
 use crate::cluster::StorageBackend;
 use crate::config::NosConfig;
 use crate::middleware::{
@@ -96,6 +96,11 @@ pub async fn create_app(backend: StorageBackend, cfg: Arc<NosConfig>) -> anyhow:
             .route(
                 "/_cluster/capabilities",
                 get(cluster_routes::cluster_capabilities),
+            )
+            .route("/_cluster/replicate", post(replicate::replicate))
+            .route(
+                "/_cluster/objects/{bucket}/{*key}",
+                axum::routing::head(cluster_routes::cluster_object_head),
             )
             .layer(cluster_layer);
         public_routes = public_routes.merge(cluster_router);

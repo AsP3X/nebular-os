@@ -18,6 +18,7 @@ pub fn map_storage_error(err: StorageError) -> (StatusCode, Json<serde_json::Val
         StorageError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         StorageError::InvalidBucket | StorageError::InvalidKey => StatusCode::BAD_REQUEST,
         StorageError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
+        StorageError::ReadOnlyReplica => StatusCode::SERVICE_UNAVAILABLE,
         StorageError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(json!({ "error": err.client_message() })))

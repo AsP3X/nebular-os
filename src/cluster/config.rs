@@ -46,6 +46,7 @@ pub struct ClusterConfig {
     pub storage_classes: Vec<String>,
     pub replication_group: String,
     pub replication_role: String,
+    pub replication_factor: u32,
     pub replication_pending_events: u64,
 }
 
@@ -64,12 +65,26 @@ impl ClusterConfig {
             storage_classes: vec!["default".into()],
             replication_group: "default".into(),
             replication_role: "member".into(),
+            replication_factor: 1,
             replication_pending_events: 0,
         }
     }
 
     pub fn is_standalone(&self) -> bool {
         self.mode == ClusterMode::Standalone
+    }
+
+    /// Human: True when this node should replicate writes to peers.
+    /// Agent: Replicated or ReplicatedAssigned; Assigned-only is false until Phase 3 gates.
+    pub fn mode_includes_replication(&self) -> bool {
+        matches!(
+            self.mode,
+            ClusterMode::Replicated | ClusterMode::ReplicatedAssigned
+        )
+    }
+
+    pub fn is_readonly_replica(&self) -> bool {
+        self.replication_role.eq_ignore_ascii_case("readonly")
     }
 
     pub fn from_env() -> Result<Self> {
@@ -107,6 +122,15 @@ impl ClusterConfig {
         let replication_group =
             env::var("NOS_REPLICATION_GROUP").unwrap_or_else(|_| "default".into());
         let replication_role = env::var("NOS_REPLICATION_ROLE").unwrap_or_else(|_| "member".into());
+        let replication_factor = env::var("NOS_REPLICATION_FACTOR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<u32>()
+                    .context("NOS_REPLICATION_FACTOR must be a valid u32")
+            })
+            .transpose()?
+            .unwrap_or(1);
 
         Ok(Self {
             mode,
@@ -118,6 +142,7 @@ impl ClusterConfig {
             storage_classes,
             replication_group,
             replication_role,
+            replication_factor,
             replication_pending_events: 0,
         })
     }

@@ -1,16 +1,22 @@
+use anyhow::Context;
+use std::sync::Arc;
+
 use crate::config::NosConfig;
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
 use crate::storage::types::{ListResult, ObjectMetadata};
 
+use super::peer::PeerRegistry;
+use super::replicated::ReplicatedBackend;
 use super::standalone::StandaloneBackend;
 
-/// Human: Single entry point for route handlers — standalone today, cluster variants later.
-/// Agent: StorageBackend enum; routes use backend.* not StorageEngine directly.
+/// Human: Single entry point for route handlers — standalone or replicated local engine.
+/// Agent: StorageBackend enum; routes use backend.*; build_backend selects variant from ClusterMode.
 #[derive(Clone)]
 pub enum StorageBackend {
     Standalone(StandaloneBackend),
+    Replicated(ReplicatedBackend),
 }
 
 impl StorageBackend {
@@ -21,12 +27,14 @@ impl StorageBackend {
     pub fn engine(&self) -> &StorageEngine {
         match self {
             Self::Standalone(b) => b.engine(),
+            Self::Replicated(b) => b.engine(),
         }
     }
 
-    fn as_standalone(&self) -> &StandaloneBackend {
+    pub async fn pending_replication_events(&self) -> Result<u64, StorageError> {
         match self {
-            Self::Standalone(b) => b,
+            Self::Standalone(_) => Ok(0),
+            Self::Replicated(b) => b.pending_replication_events().await,
         }
     }
 
@@ -37,9 +45,16 @@ impl StorageBackend {
         if_match: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.as_standalone()
-            .ensure_write_preconditions(bucket, key, if_match, if_none_match)
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.ensure_write_preconditions(bucket, key, if_match, if_none_match)
+                    .await
+            }
+            Self::Replicated(b) => {
+                b.ensure_write_preconditions(bucket, key, if_match, if_none_match)
+                    .await
+            }
+        }
     }
 
     pub async fn put_object(
@@ -50,9 +65,16 @@ impl StorageBackend {
         custom_meta: Option<&str>,
         body: impl tokio::io::AsyncRead + Unpin,
     ) -> Result<ObjectMetadata, StorageError> {
-        self.as_standalone()
-            .put_object(bucket, key, content_type, custom_meta, body)
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.put_object(bucket, key, content_type, custom_meta, body)
+                    .await
+            }
+            Self::Replicated(b) => {
+                b.put_object(bucket, key, content_type, custom_meta, body)
+                    .await
+            }
+        }
     }
 
     pub async fn copy_object(
@@ -64,16 +86,30 @@ impl StorageBackend {
         if_match: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<ObjectMetadata, StorageError> {
-        self.as_standalone()
-            .copy_object(
-                src_bucket,
-                src_key,
-                dst_bucket,
-                dst_key,
-                if_match,
-                if_none_match,
-            )
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.copy_object(
+                    src_bucket,
+                    src_key,
+                    dst_bucket,
+                    dst_key,
+                    if_match,
+                    if_none_match,
+                )
+                .await
+            }
+            Self::Replicated(b) => {
+                b.copy_object(
+                    src_bucket,
+                    src_key,
+                    dst_bucket,
+                    dst_key,
+                    if_match,
+                    if_none_match,
+                )
+                .await
+            }
+        }
     }
 
     pub async fn get_object(
@@ -84,15 +120,28 @@ impl StorageBackend {
         if_none_match: Option<&str>,
         if_modified_since: Option<i64>,
     ) -> Result<GetObjectOutcome, StorageError> {
-        self.as_standalone()
-            .get_object(
-                bucket,
-                key,
-                range_header,
-                if_none_match,
-                if_modified_since,
-            )
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.get_object(
+                    bucket,
+                    key,
+                    range_header,
+                    if_none_match,
+                    if_modified_since,
+                )
+                .await
+            }
+            Self::Replicated(b) => {
+                b.get_object(
+                    bucket,
+                    key,
+                    range_header,
+                    if_none_match,
+                    if_modified_since,
+                )
+                .await
+            }
+        }
     }
 
     pub async fn head_object(
@@ -102,9 +151,16 @@ impl StorageBackend {
         if_none_match: Option<&str>,
         if_modified_since: Option<i64>,
     ) -> Result<Option<ObjectMetadata>, StorageError> {
-        self.as_standalone()
-            .head_object(bucket, key, if_none_match, if_modified_since)
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.head_object(bucket, key, if_none_match, if_modified_since)
+                    .await
+            }
+            Self::Replicated(b) => {
+                b.head_object(bucket, key, if_none_match, if_modified_since)
+                    .await
+            }
+        }
     }
 
     pub async fn delete_object(
@@ -113,7 +169,10 @@ impl StorageBackend {
         key: &str,
         if_match: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.as_standalone().delete_object(bucket, key, if_match).await
+        match self {
+            Self::Standalone(b) => b.delete_object(bucket, key, if_match).await,
+            Self::Replicated(b) => b.delete_object(bucket, key, if_match).await,
+        }
     }
 
     pub async fn list_objects(
@@ -124,21 +183,37 @@ impl StorageBackend {
         limit: Option<u64>,
         start_after: Option<&str>,
     ) -> Result<ListResult, StorageError> {
-        self.as_standalone()
-            .list_objects(bucket, prefix, delimiter, limit, start_after)
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.list_objects(bucket, prefix, delimiter, limit, start_after)
+                    .await
+            }
+            Self::Replicated(b) => {
+                b.list_objects(bucket, prefix, delimiter, limit, start_after)
+                    .await
+            }
+        }
     }
 
     pub async fn probe_readiness(&self) -> ReadinessChecks {
-        self.as_standalone().probe_readiness().await
+        match self {
+            Self::Standalone(b) => b.probe_readiness().await,
+            Self::Replicated(b) => b.probe_readiness().await,
+        }
     }
 
     pub async fn object_count(&self) -> Result<i64, StorageError> {
-        self.as_standalone().object_count().await
+        match self {
+            Self::Standalone(b) => b.object_count().await,
+            Self::Replicated(b) => b.object_count().await,
+        }
     }
 
     pub async fn total_bytes(&self) -> Result<i64, StorageError> {
-        self.as_standalone().total_bytes().await
+        match self {
+            Self::Standalone(b) => b.total_bytes().await,
+            Self::Replicated(b) => b.total_bytes().await,
+        }
     }
 
     pub async fn init_multipart(
@@ -147,9 +222,10 @@ impl StorageBackend {
         key: &str,
         content_type: Option<&str>,
     ) -> Result<InitMultipartResult, StorageError> {
-        self.as_standalone()
-            .init_multipart(bucket, key, content_type)
-            .await
+        match self {
+            Self::Standalone(b) => b.init_multipart(bucket, key, content_type).await,
+            Self::Replicated(b) => b.init_multipart(bucket, key, content_type).await,
+        }
     }
 
     pub async fn upload_part(
@@ -160,9 +236,16 @@ impl StorageBackend {
         part_number: i32,
         body: impl tokio::io::AsyncRead + Unpin,
     ) -> Result<PartUploadResult, StorageError> {
-        self.as_standalone()
-            .upload_part(bucket, key, upload_id, part_number, body)
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.upload_part(bucket, key, upload_id, part_number, body)
+                    .await
+            }
+            Self::Replicated(b) => {
+                b.upload_part(bucket, key, upload_id, part_number, body)
+                    .await
+            }
+        }
     }
 
     pub async fn complete_multipart(
@@ -172,9 +255,16 @@ impl StorageBackend {
         upload_id: &str,
         custom_meta: Option<&str>,
     ) -> Result<ObjectMetadata, StorageError> {
-        self.as_standalone()
-            .complete_multipart(bucket, key, upload_id, custom_meta)
-            .await
+        match self {
+            Self::Standalone(b) => {
+                b.complete_multipart(bucket, key, upload_id, custom_meta)
+                    .await
+            }
+            Self::Replicated(b) => {
+                b.complete_multipart(bucket, key, upload_id, custom_meta)
+                    .await
+            }
+        }
     }
 
     pub async fn abort_multipart(
@@ -183,28 +273,44 @@ impl StorageBackend {
         key: &str,
         upload_id: &str,
     ) -> Result<(), StorageError> {
-        self.as_standalone()
-            .abort_multipart(bucket, key, upload_id)
-            .await
+        match self {
+            Self::Standalone(b) => b.abort_multipart(bucket, key, upload_id).await,
+            Self::Replicated(b) => b.abort_multipart(bucket, key, upload_id).await,
+        }
     }
 
     pub async fn multipart_key_for_upload(&self, upload_id: &str) -> Result<String, StorageError> {
-        self.as_standalone().multipart_key_for_upload(upload_id).await
+        match self {
+            Self::Standalone(b) => b.multipart_key_for_upload(upload_id).await,
+            Self::Replicated(b) => b.multipart_key_for_upload(upload_id).await,
+        }
     }
 
     pub fn multipart_part_size(&self) -> usize {
-        self.as_standalone().multipart_part_size()
+        match self {
+            Self::Standalone(b) => b.multipart_part_size(),
+            Self::Replicated(b) => b.multipart_part_size(),
+        }
     }
 }
 
-/// Human: Construct the storage facade from engine + config; Phase 0 always standalone passthrough.
-/// Agent: READS cfg.cluster.mode; Standalone => StorageBackend::standalone(engine); cluster modes Phase 2+.
-pub fn build_backend(engine: StorageEngine, cfg: &NosConfig) -> StorageBackend {
-    if cfg.cluster.is_standalone() {
-        StorageBackend::standalone(engine)
-    } else {
-        // Human: Non-standalone modes get the same local engine wrapper until replication/assignment land.
-        // Agent: Phase 1 mounts /_cluster routes; Phase 2+ replaces this branch with ClusterBackend.
-        StorageBackend::standalone(engine)
+/// Human: Construct the storage facade from engine + config.
+/// Agent: Standalone | Assigned => passthrough; Replicated* => ReplicatedBackend + worker.
+pub fn build_backend(engine: StorageEngine, cfg: &NosConfig) -> anyhow::Result<StorageBackend> {
+    if !cfg.cluster.mode_includes_replication() {
+        return Ok(StorageBackend::standalone(engine));
     }
+
+    let peers_raw = cfg
+        .cluster
+        .peers_raw
+        .as_deref()
+        .context("NOS_CLUSTER_PEERS is required for replicated cluster mode")?;
+    let peers = PeerRegistry::from_peers_raw(peers_raw)?;
+
+    Ok(StorageBackend::Replicated(ReplicatedBackend::new(
+        engine,
+        Arc::new(cfg.cluster.clone()),
+        peers,
+    )))
 }

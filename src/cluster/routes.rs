@@ -24,6 +24,11 @@ pub struct ClusterHealthResponse {
 /// Agent: GET /_cluster/health; Bearer NOS_CLUSTER_TOKEN; JSON additive ops fields.
 pub async fn cluster_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let cluster = &state.config.cluster;
+    let pending = state
+        .backend
+        .pending_replication_events()
+        .await
+        .unwrap_or(0);
     (
         StatusCode::OK,
         Json(ClusterHealthResponse {
@@ -33,9 +38,33 @@ pub async fn cluster_health(State(state): State<Arc<AppState>>) -> impl IntoResp
             storage_classes: cluster.storage_classes.clone(),
             replication_group: cluster.replication_group.clone(),
             replication_role: cluster.replication_role.clone(),
-            replication_pending_events: cluster.replication_pending_events,
+            replication_pending_events: pending,
         }),
     )
+}
+
+/// Human: Peer checks whether an object exists locally before fetch/repair.
+/// Agent: HEAD /_cluster/objects/{bucket}/{key}; 200 if exists else 404 JSON error.
+pub async fn cluster_object_head(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((bucket, key)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    match state.backend.engine().object_exists(&bucket, &key).await {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, %bucket, %key, "cluster object head failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "storage error" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(Serialize)]

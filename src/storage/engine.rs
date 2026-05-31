@@ -248,6 +248,32 @@ impl StorageEngine {
             .execute(pool)
             .await;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS replication_log (
+                event_id     TEXT PRIMARY KEY,
+                origin_node  TEXT NOT NULL,
+                op           TEXT NOT NULL,
+                bucket       TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                etag         TEXT,
+                size         INTEGER,
+                payload_path TEXT,
+                created_at   INTEGER NOT NULL,
+                applied_at   INTEGER,
+                status       TEXT NOT NULL DEFAULT 'pending'
+            )",
+        )
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_repl_status ON replication_log(status, created_at)",
+        )
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(pool)
             .await

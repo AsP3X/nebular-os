@@ -28,6 +28,11 @@ pub struct HealthResponse {
 /// Agent: HTTP 200 JSON; NO SQLite or disk I/O; READS config.cluster for display fields.
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let cluster = &state.config.cluster;
+    let replication_lag_events = state
+        .backend
+        .pending_replication_events()
+        .await
+        .unwrap_or(0);
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
@@ -36,7 +41,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
         instance_id: cluster.instance_id.clone(),
         region_label: cluster.region_label.clone(),
         storage_classes: cluster.storage_classes.clone(),
-        replication_lag_events: cluster.replication_pending_events,
+        replication_lag_events,
     })
 }
 
