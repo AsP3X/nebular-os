@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::peer::PeerRegistry;
+use crate::cluster::read_repair;
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
@@ -19,6 +20,7 @@ pub struct ReplicatedBackend {
     inner: InnerBackend,
     log: Arc<ReplicationLog>,
     cluster: Arc<ClusterConfig>,
+    peers: Arc<PeerRegistry>,
 }
 
 impl ReplicatedBackend {
@@ -38,12 +40,14 @@ impl ReplicatedBackend {
         ));
         let inner = InnerBackend::new(engine);
 
-        spawn_replication_worker(log.clone(), Arc::new(peers), cluster.clone(), token);
+        let peers = Arc::new(peers);
+        spawn_replication_worker(log.clone(), peers.clone(), cluster.clone(), token);
 
         Self {
             inner,
             log,
             cluster,
+            peers,
         }
     }
 
@@ -163,7 +167,8 @@ impl ReplicatedBackend {
         if_none_match: Option<&str>,
         if_modified_since: Option<i64>,
     ) -> Result<GetObjectOutcome, StorageError> {
-        self.inner
+        match self
+            .inner
             .get_object(
                 bucket,
                 key,
@@ -172,6 +177,30 @@ impl ReplicatedBackend {
                 if_modified_since,
             )
             .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(StorageError::NotFound) if self.cluster.replication_read_repair => {
+                let token = self
+                    .cluster
+                    .cluster_token
+                    .as_deref()
+                    .unwrap_or_default();
+                let client = reqwest::Client::new();
+                read_repair::fetch_from_peers(
+                    &client,
+                    &self.peers,
+                    &self.cluster.node_id,
+                    token,
+                    bucket,
+                    key,
+                    range_header,
+                    if_none_match,
+                    if_modified_since,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn head_object(

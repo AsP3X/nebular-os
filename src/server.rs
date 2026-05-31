@@ -104,7 +104,8 @@ pub async fn create_app(backend: StorageBackend, cfg: Arc<NosConfig>) -> anyhow:
             )
             .route(
                 "/_cluster/objects/{bucket}/{*key}",
-                axum::routing::head(cluster_routes::cluster_object_head),
+                axum::routing::get(cluster_routes::cluster_object_get)
+                    .head(cluster_routes::cluster_object_head),
             )
             .layer(cluster_layer);
         public_routes = public_routes.merge(cluster_router);

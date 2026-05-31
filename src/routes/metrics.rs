@@ -12,6 +12,8 @@ use crate::routes::AppState;
 pub struct MetricsResponse {
     pub total_objects: i64,
     pub total_bytes: i64,
+    pub logical_bytes: i64,
+    pub replication_pending_events: u64,
 }
 
 pub async fn metrics(
@@ -38,6 +40,11 @@ pub async fn metrics(
             state.metrics.inc_errors();
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    let replication_pending_events = state
+        .backend
+        .pending_replication_events()
+        .await
+        .unwrap_or(0);
 
     let accept = headers
         .get(header::ACCEPT)
@@ -45,9 +52,11 @@ pub async fn metrics(
         .unwrap_or("");
 
     if accept.contains("text/plain") || accept.contains("application/openmetrics-text") {
-        let body = state
-            .metrics
-            .render_prometheus(total_objects, total_bytes);
+        let body = state.metrics.render_prometheus(
+            total_objects,
+            total_bytes,
+            replication_pending_events,
+        );
         return Ok((
             StatusCode::OK,
             [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -59,6 +68,8 @@ pub async fn metrics(
     Ok(Json(MetricsResponse {
         total_objects,
         total_bytes,
+        logical_bytes: total_bytes,
+        replication_pending_events,
     })
     .into_response())
 }

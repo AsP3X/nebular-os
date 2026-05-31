@@ -51,6 +51,7 @@ pub struct ClusterConfig {
     pub replication_role: String,
     pub replication_factor: u32,
     pub replication_pending_events: u64,
+    pub replication_read_repair: bool,
     pub default_storage_class: String,
     pub assignment_rules_raw: Option<String>,
     pub assignment_forward: bool,
@@ -73,6 +74,7 @@ impl ClusterConfig {
             replication_role: "member".into(),
             replication_factor: 1,
             replication_pending_events: 0,
+            replication_read_repair: false,
             default_storage_class: "default".into(),
             assignment_rules_raw: None,
             assignment_forward: false,
@@ -175,6 +177,10 @@ impl ClusterConfig {
             .ok()
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
             .unwrap_or(false);
+        let replication_read_repair = env::var("NOS_REPLICATION_READ_REPAIR")
+            .ok()
+            .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+            .unwrap_or(false);
 
         if matches!(mode, ClusterMode::Assigned | ClusterMode::ReplicatedAssigned)
             && assignment_rules_raw.is_none()
@@ -194,6 +200,7 @@ impl ClusterConfig {
             replication_role,
             replication_factor,
             replication_pending_events: 0,
+            replication_read_repair,
             default_storage_class,
             assignment_rules_raw,
             assignment_forward,

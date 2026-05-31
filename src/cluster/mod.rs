@@ -4,6 +4,7 @@ pub mod auth;
 pub mod backend;
 pub mod config;
 pub mod peer;
+pub mod read_repair;
 pub mod replicate;
 pub mod replicated;
 pub mod routes;

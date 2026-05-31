@@ -32,7 +32,12 @@ impl NosMetrics {
     }
 
     /// Renders Prometheus exposition format for scrape targets.
-    pub fn render_prometheus(&self, total_objects: i64, total_bytes: i64) -> String {
+    pub fn render_prometheus(
+        &self,
+        total_objects: i64,
+        total_bytes: i64,
+        replication_pending_events: u64,
+    ) -> String {
         format!(
             "# HELP nos_http_requests_total Total HTTP requests handled.\n\
              # TYPE nos_http_requests_total counter\n\
@@ -51,13 +56,21 @@ impl NosMetrics {
              nos_objects_total {}\n\
              # HELP nos_storage_bytes_total Live object bytes in metadata DB.\n\
              # TYPE nos_storage_bytes_total gauge\n\
-             nos_storage_bytes_total {}\n",
+             nos_storage_bytes_total {}\n\
+             # HELP nos_logical_bytes_total Logical bytes (same as storage_bytes for v1).\n\
+             # TYPE nos_logical_bytes_total gauge\n\
+             nos_logical_bytes_total {}\n\
+             # HELP nos_replication_pending_events Pending replication_log rows.\n\
+             # TYPE nos_replication_pending_events gauge\n\
+             nos_replication_pending_events {}\n",
             self.http_requests_total.load(Ordering::Relaxed),
             self.http_errors_total.load(Ordering::Relaxed),
             self.bytes_uploaded_total.load(Ordering::Relaxed),
             self.bytes_downloaded_total.load(Ordering::Relaxed),
             total_objects,
             total_bytes,
+            total_bytes,
+            replication_pending_events,
         )
     }
 }

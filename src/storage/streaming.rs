@@ -109,6 +109,7 @@ impl Drop for SpillFileGuard {
 pub enum ObjectBodyStream {
     FileLimited(ReaderStream<LimitedAsyncRead<File>>),
     Channel(tokio_stream::wrappers::ReceiverStream<Result<Bytes, std::io::Error>>),
+    Http(Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>),
 }
 
 impl Stream for ObjectBodyStream {
@@ -118,6 +119,7 @@ impl Stream for ObjectBodyStream {
         match &mut *self {
             ObjectBodyStream::FileLimited(s) => Pin::new(s).poll_next(cx),
             ObjectBodyStream::Channel(s) => Pin::new(s).poll_next(cx),
+            ObjectBodyStream::Http(s) => Pin::new(s).poll_next(cx),
         }
     }
 }
@@ -127,6 +129,15 @@ impl Stream for ObjectBodyStream {
 pub struct GuardedObjectBodyStream {
     pub stream: ObjectBodyStream,
     _spill_guard: Option<SpillFileGuard>,
+}
+
+impl GuardedObjectBodyStream {
+    pub fn from_http_stream(stream: ObjectBodyStream) -> Self {
+        Self {
+            stream,
+            _spill_guard: None,
+        }
+    }
 }
 
 impl Stream for GuardedObjectBodyStream {

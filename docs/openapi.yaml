@@ -24,6 +24,85 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /_nos/capabilities:
+    get:
+      summary: Node capabilities (cluster fields when enabled)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Capabilities JSON
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /_cluster/health:
+    get:
+      summary: Cluster health (requires cluster token)
+      security:
+        - clusterToken: []
+      responses:
+        "200":
+          description: Cluster health JSON
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /_cluster/capabilities:
+    get:
+      summary: Cluster capabilities for peers
+      security:
+        - clusterToken: []
+      responses:
+        "200":
+          description: Cluster capabilities JSON
+  /_cluster/replicate:
+    post:
+      summary: Apply idempotent replication event from peer
+      security:
+        - clusterToken: []
+      responses:
+        "200":
+          description: Applied or duplicate event_id
+  /_cluster/assignment/resolve:
+    post:
+      summary: Preview storage class assignment (assigned modes)
+      security:
+        - clusterToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bucket, key]
+              properties:
+                bucket: { type: string }
+                key: { type: string }
+                content_type: { type: string }
+                storage_class_header: { type: string }
+                content_length: { type: integer }
+      responses:
+        "200":
+          description: Resolution JSON
+  /_cluster/objects/{bucket}/{key}:
+    get:
+      summary: Stream object from local disk (peer read-repair)
+      security:
+        - clusterToken: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - $ref: "#/components/parameters/key"
+        - in: header
+          name: Range
+          schema: { type: string }
+      responses:
+        "200": { description: Object bytes }
+        "206": { description: Partial content }
+        "404": { $ref: "#/components/responses/NotFound" }
+    head:
+      summary: Check object exists locally
+      security:
+        - clusterToken: []
+      responses:
+        "200": { description: Exists }
+        "404": { $ref: "#/components/responses/NotFound" }
   /metrics:
     get:
       summary: Storage metrics (JSON or Prometheus)
@@ -73,6 +152,9 @@ paths:
         - $ref: "#/components/parameters/bucket"
         - $ref: "#/components/parameters/key"
         - in: header
+          name: x-nd-storage-class
+          schema: { type: string, description: "Ignored in standalone mode" }
+        - in: header
           name: x-nd-copy-source
           schema: { type: string, example: music/source.mp3 }
         - in: header
@@ -80,6 +162,17 @@ paths:
           schema: { type: string }
       responses:
         "201": { description: Created, returns `{ "etag": "..." }` }
+        "409":
+          description: Object not assigned to this node (assigned cluster mode)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error: { type: string }
+                  assigned_node: { type: string }
+                  storage_class: { type: string }
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
     get:
       summary: Download object
@@ -157,6 +250,10 @@ components:
     metricsToken:
       type: http
       scheme: bearer
+    clusterToken:
+      type: http
+      scheme: bearer
+      description: NOS_CLUSTER_TOKEN for /_cluster/* routes
   parameters:
     bucket:
       in: path

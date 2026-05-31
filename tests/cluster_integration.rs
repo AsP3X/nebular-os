@@ -88,6 +88,7 @@ fn cluster_test_config(
             replication_role: role.into(),
             replication_factor,
             replication_pending_events: 0,
+            replication_read_repair: false,
             default_storage_class: "default".into(),
             assignment_rules_raw: None,
             assignment_forward: false,

@@ -1,7 +1,8 @@
 use axum::{
+    body::Body,
     extract::State,
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Serialize;
@@ -9,7 +10,9 @@ use std::sync::Arc;
 
 use crate::cluster::assignment::WriteContext;
 use crate::cluster::backend::StorageBackend;
-use crate::routes::AppState;
+use crate::routes::helpers::{apply_object_headers, parse_if_modified_since, parse_if_none_match};
+use crate::routes::{errors::map_storage_error, AppState};
+use crate::storage::engine::GetObjectOutcome;
 
 #[derive(Serialize)]
 pub struct ClusterHealthResponse {
@@ -47,6 +50,64 @@ pub async fn cluster_health(State(state): State<Arc<AppState>>) -> impl IntoResp
 
 /// Human: Peer checks whether an object exists locally before fetch/repair.
 /// Agent: HEAD /_cluster/objects/{bucket}/{key}; 200 if exists else 404 JSON error.
+/// Human: Peers fetch object bytes for read-repair without user JWT.
+/// Agent: GET /_cluster/objects/{bucket}/{key}; streams local blob; does not persist on caller.
+pub async fn cluster_object_get(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path((bucket, key)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    let if_none_match = parse_if_none_match(&headers);
+    let if_modified_since = parse_if_modified_since(&headers);
+
+    match state
+        .backend
+        .engine()
+        .get_object(
+            &bucket,
+            &key,
+            range_header,
+            if_none_match.as_deref(),
+            if_modified_since,
+        )
+        .await
+    {
+        Ok(GetObjectOutcome::NotModified(meta)) => {
+            let mut resp = Response::new(Body::empty());
+            *resp.status_mut() = StatusCode::NOT_MODIFIED;
+            apply_object_headers(resp.headers_mut(), &meta);
+            resp
+        }
+        Ok(GetObjectOutcome::Content {
+            stream,
+            content_length,
+            total_size,
+            meta,
+        }) => {
+            let body = Body::from_stream(stream);
+            let mut resp = Response::new(body);
+            apply_object_headers(resp.headers_mut(), &meta);
+            if let Ok(ar) = "bytes".parse() {
+                resp.headers_mut().insert(header::ACCEPT_RANGES, ar);
+            }
+            if let Some(range_hdr) = range_header {
+                let start = crate::routes::helpers::parse_range(range_hdr, total_size)
+                    .map(|(s, _)| s)
+                    .unwrap_or(0);
+                let end = start + content_length.saturating_sub(1);
+                let value = format!("bytes {}-{}/{}", start, end, total_size);
+                if let Ok(cr) = value.parse() {
+                    resp.headers_mut().insert(header::CONTENT_RANGE, cr);
+                }
+                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+            }
+            resp
+        }
+        Err(e) => map_storage_error(e).into_response(),
+    }
+}
+
 pub async fn cluster_object_head(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((bucket, key)): axum::extract::Path<(String, String)>,
