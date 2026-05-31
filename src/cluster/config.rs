@@ -1,0 +1,130 @@
+use std::env;
+
+use anyhow::{bail, Context, Result};
+
+/// Human: Deployment topology for Nebular — standalone is the default and ignores cluster env.
+/// Agent: ClusterMode parsed from NOS_CLUSTER_MODE; Standalone => no /_cluster routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterMode {
+    Standalone,
+    Replicated,
+    Assigned,
+    ReplicatedAssigned,
+}
+
+impl ClusterMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Replicated => "replicated",
+            Self::Assigned => "assigned",
+            Self::ReplicatedAssigned => "replicated+assigned",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "standalone" => Ok(Self::Standalone),
+            "replicated" => Ok(Self::Replicated),
+            "assigned" => Ok(Self::Assigned),
+            "replicated+assigned" | "replicated_assigned" => Ok(Self::ReplicatedAssigned),
+            other => bail!("unsupported NOS_CLUSTER_MODE: {other}"),
+        }
+    }
+}
+
+/// Human: Cluster-related settings; when mode is standalone, peer/token env vars are ignored.
+/// Agent: ClusterConfig::from_env; is_standalone gates /_cluster mount in server.rs.
+#[derive(Debug, Clone)]
+pub struct ClusterConfig {
+    pub mode: ClusterMode,
+    pub node_id: String,
+    pub instance_id: String,
+    pub region_label: Option<String>,
+    pub cluster_token: Option<String>,
+    pub peers_raw: Option<String>,
+    pub storage_classes: Vec<String>,
+    pub replication_group: String,
+    pub replication_role: String,
+    pub replication_pending_events: u64,
+}
+
+impl ClusterConfig {
+    /// Human: Default for tests and unset NOS_CLUSTER_MODE — no cluster behavior.
+    /// Agent: mode=Standalone; storage_classes=["default"]; replication_lag=0.
+    pub fn standalone() -> Self {
+        let node_id = default_node_id();
+        Self {
+            mode: ClusterMode::Standalone,
+            node_id: node_id.clone(),
+            instance_id: node_id,
+            region_label: None,
+            cluster_token: None,
+            peers_raw: None,
+            storage_classes: vec!["default".into()],
+            replication_group: "default".into(),
+            replication_role: "member".into(),
+            replication_pending_events: 0,
+        }
+    }
+
+    pub fn is_standalone(&self) -> bool {
+        self.mode == ClusterMode::Standalone
+    }
+
+    pub fn from_env() -> Result<Self> {
+        let mode = match env::var("NOS_CLUSTER_MODE") {
+            Ok(v) => ClusterMode::parse(&v)?,
+            Err(_) => ClusterMode::Standalone,
+        };
+
+        if mode == ClusterMode::Standalone {
+            return Ok(Self::standalone());
+        }
+
+        let node_id = env::var("NOS_NODE_ID").unwrap_or_else(|_| default_node_id());
+        let instance_id = env::var("NOS_INSTANCE_ID").unwrap_or_else(|_| node_id.clone());
+        let cluster_token = env::var("NOS_CLUSTER_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context("NOS_CLUSTER_TOKEN is required when NOS_CLUSTER_MODE is not standalone")?;
+        let peers_raw = env::var("NOS_CLUSTER_PEERS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .context("NOS_CLUSTER_PEERS is required when NOS_CLUSTER_MODE is not standalone")?;
+
+        let storage_classes: Vec<String> = env::var("NOS_STORAGE_CLASSES")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.split(',')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .unwrap_or_else(|| vec!["default".into()]);
+
+        let replication_group =
+            env::var("NOS_REPLICATION_GROUP").unwrap_or_else(|_| "default".into());
+        let replication_role = env::var("NOS_REPLICATION_ROLE").unwrap_or_else(|_| "member".into());
+
+        Ok(Self {
+            mode,
+            node_id,
+            instance_id,
+            region_label: env::var("NOS_REGION_LABEL").ok().filter(|s| !s.is_empty()),
+            cluster_token: Some(cluster_token),
+            peers_raw: Some(peers_raw),
+            storage_classes,
+            replication_group,
+            replication_role,
+            replication_pending_events: 0,
+        })
+    }
+}
+
+fn default_node_id() -> String {
+    env::var("COMPUTERNAME")
+        .or_else(|_| env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "node".into())
+}

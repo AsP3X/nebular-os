@@ -42,7 +42,7 @@ pub async fn list_objects(
             ));
 
     match state
-        .storage
+        .backend
         .list_objects(
             &bucket,
             query.prefix.as_deref(),

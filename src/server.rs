@@ -12,19 +12,20 @@ use tower_http::{
 };
 
 use crate::auth::{presigned_or_jwt_middleware, JwtSecret};
+use crate::cluster::{auth as cluster_auth, routes as cluster_routes};
+use crate::cluster::StorageBackend;
 use crate::config::NosConfig;
 use crate::middleware::{
     metrics_auth::metrics_auth_middleware, rate_limit::rate_limit_middleware,
     rate_limit::new_rate_limit_map,
 };
 use crate::observability::NosMetrics;
-use crate::routes::{bucket, health, metrics, multipart, object, AppState};
-use crate::storage::engine::StorageEngine;
+use crate::routes::{bucket, capabilities, health, metrics, multipart, object, AppState};
 
-pub async fn create_app(storage: StorageEngine, cfg: Arc<NosConfig>) -> anyhow::Result<Router> {
+pub async fn create_app(backend: StorageBackend, cfg: Arc<NosConfig>) -> anyhow::Result<Router> {
     let metrics = NosMetrics::new();
     let state = Arc::new(AppState {
-        storage,
+        backend,
         config: cfg.clone(),
         jwt_secret: Arc::new(JwtSecret(cfg.jwt_secret.clone())),
         signing_secret: cfg.signing_secret.clone().map(Arc::new),
@@ -62,6 +63,7 @@ pub async fn create_app(storage: StorageEngine, cfg: Arc<NosConfig>) -> anyhow::
         );
 
     let mut protected_routes = Router::new()
+        .route("/_nos/capabilities", get(capabilities::capabilities))
         .merge(multipart_routes)
         .route(
             "/{bucket}/{*key}",
@@ -80,9 +82,24 @@ pub async fn create_app(storage: StorageEngine, cfg: Arc<NosConfig>) -> anyhow::
         ));
     }
 
-    let public_routes = Router::new()
+    let mut public_routes = Router::new()
         .route("/health", get(health::health))
         .route("/health/ready", get(health::ready));
+
+    // Human: Internal cluster API is mounted only when not standalone.
+    // Agent: IF !cfg.cluster.is_standalone THEN merge /_cluster/* with cluster_token_middleware.
+    if !cfg.cluster.is_standalone() {
+        let cluster_layer =
+            middleware::from_fn_with_state(state.clone(), cluster_auth::cluster_token_middleware);
+        let cluster_router = Router::new()
+            .route("/_cluster/health", get(cluster_routes::cluster_health))
+            .route(
+                "/_cluster/capabilities",
+                get(cluster_routes::cluster_capabilities),
+            )
+            .layer(cluster_layer);
+        public_routes = public_routes.merge(cluster_router);
+    }
 
     let cors = build_cors(&cfg);
 

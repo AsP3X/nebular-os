@@ -1,4 +1,5 @@
 pub mod bucket;
+pub mod capabilities;
 pub mod errors;
 pub mod health;
 pub mod helpers;
@@ -13,11 +14,11 @@ use dashmap::DashMap;
 use crate::config::NosConfig;
 use crate::middleware::rate_limit::ClientBucket;
 use crate::observability::NosMetrics;
-use crate::storage::engine::StorageEngine;
+use crate::cluster::StorageBackend;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub storage: StorageEngine,
+    pub backend: StorageBackend,
     pub config: Arc<NosConfig>,
     pub jwt_secret: Arc<crate::auth::JwtSecret>,
     pub signing_secret: Option<Arc<String>>,

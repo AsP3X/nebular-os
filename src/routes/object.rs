@@ -94,7 +94,7 @@ pub async fn put_object(
     let if_none_match = parse_if_none_match(&headers);
 
     if let Err(e) = state
-        .storage
+        .backend
         .ensure_write_preconditions(
             &params.bucket,
             &params.key,
@@ -109,7 +109,7 @@ pub async fn put_object(
 
     if let Some((src_bucket, src_key)) = parse_copy_source(&headers) {
         match state
-            .storage
+            .backend
             .copy_object(
                 &src_bucket,
                 &src_key,
@@ -149,7 +149,7 @@ pub async fn put_object(
     };
 
     match state
-        .storage
+        .backend
         .put_object(
             &params.bucket,
             &params.key,
@@ -190,7 +190,7 @@ pub async fn get_object(
     let if_modified_since = parse_if_modified_since(headers);
 
     match state
-        .storage
+        .backend
         .get_object(
             &params.bucket,
             &params.key,
@@ -249,7 +249,7 @@ pub async fn head_object(
     let if_modified_since = parse_if_modified_since(headers);
 
     match state
-        .storage
+        .backend
         .head_object(
             &params.bucket,
             &params.key,
@@ -282,7 +282,7 @@ pub async fn delete_object(
 ) -> Response {
     let if_match = parse_if_match(req.headers());
     match state
-        .storage
+        .backend
         .delete_object(&params.bucket, &params.key, if_match.as_deref())
         .await
     {

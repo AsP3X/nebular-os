@@ -21,7 +21,7 @@ pub async fn metrics(
     state.metrics.inc_requests();
 
     let total_objects = state
-        .storage
+        .backend
         .object_count()
         .await
         .map_err(|e| {
@@ -30,7 +30,7 @@ pub async fn metrics(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let total_bytes = state
-        .storage
+        .backend
         .total_bytes()
         .await
         .map_err(|e| {

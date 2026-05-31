@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use nebular_os::auth::Claims;
+use nebular_os::cluster::{build_backend, ClusterConfig};
 use nebular_os::config::NosConfig;
 use nebular_os::server::create_app;
 use nebular_os::storage::engine::{EngineOptions, StorageEngine};
@@ -64,6 +65,7 @@ fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<N
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
         s3_secret_key: None,
+        cluster: ClusterConfig::standalone(),
     })
 }
 
@@ -90,7 +92,8 @@ async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (
     .unwrap();
 
     let cfg = test_config(signing_secret, allow_public_read);
-    let app = create_app(storage, cfg).await.unwrap();
+    let backend = build_backend(storage, &cfg);
+    let app = create_app(backend, cfg).await.unwrap();
 
     (app, make_token(), tmp)
 }
@@ -641,7 +644,9 @@ async fn test_payload_too_large_returns_413() {
     .unwrap();
     let mut cfg = (*test_config(None, false)).clone();
     cfg.max_body_size = 8;
-    let app = create_app(storage, Arc::new(cfg)).await.unwrap();
+    let cfg = Arc::new(cfg);
+    let backend = build_backend(storage, &cfg);
+    let app = create_app(backend, cfg).await.unwrap();
     let token = make_token();
 
     let req = Request::builder()
@@ -949,7 +954,9 @@ async fn test_metrics_requires_token_when_configured() {
     .unwrap();
     let mut cfg = (*test_config(None, false)).clone();
     cfg.metrics_token = Some("metrics-secret".into());
-    let app = create_app(storage, Arc::new(cfg)).await.unwrap();
+    let cfg = Arc::new(cfg);
+    let backend = build_backend(storage, &cfg);
+    let app = create_app(backend, cfg).await.unwrap();
 
     let req = Request::builder()
         .method("GET")
@@ -1199,7 +1206,8 @@ async fn test_s3_list_objects_xml_when_compat_enabled() {
     )
     .await
     .unwrap();
-    let app = create_app(storage, cfg).await.unwrap();
+    let backend = build_backend(storage, &cfg);
+    let app = create_app(backend, cfg).await.unwrap();
     let token = make_token();
 
     let put = Request::builder()
@@ -1245,7 +1253,8 @@ async fn test_bucket_policy_denies_other_bucket() {
     )
     .await
     .unwrap();
-    let app = create_app(storage, cfg).await.unwrap();
+    let backend = build_backend(storage, &cfg);
+    let app = create_app(backend, cfg).await.unwrap();
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

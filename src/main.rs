@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nebular_os::{config, secrets, server, storage};
+use nebular_os::{cluster, config, secrets, server, storage};
 
 use anyhow::Result;
 use axum::serve;
@@ -71,7 +71,8 @@ async fn main() -> Result<()> {
 
     spawn_storage_maintenance(storage.clone(), cfg.clone());
 
-    let app = server::create_app(storage, cfg.clone()).await?;
+    let backend = cluster::build_backend(storage, &cfg);
+    let app = server::create_app(backend, cfg.clone()).await?;
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!("Listening on {}", cfg.bind_addr);
