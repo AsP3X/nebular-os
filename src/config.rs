@@ -3,6 +3,8 @@ use std::env;
 use std::fmt;
 use anyhow::{Context, Result};
 
+use crate::cluster::ClusterConfig;
+
 /// Human: Optional per-subject bucket allow-lists loaded from NOS_BUCKET_POLICY JSON.
 /// Agent: EMPTY map => allow all buckets; non-empty => sub must list bucket explicitly.
 #[derive(Clone, Default)]
@@ -58,6 +60,10 @@ pub struct NosConfig {
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
+    /// Human: Operator token for first-time PUT /_cluster/config before cluster_token exists.
+    /// Agent: READS NOS_CLUSTER_BOOTSTRAP_TOKEN env; OPTIONAL; ≥32 chars when set.
+    pub cluster_bootstrap_token: Option<String>,
+    pub cluster: ClusterConfig,
 }
 
 impl fmt::Debug for NosConfig {
@@ -93,6 +99,8 @@ impl fmt::Debug for NosConfig {
                 &self.bucket_policy.0.keys().collect::<Vec<_>>(),
             )
             .field("s3_access_key", &self.s3_access_key.as_ref().map(|_| "[REDACTED]"))
+            .field("cluster_mode", &self.cluster.mode.as_str())
+            .field("node_id", &self.cluster.node_id)
             .finish()
     }
 }
@@ -216,6 +224,10 @@ impl NosConfig {
                 .unwrap_or_default(),
             s3_access_key: env::var("NOS_S3_ACCESS_KEY").ok().filter(|s| !s.is_empty()),
             s3_secret_key: env::var("NOS_S3_SECRET_KEY").ok().filter(|s| !s.is_empty()),
+            cluster_bootstrap_token: env::var("NOS_CLUSTER_BOOTSTRAP_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            cluster: ClusterConfig::from_env()?,
         })
     }
 }

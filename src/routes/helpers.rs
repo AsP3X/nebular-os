@@ -2,6 +2,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 use chrono::{DateTime, Utc};
 use serde_json::{Map, Value};
 
+use crate::cluster::assignment::WriteContext;
 use crate::storage::types::ObjectMetadata;
 
 /// Replays stored custom metadata as `x-nd-custom-meta-*` response headers.
@@ -38,6 +39,16 @@ pub fn apply_object_headers(headers: &mut HeaderMap, meta: &ObjectMetadata) {
         }
     if let Ok(v) = HeaderValue::from_str(&meta.updated_at.to_rfc2822()) {
         headers.insert(header::LAST_MODIFIED, v);
+    }
+    if let Some(class) = &meta.storage_class
+        && let Ok(v) = HeaderValue::from_str(class)
+    {
+        headers.insert(HeaderName::from_static("x-nd-storage-class"), v);
+    }
+    if let Some(node) = &meta.origin_node
+        && let Ok(v) = HeaderValue::from_str(node)
+    {
+        headers.insert(HeaderName::from_static("x-nd-origin-node"), v);
     }
     apply_custom_meta_headers(headers, meta);
 }
@@ -77,4 +88,46 @@ fn parse_etag_precondition(value: &axum::http::HeaderValue) -> Option<String> {
 /// Parses RFC 7233 range values including suffix form `bytes=-N`.
 pub fn parse_range(value: &str, total_size: u64) -> Option<(u64, u64)> {
     crate::storage::range::parse_content_range(value, total_size)
+}
+
+/// Human: Collect optional assignment hints from object upload headers.
+/// Agent: READS x-nd-storage-class, Content-Type, Content-Length, x-nd-custom-meta-storage-class.
+pub fn write_context_from_headers(
+    headers: &HeaderMap,
+    custom_meta_json: Option<&str>,
+) -> WriteContext {
+    let storage_class_header = headers
+        .get("x-nd-storage-class")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok());
+    let custom_meta_storage_class = custom_meta_json.and_then(|raw| {
+        let map: Map<String, Value> = serde_json::from_str(raw).ok()?;
+        map.get("storage-class")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let replication_group_header = headers
+        .get("x-nd-replication-group")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    WriteContext {
+        storage_class_header,
+        content_type,
+        custom_meta_storage_class,
+        content_length,
+        authorization,
+        replication_group_header,
+    }
 }

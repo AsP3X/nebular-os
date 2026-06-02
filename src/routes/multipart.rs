@@ -11,6 +11,7 @@ use std::io;
 use std::sync::Arc;
 
 use crate::routes::errors::map_storage_error;
+use crate::routes::helpers::write_context_from_headers;
 use crate::routes::object::LimitReader;
 use crate::routes::AppState;
 
@@ -43,14 +44,22 @@ pub async fn init_multipart(
     Query(query): Query<InitQuery>,
     req: Request,
 ) -> Response {
-    let content_type = req
-        .headers()
+    let headers = req.headers();
+    let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok());
+    let write_ctx = write_context_from_headers(headers, None);
 
     match state
-        .storage
-        .init_multipart(&params.bucket, &query.key, content_type)
+        .backend
+        .read()
+        .await
+        .init_multipart(
+            &params.bucket,
+            &query.key,
+            content_type,
+            Some(&write_ctx),
+        )
         .await
     {
         Ok(result) => (StatusCode::OK, Json(result)).into_response(),
@@ -64,7 +73,9 @@ pub async fn upload_part(
     req: Request,
 ) -> Response {
     let key = match state
-        .storage
+        .backend
+        .read()
+        .await
         .multipart_key_for_upload(&params.upload_id)
         .await
     {
@@ -72,7 +83,8 @@ pub async fn upload_part(
         Err(e) => return map_storage_error(e).into_response(),
     };
 
-    let max_part = state.storage.multipart_part_size();
+    let write_ctx = write_context_from_headers(req.headers(), None);
+    let max_part = state.backend.read().await.multipart_part_size();
     let body_stream = req.into_body().into_data_stream();
     let body_reader = tokio_util::io::StreamReader::new(
         body_stream.map(|result| {
@@ -85,13 +97,16 @@ pub async fn upload_part(
     };
 
     match state
-        .storage
+        .backend
+        .read()
+        .await
         .upload_part(
             &params.bucket,
             &key,
             &params.upload_id,
             params.part_number,
             body_reader,
+            Some(&write_ctx),
         )
         .await
     {
@@ -106,7 +121,9 @@ pub async fn complete_multipart(
     req: Request,
 ) -> Response {
     let key = match state
-        .storage
+        .backend
+        .read()
+        .await
         .multipart_key_for_upload(&params.upload_id)
         .await
     {
@@ -127,14 +144,18 @@ pub async fn complete_multipart(
     } else {
         Some(serde_json::to_string(&custom_meta_map).unwrap_or_default())
     };
+    let write_ctx = write_context_from_headers(req.headers(), custom_meta.as_deref());
 
     match state
-        .storage
+        .backend
+        .read()
+        .await
         .complete_multipart(
             &params.bucket,
             &key,
             &params.upload_id,
             custom_meta.as_deref(),
+            Some(&write_ctx),
         )
         .await
     {
@@ -148,7 +169,9 @@ pub async fn abort_multipart(
     Path(params): Path<UploadSessionParams>,
 ) -> Response {
     let key = match state
-        .storage
+        .backend
+        .read()
+        .await
         .multipart_key_for_upload(&params.upload_id)
         .await
     {
@@ -157,7 +180,9 @@ pub async fn abort_multipart(
     };
 
     match state
-        .storage
+        .backend
+        .read()
+        .await
         .abort_multipart(&params.bucket, &key, &params.upload_id)
         .await
     {

@@ -19,7 +19,7 @@ use super::{blob_path, sanitize_bucket, sanitize_key};
 pub(crate) const DEFAULT_UPLOAD_BUFFER: usize = 256 * 1024;
 const DEFAULT_LIST_SCAN_CAP: i64 = 4096;
 
-const META_SELECT: &str = "bucket, key, size, mime_type, etag, created_at, updated_at, custom_meta, deleted_at";
+const META_SELECT: &str = "bucket, key, size, mime_type, etag, created_at, updated_at, custom_meta, deleted_at, storage_class, origin_node";
 const ACTIVE_WHERE: &str = "deleted_at IS NULL";
 
 fn escape_like_pattern(s: &str) -> String {
@@ -248,6 +248,68 @@ impl StorageEngine {
             .execute(pool)
             .await;
 
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS replication_log (
+                event_id     TEXT PRIMARY KEY,
+                origin_node  TEXT NOT NULL,
+                op           TEXT NOT NULL,
+                bucket       TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                etag         TEXT,
+                size         INTEGER,
+                payload_path TEXT,
+                created_at   INTEGER NOT NULL,
+                applied_at   INTEGER,
+                status       TEXT NOT NULL DEFAULT 'pending'
+            )",
+        )
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_repl_status ON replication_log(status, created_at)",
+        )
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+
+        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN storage_class TEXT DEFAULT 'default'")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN origin_node TEXT")
+            .execute(pool)
+            .await;
+        let _ = sqlx::query(
+            "ALTER TABLE replication_log ADD COLUMN storage_class TEXT DEFAULT 'default'",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE replication_log ADD COLUMN replication_group TEXT DEFAULT 'default'",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query(
+            "ALTER TABLE replication_log ADD COLUMN attempts INTEGER DEFAULT 0",
+        )
+        .execute(pool)
+        .await;
+        let _ = sqlx::query("ALTER TABLE replication_log ADD COLUMN next_retry_at INTEGER")
+            .execute(pool)
+            .await;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cluster_runtime_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                json TEXT NOT NULL,
+                applied_at INTEGER NOT NULL
+            )",
+        )
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(pool)
             .await
@@ -411,6 +473,8 @@ impl StorageEngine {
             updated_at: now,
             custom_meta: src_meta.custom_meta,
             deleted_at: None,
+            storage_class: src_meta.storage_class,
+            origin_node: src_meta.origin_node,
         })
     }
 
@@ -480,6 +544,8 @@ impl StorageEngine {
             updated_at: now,
             custom_meta: custom_meta.map(|s| s.to_string()),
             deleted_at: None,
+            storage_class: None,
+            origin_node: None,
         };
         Ok((meta, etag))
     }
@@ -749,6 +815,8 @@ impl StorageEngine {
                     mime_type: r.mime_type,
                     etag: r.etag,
                     last_modified: r.updated_at,
+                    storage_class: r.storage_class.clone(),
+                    origin_node: r.origin_node.clone(),
                 })
                 .collect();
             return Ok(ListResult {
@@ -795,6 +863,8 @@ impl StorageEngine {
                 mime_type: row.mime_type,
                 etag: row.etag,
                 last_modified: row.updated_at,
+                storage_class: row.storage_class.clone(),
+                origin_node: row.origin_node.clone(),
             });
         }
 
@@ -858,5 +928,90 @@ impl StorageEngine {
             .await
             .map_err(internal)?;
         Ok(total)
+    }
+
+    /// Human: Records which storage class and node own an object after assignment accepts a write.
+    /// Agent: UPDATE objects SET storage_class, origin_node for active row matching bucket/key.
+    pub async fn set_object_placement(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_class: &str,
+        origin_node: &str,
+    ) -> Result<(), StorageError> {
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        sqlx::query(
+            "UPDATE objects SET storage_class = ?, origin_node = ? WHERE bucket = ? AND key = ? AND deleted_at IS NULL",
+        )
+        .bind(storage_class)
+        .bind(origin_node)
+        .bind(&bucket)
+        .bind(&safe_key)
+        .execute(&self.write_pool)
+        .await
+        .map_err(internal)?;
+        Ok(())
+    }
+
+    /// Human: Lookup storage class before delete replication enqueue.
+    /// Agent: SELECT storage_class FROM objects WHERE active row; None if missing.
+    pub async fn active_storage_class(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT COALESCE(storage_class, 'default') FROM objects WHERE bucket = ? AND key = ? AND deleted_at IS NULL",
+        )
+        .bind(&bucket)
+        .bind(&safe_key)
+        .fetch_optional(&self.read_pool)
+        .await
+        .map_err(internal)?;
+        Ok(row.map(|(c,)| c))
+    }
+
+    /// Human: Per-class object counts for Prometheus metrics.
+    /// Agent: GROUP BY storage_class on active objects.
+    pub async fn objects_by_storage_class(
+        &self,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT COALESCE(storage_class, 'default'), COUNT(*) FROM objects WHERE deleted_at IS NULL GROUP BY storage_class",
+        )
+        .fetch_all(&self.read_pool)
+        .await
+        .map_err(internal)?;
+        Ok(rows)
+    }
+
+    /// Human: Load Ownly-applied runtime cluster JSON persisted across restarts.
+    /// Agent: READS cluster_runtime_config row id=1; RETURNS None when unset.
+    pub async fn load_cluster_runtime_config(&self) -> Result<Option<String>, StorageError> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT json FROM cluster_runtime_config WHERE id = 1")
+                .fetch_optional(&self.read_pool)
+                .await
+                .map_err(internal)?;
+        Ok(row.map(|(json,)| json))
+    }
+
+    /// Human: Persist runtime cluster topology after PUT /_cluster/config succeeds.
+    /// Agent: UPSERT cluster_runtime_config id=1; WRITES applied_at unix timestamp.
+    pub async fn save_cluster_runtime_config(&self, json: &str) -> Result<(), StorageError> {
+        let applied_at = chrono::Utc::now().timestamp();
+        sqlx::query(
+            "INSERT INTO cluster_runtime_config (id, json, applied_at) VALUES (1, $1, $2) \
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json, applied_at = excluded.applied_at",
+        )
+        .bind(json)
+        .bind(applied_at)
+        .execute(&self.write_pool)
+        .await
+        .map_err(internal)?;
+        Ok(())
     }
 }

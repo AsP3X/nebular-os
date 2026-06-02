@@ -45,6 +45,13 @@ pub enum StorageError {
     InvalidKey,
     #[error("precondition failed")]
     PreconditionFailed,
+    #[error("node is read-only replica")]
+    ReadOnlyReplica,
+    #[error("object not assigned to this node")]
+    NotAssigned {
+        assigned_node: String,
+        storage_class: String,
+    },
     #[error("storage error")]
     Internal(#[from] anyhow::Error),
 }
@@ -57,6 +64,8 @@ impl StorageError {
             StorageError::PayloadTooLarge => "payload too large",
             StorageError::InvalidBucket | StorageError::InvalidKey => "invalid request",
             StorageError::PreconditionFailed => "precondition failed",
+            StorageError::ReadOnlyReplica => "node is read-only replica",
+            StorageError::NotAssigned { .. } => "object not assigned to this node",
             StorageError::Internal(_) => "storage error",
         }
     }

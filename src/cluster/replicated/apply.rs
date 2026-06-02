@@ -1,0 +1,64 @@
+use std::path::PathBuf;
+
+use tokio::fs::File;
+use tokio::io::BufReader;
+
+use crate::storage::engine::StorageEngine;
+use crate::storage::error::{internal, StorageError};
+
+use super::log::{ReplicationEvent, ReplicationLog, ReplicationOp};
+
+/// Human: Apply a peer replication event locally (idempotent on event_id).
+/// Agent: IF has_event THEN no-op Ok; ELSE put/delete via StorageEngine; record_applied.
+pub async fn apply_replication_event_bytes(
+    engine: &StorageEngine,
+    log: &ReplicationLog,
+    event: &ReplicationEvent,
+    blob: Option<Vec<u8>>,
+) -> Result<(), StorageError> {
+    if log.has_event(&event.event_id).await? {
+        return Ok(());
+    }
+
+    match event.op {
+        ReplicationOp::Delete => {
+            engine
+                .delete_object(&event.bucket, &event.key, None)
+                .await?;
+        }
+        ReplicationOp::Put => {
+            if let Some(bytes) = blob {
+                engine
+                    .put_object(
+                        &event.bucket,
+                        &event.key,
+                        None,
+                        None,
+                        std::io::Cursor::new(bytes),
+                    )
+                    .await?;
+            } else {
+                // Human: Multipart replicate must include the blob part; payload_path is origin-local only.
+                // Agent: IF no blob AND local path missing THEN fail fast (typical when Axum 2MB default limit drops blob).
+                let path = event
+                    .payload_path
+                    .as_ref()
+                    .map(|rel| PathBuf::from(log.data_dir()).join(rel))
+                    .ok_or(StorageError::NotFound)?;
+                if !path.is_file() {
+                    return Err(internal(anyhow::anyhow!(
+                        "replication put missing blob body and local payload not found at {}",
+                        path.display()
+                    )));
+                }
+                let file = BufReader::new(File::open(&path).await.map_err(internal)?);
+                engine
+                    .put_object(&event.bucket, &event.key, None, None, file)
+                    .await?;
+            }
+        }
+    }
+
+    log.record_applied(event).await?;
+    Ok(())
+}

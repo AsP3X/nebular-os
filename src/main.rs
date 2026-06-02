@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use nebular_os::{config, secrets, server, storage};
+use nebular_os::{cluster, config, observability::NosMetrics, secrets, server, storage};
 
 use anyhow::Result;
 use axum::serve;
@@ -71,7 +71,13 @@ async fn main() -> Result<()> {
 
     spawn_storage_maintenance(storage.clone(), cfg.clone());
 
-    let app = server::create_app(storage, cfg.clone()).await?;
+    let metrics = NosMetrics::new();
+    let mut cfg_for_backend = (*cfg).clone();
+    if let Some(runtime_cluster) = cluster::runtime_config::cluster_config_from_storage(&storage).await? {
+        cfg_for_backend.cluster = runtime_cluster;
+    }
+    let backend = cluster::build_backend(storage.clone(), &cfg_for_backend, metrics.clone())?;
+    let app = server::create_app(backend, storage, Arc::new(cfg_for_backend), metrics).await?;
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!("Listening on {}", cfg.bind_addr);

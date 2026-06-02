@@ -9,13 +9,13 @@ use super::engine::{StorageEngine, TempFileGuard};
 use super::error::{internal, map_io_error, StorageError};
 use super::{blob_path, sanitize_bucket, sanitize_key};
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct InitMultipartResult {
     pub upload_id: String,
     pub part_size: usize,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct PartUploadResult {
     pub etag: String,
 }
@@ -230,6 +230,8 @@ impl StorageEngine {
             updated_at: now,
             custom_meta: custom_meta.map(|s| s.to_string()),
             deleted_at: None,
+            storage_class: None,
+            origin_node: None,
         })
     }
 

@@ -9,6 +9,10 @@ use super::{blob_path, sanitize_bucket};
 pub struct ReconcileReport {
     pub orphan_blobs_removed: u64,
     pub stale_rows_removed: u64,
+    /// Pending replication_log rows (informational when cluster replication is enabled).
+    pub replication_pending_events: u64,
+    /// Pending put events whose payload blob file is missing on disk.
+    pub replication_pending_missing_blob: u64,
 }
 
 impl StorageEngine {
@@ -56,12 +60,58 @@ impl StorageEngine {
             Self::scan_bucket_blobs(entry.path(), &bucket, &db_keys, &mut report).await?;
         }
 
+        if let Ok(hints) = self.replication_reconcile_hints().await {
+            report.replication_pending_events = hints.pending;
+            report.replication_pending_missing_blob = hints.missing_blob;
+        }
+
         tracing::info!(
             orphan_blobs_removed = report.orphan_blobs_removed,
             stale_rows_removed = report.stale_rows_removed,
+            replication_pending_events = report.replication_pending_events,
+            replication_pending_missing_blob = report.replication_pending_missing_blob,
             "storage::reconcile completed"
         );
         Ok(report)
+    }
+
+    async fn replication_reconcile_hints(&self) -> Result<ReplicationHints, StorageError> {
+        let table: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'replication_log'",
+        )
+        .fetch_optional(self.write_pool())
+        .await
+        .map_err(internal)?;
+        if table.is_none() {
+            return Ok(ReplicationHints::default());
+        }
+
+        let pending: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM replication_log WHERE status = 'pending'",
+        )
+        .fetch_one(self.write_pool())
+        .await
+        .map_err(internal)?;
+
+        let paths: Vec<(String,)> = sqlx::query_as(
+            "SELECT payload_path FROM replication_log WHERE status = 'pending' AND op = 'put' AND payload_path IS NOT NULL",
+        )
+        .fetch_all(self.write_pool())
+        .await
+        .map_err(internal)?;
+
+        let mut missing_blob = 0u64;
+        for (rel,) in paths {
+            let path = std::path::Path::new(self.data_dir()).join(&rel);
+            if !path.exists() {
+                missing_blob += 1;
+            }
+        }
+
+        Ok(ReplicationHints {
+            pending: pending.0.max(0) as u64,
+            missing_blob,
+        })
     }
 
     async fn scan_bucket_blobs(
@@ -103,4 +153,10 @@ impl StorageEngine {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Default)]
+struct ReplicationHints {
+    pending: u64,
+    missing_blob: u64,
 }

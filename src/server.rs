@@ -1,9 +1,11 @@
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post, put},
     Router,
 };
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use tokio::sync::RwLock as AsyncRwLock;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, Any, CorsLayer},
@@ -12,20 +14,37 @@ use tower_http::{
 };
 
 use crate::auth::{presigned_or_jwt_middleware, JwtSecret};
+use crate::cluster::{
+    auth as cluster_auth, replicate, routes as cluster_routes, runtime_config, StorageBackend,
+};
 use crate::config::NosConfig;
 use crate::middleware::{
     metrics_auth::metrics_auth_middleware, rate_limit::rate_limit_middleware,
     rate_limit::new_rate_limit_map,
 };
 use crate::observability::NosMetrics;
-use crate::routes::{bucket, health, metrics, multipart, object, AppState};
+use crate::routes::{bucket, capabilities, health, metrics, multipart, object, AppState};
 use crate::storage::engine::StorageEngine;
 
-pub async fn create_app(storage: StorageEngine, cfg: Arc<NosConfig>) -> anyhow::Result<Router> {
-    let metrics = NosMetrics::new();
+pub async fn create_app(
+    backend: StorageBackend,
+    engine: StorageEngine,
+    cfg: Arc<NosConfig>,
+    metrics: Arc<NosMetrics>,
+) -> anyhow::Result<Router> {
+    let cluster = Arc::new(RwLock::new(cfg.cluster.clone()));
+    let bootstrap_token = cfg
+        .cluster_bootstrap_token
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|s| Arc::new(s.to_string()));
+
     let state = Arc::new(AppState {
-        storage,
+        backend: Arc::new(AsyncRwLock::new(backend)),
+        engine,
+        cluster: cluster.clone(),
         config: cfg.clone(),
+        bootstrap_token,
         jwt_secret: Arc::new(JwtSecret(cfg.jwt_secret.clone())),
         signing_secret: cfg.signing_secret.clone().map(Arc::new),
         metrics_token: cfg.metrics_token.clone().map(Arc::new),
@@ -62,6 +81,7 @@ pub async fn create_app(storage: StorageEngine, cfg: Arc<NosConfig>) -> anyhow::
         );
 
     let mut protected_routes = Router::new()
+        .route("/_nos/capabilities", get(capabilities::capabilities))
         .merge(multipart_routes)
         .route(
             "/{bucket}/{*key}",
@@ -80,9 +100,45 @@ pub async fn create_app(storage: StorageEngine, cfg: Arc<NosConfig>) -> anyhow::
         ));
     }
 
+    // Human: Runtime cluster config must stay on public routes — never behind JWT object auth.
+    // Agent: PUT /_cluster/config; bootstrap OR cluster token; Ownly setup/admin CALLS this.
+    let runtime_config_layer = middleware::from_fn_with_state(
+        state.clone(),
+        cluster_auth::runtime_config_auth_middleware,
+    );
+    let runtime_config_router = Router::new()
+        .route(
+            "/_cluster/config",
+            get(runtime_config::get_cluster_config).put(runtime_config::put_cluster_config),
+        )
+        .layer(runtime_config_layer);
+
+    let cluster_layer =
+        middleware::from_fn_with_state(state.clone(), cluster_auth::cluster_token_middleware);
+    let cluster_router = Router::new()
+        .route("/_cluster/health", get(cluster_routes::cluster_health))
+        .route(
+            "/_cluster/capabilities",
+            get(cluster_routes::cluster_capabilities),
+        )
+        .route("/_cluster/replicate", post(replicate::replicate))
+        .route(
+            "/_cluster/assignment/resolve",
+            post(cluster_routes::assignment_resolve),
+        )
+        .route(
+            "/_cluster/objects/{bucket}/{*key}",
+            axum::routing::get(cluster_routes::cluster_object_get)
+                .head(cluster_routes::cluster_object_head),
+        )
+        .layer(DefaultBodyLimit::max(cfg.max_body_size))
+        .layer(cluster_layer);
+
     let public_routes = Router::new()
         .route("/health", get(health::health))
-        .route("/health/ready", get(health::ready));
+        .route("/health/ready", get(health::ready))
+        .merge(runtime_config_router)
+        .merge(cluster_router);
 
     let cors = build_cors(&cfg);
 

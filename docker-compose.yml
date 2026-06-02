@@ -14,5 +14,52 @@ services:
     volumes:
       - nebular_data:/data
 
+  nebular-os-hot:
+    profiles: [cluster]
+    build: .
+    container_name: nebular-os-hot
+    environment:
+      NOS_JWT_SECRET: ${NOS_JWT_SECRET:?Set NOS_JWT_SECRET in .env (min 32 chars)}
+      NOS_SIGNING_SECRET: ${NOS_SIGNING_SECRET:?Set NOS_SIGNING_SECRET in .env (min 32 chars)}
+      NOS_BIND_ADDR: 0.0.0.0:9000
+      NOS_DATA_DIR: /data/blobs
+      NOS_META_PATH: /data/meta/metadata.db
+      NOS_CLUSTER_MODE: replicated+assigned
+      NOS_NODE_ID: node-hot
+      NOS_CLUSTER_TOKEN: ${NOS_CLUSTER_TOKEN:?Set NOS_CLUSTER_TOKEN in .env}
+      NOS_CLUSTER_PEERS: node-cold=http://nebular-os-cold:9000;default,hls-hot;group=default
+      NOS_STORAGE_CLASSES: default,hls-hot
+      NOS_REPLICATION_FACTOR: "2"
+      NOS_ASSIGNMENT_RULES: '{"rules":[{"storage_class":"hls-hot","prefix":"users/","mime_prefix":"video/","assigned_node":"node-hot"}]}'
+      RUST_LOG: info
+    ports:
+      - "9001:9000"
+    volumes:
+      - nebular_hot_data:/data
+
+  nebular-os-cold:
+    profiles: [cluster]
+    build: .
+    container_name: nebular-os-cold
+    environment:
+      NOS_JWT_SECRET: ${NOS_JWT_SECRET:?Set NOS_JWT_SECRET in .env (min 32 chars)}
+      NOS_SIGNING_SECRET: ${NOS_SIGNING_SECRET:?Set NOS_SIGNING_SECRET in .env (min 32 chars)}
+      NOS_BIND_ADDR: 0.0.0.0:9000
+      NOS_DATA_DIR: /data/blobs
+      NOS_META_PATH: /data/meta/metadata.db
+      NOS_CLUSTER_MODE: assigned
+      NOS_NODE_ID: node-cold
+      NOS_CLUSTER_TOKEN: ${NOS_CLUSTER_TOKEN:?Set NOS_CLUSTER_TOKEN in .env}
+      NOS_CLUSTER_PEERS: node-hot=http://nebular-os-hot:9000;hls-hot,default;group=default
+      NOS_STORAGE_CLASSES: cold
+      NOS_ASSIGNMENT_RULES: '{"rules":[{"storage_class":"cold","assigned_node":"node-cold"}]}'
+      RUST_LOG: info
+    ports:
+      - "9002:9000"
+    volumes:
+      - nebular_cold_data:/data
+
 volumes:
   nebular_data:
+  nebular_hot_data:
+  nebular_cold_data:
