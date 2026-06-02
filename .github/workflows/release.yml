@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+
+jobs:
+  build-binaries:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            bin: nebular-os
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            bin: nebular-os
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            bin: nebular-os.exe
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            bin: nebular-os
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            bin: nebular-os
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Strip (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: strip target/${{ matrix.target }}/release/${{ matrix.bin }}
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="nebular-os-${VERSION}-${{ matrix.name }}"
+          mkdir -p "$STAGING"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGING/"
+          tar -czf "${STAGING}.tar.gz" -C . "$STAGING"
+          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart('v')
+          $staging = "nebular-os-$version-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $staging
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $staging/
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  docker:
+    name: Docker (multi-arch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  github-release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

@@ -161,6 +161,16 @@ cargo build --release
 
 ## Docker
 
+Published images (linux/amd64 and linux/arm64) are on GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/asp3x/nebular-os:latest
+```
+
+Tagged releases also publish platform binaries (Linux, Windows, macOS) on
+[GitHub Releases](https://github.com/AsP3X/nebular-os/releases). Push a `v*` tag
+to run the release workflow.
+
 ```bash
 docker build -t nebular-os .
 docker run --rm -p 9000:9000 \
