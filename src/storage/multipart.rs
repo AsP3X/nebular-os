@@ -165,11 +165,16 @@ impl StorageEngine {
             self.upload_buffer_size(),
         )?;
 
+        let existing = if final_path.exists() {
+            Some(final_path.clone())
+        } else {
+            None
+        };
         finalize_temp_to_blob(
             PathBuf::from(&tmp_path).as_path(),
             &final_path,
             total_size,
-            self.zstd_level(),
+            self.blob_finalize_options(existing),
         )
         .await?;
 

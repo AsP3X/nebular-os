@@ -5,14 +5,18 @@ use sqlx::{Pool, Sqlite};
 use tokio::fs;
 
 use super::blob_ops::link_or_copy_blob;
-use super::compression::{self, DEFAULT_ZSTD_LEVEL};
+use super::blocks::BlockStore;
+use super::compression::{self, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_LEVEL_UPLOAD};
+use super::dict_store::DictStore;
 use super::error::{internal, StorageError};
 use super::metadata_backend::MetadataBackendKind;
 use super::object_meta::{ObjectMetaConnect, ObjectMetaStore};
 use super::range::parse_content_range;
 use super::streaming::{
-    finalize_temp_to_blob, open_object_body_stream, stream_body_to_temp, GuardedObjectBodyStream,
+    finalize_temp_to_blob, open_object_body_stream, stream_body_to_temp, BlobFinalizeOptions,
+    GuardedObjectBodyStream,
 };
+use super::blob_finalize::ReadContext;
 use super::precondition::{check_write_preconditions, etag_matches};
 use super::types::{ListItem, ListResult, ObjectMetadata};
 use super::{blob_path, sanitize_bucket, sanitize_key};
@@ -71,6 +75,13 @@ pub struct EngineOptions {
     pub recompress_batch_size: usize,
     pub read_pool_size: u32,
     pub zstd_level: i32,
+    pub zstd_level_upload: i32,
+    pub zstd_dict_enabled: bool,
+    pub zstd_dict_max_bytes: usize,
+    pub zstd_dict_train_batch: usize,
+    pub dedup_enabled: bool,
+    pub dedup_block_size: usize,
+    pub dedup_min_size: u64,
     pub metadata_backend: MetadataBackendKind,
     pub metadata_database_url: Option<String>,
     pub max_logical_bytes: i64,
@@ -88,6 +99,13 @@ impl Default for EngineOptions {
             recompress_batch_size: 100,
             read_pool_size: 4,
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            zstd_level_upload: DEFAULT_ZSTD_LEVEL_UPLOAD,
+            zstd_dict_enabled: false,
+            zstd_dict_max_bytes: 112_640,
+            zstd_dict_train_batch: 32,
+            dedup_enabled: false,
+            dedup_block_size: 256 * 1024,
+            dedup_min_size: 1024 * 1024,
             metadata_backend: MetadataBackendKind::Sqlite,
             metadata_database_url: None,
             max_logical_bytes: 0,
@@ -111,6 +129,15 @@ pub struct StorageEngine {
     multipart_upload_ttl_secs: i64,
     recompress_batch_size: usize,
     zstd_level: i32,
+    zstd_level_upload: i32,
+    zstd_dict_enabled: bool,
+    zstd_dict_max_bytes: usize,
+    zstd_dict_train_batch: usize,
+    dedup_enabled: bool,
+    dedup_block_size: usize,
+    dedup_min_size: u64,
+    dict_store: DictStore,
+    block_store: BlockStore,
 }
 
 pub(crate) struct TempFileGuard {
@@ -183,6 +210,14 @@ impl StorageEngine {
         fs::create_dir_all(format!("{}/.multipart", data_dir))
             .await
             .map_err(internal)?;
+        fs::create_dir_all(format!("{}/.dict", data_dir))
+            .await
+            .map_err(internal)?;
+        fs::create_dir_all(format!("{}/.blocks", data_dir))
+            .await
+            .map_err(internal)?;
+
+        BlockStore::init_schema(&system_write).await?;
 
         Ok(Self {
             object_meta,
@@ -199,6 +234,15 @@ impl StorageEngine {
             multipart_upload_ttl_secs: opts.multipart_upload_ttl_secs.max(0),
             recompress_batch_size: opts.recompress_batch_size.max(1),
             zstd_level: compression::clamp_zstd_level(opts.zstd_level),
+            zstd_level_upload: compression::clamp_zstd_level(opts.zstd_level_upload),
+            zstd_dict_enabled: opts.zstd_dict_enabled,
+            zstd_dict_max_bytes: opts.zstd_dict_max_bytes.max(1024),
+            zstd_dict_train_batch: opts.zstd_dict_train_batch.max(2),
+            dedup_enabled: opts.dedup_enabled,
+            dedup_block_size: opts.dedup_block_size.max(4096),
+            dedup_min_size: opts.dedup_min_size,
+            dict_store: DictStore::new(data_dir),
+            block_store: BlockStore::new(data_dir),
         })
     }
 
@@ -291,6 +335,76 @@ impl StorageEngine {
         self.zstd_level
     }
 
+    pub fn zstd_level_upload(&self) -> i32 {
+        self.zstd_level_upload
+    }
+
+    pub fn zstd_dict_enabled(&self) -> bool {
+        self.zstd_dict_enabled
+    }
+
+    pub fn zstd_dict_max_bytes(&self) -> usize {
+        self.zstd_dict_max_bytes
+    }
+
+    pub fn zstd_dict_train_batch(&self) -> usize {
+        self.zstd_dict_train_batch
+    }
+
+    pub fn dedup_enabled(&self) -> bool {
+        self.dedup_enabled
+    }
+
+    pub fn dedup_block_size(&self) -> usize {
+        self.dedup_block_size
+    }
+
+    pub fn dedup_min_size(&self) -> u64 {
+        self.dedup_min_size
+    }
+
+    pub fn dict_store(&self) -> &DictStore {
+        &self.dict_store
+    }
+
+    pub fn block_store(&self) -> &BlockStore {
+        &self.block_store
+    }
+
+    pub fn system_write_pool(&self) -> &Pool<Sqlite> {
+        &self.system_write
+    }
+
+    pub(crate) fn blob_finalize_options(&self, existing: Option<PathBuf>) -> BlobFinalizeOptions {
+        let dict = if self.zstd_dict_enabled {
+            self.dict_store.global_dict()
+        } else {
+            None
+        };
+        BlobFinalizeOptions {
+            level: self.zstd_level_upload,
+            dict_id: 0,
+            dict,
+            dedup_enabled: self.dedup_enabled,
+            dedup_block_size: self.dedup_block_size,
+            dedup_min_size: self.dedup_min_size,
+            data_dir: self.data_dir.clone(),
+            system_pool: self.system_write.clone(),
+            existing_blob: existing,
+        }
+    }
+
+    pub fn read_context(&self) -> ReadContext {
+        ReadContext {
+            data_dir: self.data_dir.clone(),
+            dict: if self.zstd_dict_enabled {
+                self.dict_store.global_dict()
+            } else {
+                None
+            },
+        }
+    }
+
     /// Human: Loads active object metadata when present, without treating a miss as an error.
     /// Agent: SELECT objects WHERE deleted_at IS NULL; RETURNS Option (None = no live row).
     pub async fn try_fetch_active_metadata(
@@ -362,7 +476,16 @@ impl StorageEngine {
         // Agent: CALLS link_or_copy_blob(src,dst); fallback fs::copy on EXDEV; metadata row for dst only.
         self.ensure_capacity_for_write(&dst_bucket, &dst_key, src_meta.size as u64)
             .await?;
-        link_or_copy_blob(&src_path, &dst_path).await?;
+        let entries = BlockStore::manifest_entries(&src_path)?;
+        if entries.is_empty() {
+            link_or_copy_blob(&src_path, &dst_path).await?;
+        } else {
+            if dst_path.exists() {
+                BlockStore::release_blob(&self.system_write, &self.data_dir, &dst_path).await?;
+            }
+            link_or_copy_blob(&src_path, &dst_path).await?;
+            BlockStore::inc_refs(&self.system_write, &entries).await?;
+        }
 
         self.object_meta
             .copy_object_metadata(&src_meta, &dst_bucket, &dst_key)
@@ -389,11 +512,16 @@ impl StorageEngine {
             stream_body_to_temp(body, PathBuf::from(&tmp_path).as_path(), self.upload_buffer_size)
                 .await?;
 
+        let existing = if final_path.exists() {
+            Some(final_path.clone())
+        } else {
+            None
+        };
         finalize_temp_to_blob(
             PathBuf::from(&tmp_path).as_path(),
             &final_path,
             size,
-            self.zstd_level(),
+            self.blob_finalize_options(existing),
         )
         .await?;
 
@@ -461,7 +589,7 @@ impl StorageEngine {
             total_size,
             start,
             content_length,
-            &self.data_dir,
+            &self.read_context(),
         )
         .await?;
 
@@ -535,12 +663,18 @@ impl StorageEngine {
         let path = blob_path(&self.data_dir, &bucket, &safe_key);
 
         if self.soft_delete_ttl_secs <= 0 {
+            if path.exists() {
+                BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
+            }
             let _ = fs::remove_file(&path).await;
             self.object_meta.hard_delete_object(&bucket, &safe_key).await?;
             return Ok(());
         }
 
         if self.soft_delete_drop_blob {
+            if path.exists() {
+                BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
+            }
             let _ = fs::remove_file(&path).await;
         }
 

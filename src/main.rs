@@ -35,6 +35,13 @@ async fn main() -> Result<()> {
         recompress_batch_size: cfg.recompress_batch_size,
         read_pool_size: cfg.read_pool_size,
         zstd_level: cfg.zstd_level,
+        zstd_level_upload: cfg.zstd_level_upload,
+        zstd_dict_enabled: cfg.zstd_dict_enabled,
+        zstd_dict_max_bytes: cfg.zstd_dict_max_bytes,
+        zstd_dict_train_batch: cfg.zstd_dict_train_batch,
+        dedup_enabled: cfg.dedup_enabled,
+        dedup_block_size: cfg.dedup_block_size,
+        dedup_min_size: cfg.dedup_min_size,
         metadata_backend: cfg.metadata_backend,
         metadata_database_url: cfg.metadata_database_url.clone(),
         max_logical_bytes: cfg.max_logical_bytes,
@@ -73,9 +80,13 @@ async fn main() -> Result<()> {
 
     if cfg.recompress_on_startup {
         let report = storage
-            .recompress_legacy_blobs(cfg.recompress_batch_size)
+            .recompress_blobs(cfg.recompress_batch_size)
             .await?;
-        tracing::info!(?report, "Startup legacy blob recompression finished");
+        tracing::info!(?report, "Startup blob recompression finished");
+        if cfg.zstd_dict_enabled {
+            let dict_report = storage.train_zstd_dictionary().await?;
+            tracing::info!(?dict_report, "Startup dictionary training finished");
+        }
     }
 
     if cfg.reconcile_interval_secs > 0 {
@@ -141,15 +152,21 @@ fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::N
                 }
             }
             if recompress {
-                match storage
-                    .recompress_legacy_blobs(cfg.recompress_batch_size)
-                    .await
-                {
+                match storage.recompress_blobs(cfg.recompress_batch_size).await {
                     Ok(report) if report.recompressed > 0 => {
-                        tracing::info!(?report, "Periodic legacy blob recompression finished")
+                        tracing::info!(?report, "Periodic blob recompression finished")
                     }
                     Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "Legacy blob recompression failed"),
+                    Err(e) => tracing::error!(error = %e, "Blob recompression failed"),
+                }
+                if cfg.zstd_dict_enabled {
+                    match storage.train_zstd_dictionary().await {
+                        Ok(report) if report.trained => {
+                            tracing::info!(?report, "Periodic dictionary training finished")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!(error = %e, "Dictionary training failed"),
+                    }
                 }
             }
         }

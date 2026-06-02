@@ -41,8 +41,8 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_SOFT_DELETE_TTL_SECS` | Seconds before purging soft-deleted metadata; `0` hard-deletes immediately (default `86400`) |
 | `NOS_SOFT_DELETE_DROP_BLOB` | Remove blob file on soft-delete while keeping tombstone until TTL (default `false`) |
 | `NOS_MULTIPART_UPLOAD_TTL_SECS` | Purge abandoned multipart sessions after this many seconds (default `86400`; `0` disables) |
-| `NOS_RECOMPRESS_ON_STARTUP` | Re-compress legacy raw blobs at boot (default `false`) |
-| `NOS_RECOMPRESS_INTERVAL_SECS` | Periodic legacy blob recompression interval; `0` disables (default `0`) |
+| `NOS_RECOMPRESS_ON_STARTUP` | Re-compress raw and upgradeable NOSZ/NOS2 blobs at boot (default `false`) |
+| `NOS_RECOMPRESS_INTERVAL_SECS` | Periodic blob recompression interval; `0` disables (default `0`) |
 | `NOS_RECOMPRESS_BATCH_SIZE` | Max objects scanned per recompression pass (default `100`) |
 | `NOS_METRICS_TOKEN` | Bearer token required for `/metrics` when set |
 | `NOS_RATE_LIMIT_RPS` | Per-IP request limit; `0` disables (default `0`) |
@@ -50,7 +50,14 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_LIST_SCAN_CAP` | Max keys scanned per delimiter listing page (default `4096`) |
 | `NOS_MULTIPART_PART_SIZE` | Max bytes per multipart part (default `8388608`) |
 | `NOS_READ_POOL_SIZE` | SQLite read pool connections (default `4`) |
-| `NOS_ZSTD_LEVEL` | zstd compression level 1–22 for blob writes (default `22`; lower = faster uploads) |
+| `NOS_ZSTD_LEVEL` | Background / maintenance zstd level 1–22 (default `22`; lower = faster recompression passes) |
+| `NOS_ZSTD_LEVEL_UPLOAD` | Fast upload zstd level 1–22 (default `3`) |
+| `NOS_ZSTD_DICT_ENABLED` | Train and use a global zstd dictionary (default `false`) |
+| `NOS_ZSTD_DICT_MAX_BYTES` | Max trained dictionary size in bytes (default `112640`) |
+| `NOS_ZSTD_DICT_TRAIN_BATCH` | Sample count for dictionary training (default `32`) |
+| `NOS_DEDUP_ENABLED` | Block-level deduplication for large objects (default `false`) |
+| `NOS_DEDUP_BLOCK_SIZE` | Dedup chunk size in bytes (default `262144`) |
+| `NOS_DEDUP_MIN_SIZE` | Minimum logical object size to use dedup (default `1048576`) |
 | `NOS_S3_COMPAT` | Enable S3-style XML list/errors and `x-amz-copy-source` (default `false`) |
 | `NOS_BUCKET_POLICY` | JSON map of `sub` → allowed bucket names; empty = no extra restriction |
 | `NOS_S3_ACCESS_KEY` / `NOS_S3_SECRET_KEY` | Optional access-key auth via `Authorization: NOS <key>:<sig>` |

@@ -10,8 +10,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use super::compression::{
-    compress_file_to_storage, decompress_file_to_temp, read_blob_header_size, BLOB_MAGIC, HEADER_LEN,
+    decompress_file_to_temp, read_blob_header_size, BlobFormat, HEADER_LEN, HEADER_LEN_V2,
 };
+use super::blocks::BlockStore;
+use super::blob_finalize::blob_format_from_header;
 use super::error::{internal, map_io_error, StorageError};
 
 /// Human: AsyncRead wrapper that skips an offset and stops after a byte budget (HTTP Range on raw files).
@@ -155,12 +157,25 @@ pub async fn open_object_body_stream(
     logical_size: u64,
     range_start: u64,
     content_length: u64,
-    data_dir: &str,
+    ctx: &ReadContext,
 ) -> Result<GuardedObjectBodyStream, StorageError> {
     let header = fs::read(blob_path)
         .await
         .map_err(map_io_error)?;
-    if header.len() < HEADER_LEN || !header.starts_with(BLOB_MAGIC) {
+    let format = blob_format_from_header(&header);
+
+    if format == BlobFormat::Nosd {
+        return open_dedup_object_stream(
+            blob_path,
+            logical_size,
+            range_start,
+            content_length,
+            ctx,
+        )
+        .await;
+    }
+
+    if format == BlobFormat::Raw {
         let stream = open_raw_file_stream(blob_path, range_start, content_length).await?;
         return Ok(GuardedObjectBodyStream {
             stream,
@@ -168,8 +183,10 @@ pub async fn open_object_body_stream(
         });
     }
 
+    let dict = ctx.dict_bytes();
+
     if range_start == 0 && content_length == logical_size {
-        let stream = open_full_compressed_stream(blob_path, logical_size).await?;
+        let stream = open_full_compressed_stream(blob_path, logical_size, format, dict).await?;
         return Ok(GuardedObjectBodyStream {
             stream,
             _spill_guard: None,
@@ -178,13 +195,52 @@ pub async fn open_object_body_stream(
 
     let spill = format!(
         "{}/.tmp/decompress-{}.bin",
-        data_dir,
+        ctx.data_dir,
         uuid::Uuid::new_v4()
     );
     let blob_path_owned = blob_path.to_path_buf();
     let spill_path = spill.clone();
+    let dict_owned = ctx.dict.clone();
     tokio::task::spawn_blocking(move || {
-        decompress_file_to_temp(&blob_path_owned, logical_size, Path::new(&spill_path))
+        decompress_file_to_temp(
+            &blob_path_owned,
+            logical_size,
+            Path::new(&spill_path),
+            dict_owned.as_deref().map(|v| v.as_slice()),
+        )
+    })
+    .await
+    .map_err(internal)??;
+
+    let guard = SpillFileGuard {
+        path: PathBuf::from(&spill),
+    };
+    let file = File::open(&spill).await.map_err(map_io_error)?;
+    let limited = LimitedAsyncRead::new(file, range_start, content_length);
+    Ok(GuardedObjectBodyStream {
+        stream: ObjectBodyStream::FileLimited(ReaderStream::new(limited)),
+        _spill_guard: Some(guard),
+    })
+}
+
+async fn open_dedup_object_stream(
+    blob_path: &Path,
+    logical_size: u64,
+    range_start: u64,
+    content_length: u64,
+    ctx: &ReadContext,
+) -> Result<GuardedObjectBodyStream, StorageError> {
+    let spill = format!(
+        "{}/.tmp/dedup-{}.bin",
+        ctx.data_dir,
+        uuid::Uuid::new_v4()
+    );
+    let blob_path_owned = blob_path.to_path_buf();
+    let spill_path = spill.clone();
+    let data_dir = ctx.data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let store = BlockStore::new(&data_dir);
+        store.assemble_to_file(&blob_path_owned, Path::new(&spill_path), logical_size)
     })
     .await
     .map_err(internal)??;
@@ -213,10 +269,15 @@ async fn open_raw_file_stream(
 async fn open_full_compressed_stream(
     blob_path: &Path,
     logical_size: u64,
+    format: BlobFormat,
+    dict: Option<&[u8]>,
 ) -> Result<ObjectBodyStream, StorageError> {
     let path = blob_path.to_path_buf();
+    let dict_vec = dict.map(|d| d.to_vec());
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-    tokio::task::spawn_blocking(move || pump_zstd_decode(path, logical_size, tx));
+    tokio::task::spawn_blocking(move || {
+        pump_zstd_decode(path, logical_size, format, dict_vec, tx)
+    });
     Ok(ObjectBodyStream::Channel(
         tokio_stream::wrappers::ReceiverStream::new(rx),
     ))
@@ -225,6 +286,8 @@ async fn open_full_compressed_stream(
 fn pump_zstd_decode(
     blob_path: PathBuf,
     logical_size: u64,
+    format: BlobFormat,
+    dict: Option<Vec<u8>>,
     tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
     let mut file = match std::fs::File::open(&blob_path) {
@@ -248,15 +311,37 @@ fn pump_zstd_decode(
         let _ = tx.blocking_send(Err(std::io::Error::other("blob header size mismatch")));
         return;
     }
-    if file.seek(std::io::SeekFrom::Start(HEADER_LEN as u64)).is_err() {
+    let header_len = match format {
+        BlobFormat::Nosz => HEADER_LEN,
+        BlobFormat::Nos2 => HEADER_LEN_V2,
+        _ => {
+            let _ = tx.blocking_send(Err(std::io::Error::other("not a zstd blob")));
+            return;
+        }
+    };
+    if file
+        .seek(std::io::SeekFrom::Start(header_len as u64))
+        .is_err()
+    {
         let _ = tx.blocking_send(Err(std::io::Error::other("seek past header failed")));
         return;
     }
-    let mut decoder = match zstd::stream::read::Decoder::new(file) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(e));
-            return;
+    let reader = std::io::BufReader::new(file);
+    let mut decoder = if let Some(ref d) = dict.filter(|d| !d.is_empty()) {
+        match zstd::stream::read::Decoder::with_dictionary(reader, d) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
+        }
+    } else {
+        match zstd::stream::read::Decoder::with_buffer(reader) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = tx.blocking_send(Err(e));
+                return;
+            }
         }
     };
     let mut buf = vec![0u8; 256 * 1024];
@@ -321,26 +406,4 @@ pub fn hash_temp_file(tmp_path: &Path, buffer_size: usize) -> Result<(u64, Strin
     Ok((total_size, format!("{:016x}", hasher.digest())))
 }
 
-/// Human: After temp upload, compress-or-store to final blob path without loading the whole object into RAM.
-/// Agent: CALLS compress_file_to_storage; compares on-disk sizes; may copy raw when compression does not shrink.
-pub async fn finalize_temp_to_blob(
-    tmp_path: &Path,
-    final_path: &Path,
-    logical_size: u64,
-    zstd_level: i32,
-) -> Result<(), StorageError> {
-    if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent).await.map_err(internal)?;
-    }
-    if final_path.exists() {
-        fs::remove_file(final_path).await.map_err(map_io_error)?;
-    }
-    let tmp = tmp_path.to_path_buf();
-    let fin = final_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        compress_file_to_storage(&tmp, &fin, logical_size, zstd_level)
-    })
-    .await
-    .map_err(internal)??;
-    Ok(())
-}
+pub use super::blob_finalize::{finalize_temp_to_blob, BlobFinalizeOptions, ReadContext};

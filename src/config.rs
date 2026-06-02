@@ -59,7 +59,16 @@ pub struct NosConfig {
     pub multipart_part_size: usize,
     pub read_pool_size: u32,
     pub cors_origins: Vec<String>,
+    /// Background / maintenance zstd level (NOS_ZSTD_LEVEL, default 22).
     pub zstd_level: i32,
+    /// Fast upload zstd level (NOS_ZSTD_LEVEL_UPLOAD, default 3).
+    pub zstd_level_upload: i32,
+    pub zstd_dict_enabled: bool,
+    pub zstd_dict_max_bytes: usize,
+    pub zstd_dict_train_batch: usize,
+    pub dedup_enabled: bool,
+    pub dedup_block_size: usize,
+    pub dedup_min_size: u64,
     pub s3_compat: bool,
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
@@ -102,6 +111,9 @@ impl fmt::Debug for NosConfig {
             .field("read_pool_size", &self.read_pool_size)
             .field("cors_origins", &self.cors_origins)
             .field("zstd_level", &self.zstd_level)
+            .field("zstd_level_upload", &self.zstd_level_upload)
+            .field("zstd_dict_enabled", &self.zstd_dict_enabled)
+            .field("dedup_enabled", &self.dedup_enabled)
             .field("s3_compat", &self.s3_compat)
             .field(
                 "bucket_policy",
@@ -234,6 +246,43 @@ impl NosConfig {
                 .transpose()?
                 .map(crate::storage::compression::clamp_zstd_level)
                 .unwrap_or(crate::storage::compression::DEFAULT_ZSTD_LEVEL),
+            zstd_level_upload: env::var("NOS_ZSTD_LEVEL_UPLOAD")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_ZSTD_LEVEL_UPLOAD must be a valid i32")
+                })
+                .transpose()?
+                .map(crate::storage::compression::clamp_zstd_level)
+                .unwrap_or(crate::storage::compression::DEFAULT_ZSTD_LEVEL_UPLOAD),
+            zstd_dict_enabled: env::var("NOS_ZSTD_DICT_ENABLED")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(false),
+            zstd_dict_max_bytes: env::var("NOS_ZSTD_DICT_MAX_BYTES")
+                .ok()
+                .map(|s| s.parse().context("NOS_ZSTD_DICT_MAX_BYTES must be a valid usize"))
+                .transpose()?
+                .unwrap_or(112_640),
+            zstd_dict_train_batch: env::var("NOS_ZSTD_DICT_TRAIN_BATCH")
+                .ok()
+                .map(|s| s.parse().context("NOS_ZSTD_DICT_TRAIN_BATCH must be a valid usize"))
+                .transpose()?
+                .unwrap_or(32),
+            dedup_enabled: env::var("NOS_DEDUP_ENABLED")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(false),
+            dedup_block_size: env::var("NOS_DEDUP_BLOCK_SIZE")
+                .ok()
+                .map(|s| s.parse().context("NOS_DEDUP_BLOCK_SIZE must be a valid usize"))
+                .transpose()?
+                .unwrap_or(256 * 1024),
+            dedup_min_size: env::var("NOS_DEDUP_MIN_SIZE")
+                .ok()
+                .map(|s| s.parse().context("NOS_DEDUP_MIN_SIZE must be a valid u64"))
+                .transpose()?
+                .unwrap_or(1024 * 1024),
             s3_compat: env::var("NOS_S3_COMPAT")
                 .ok()
                 .map(|s| parse_bool(&s))

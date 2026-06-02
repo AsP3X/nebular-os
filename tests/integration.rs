@@ -73,6 +73,13 @@ fn test_config_with_cap(
         read_pool_size: 2,
         cors_origins: vec![],
         zstd_level: 3,
+        zstd_level_upload: 3,
+        zstd_dict_enabled: false,
+        zstd_dict_max_bytes: 112_640,
+        zstd_dict_train_batch: 32,
+        dedup_enabled: false,
+        dedup_block_size: 256 * 1024,
+        dedup_min_size: 1024 * 1024,
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -576,7 +583,7 @@ async fn test_presigned_url_access() {
 #[tokio::test]
 async fn test_storage_compression_transparent() {
     use nebular_os::storage::blob_path;
-    use nebular_os::storage::compression::{is_compressed_blob, BLOB_MAGIC};
+    use nebular_os::storage::compression::{is_compressed_blob, BLOB_MAGIC_V2};
 
     let (app, token, tmp) = setup_app(None, false).await;
     let content = "compressible payload ".repeat(500);
@@ -599,7 +606,7 @@ async fn test_storage_compression_transparent() {
     ))
     .unwrap();
     assert!(is_compressed_blob(&on_disk));
-    assert!(on_disk.starts_with(BLOB_MAGIC));
+    assert!(on_disk.starts_with(BLOB_MAGIC_V2));
     assert!(on_disk.len() < content.len());
 
     let req = Request::builder()
@@ -1357,4 +1364,187 @@ async fn test_bucket_policy_denies_other_bucket() {
         .body(Body::empty())
         .unwrap();
     assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_recompress_nosz_at_higher_level() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::{
+        compress_blob, is_compressed_blob, read_stored_zstd_level, RuntimeCompressParams,
+        BLOB_MAGIC, HEADER_LEN,
+    };
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        zstd_level: 22,
+        zstd_level_upload: 3,
+        ..EngineOptions::default()
+    })
+    .await;
+    let logical = b"recompress me at higher level ".repeat(300);
+    let path = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "low-level.bin",
+    );
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    let low = compress_blob(&logical, &RuntimeCompressParams::new(1)).unwrap();
+    assert_eq!(read_stored_zstd_level(&low), Some(1));
+    std::fs::write(&path, &low).unwrap();
+
+    storage
+        .object_meta()
+        .upsert_object(
+            &tmp.path().join("blobs").to_string_lossy(),
+            "music",
+            "low-level.bin",
+            logical.len() as i64,
+            None,
+            "abc",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let report = storage.recompress_blobs(10).await.unwrap();
+    assert!(
+        report.recompressed >= 1,
+        "expected recompression, got {:?}",
+        report
+    );
+    let on_disk = std::fs::read(&path).unwrap();
+    assert!(is_compressed_blob(&on_disk));
+    assert_eq!(read_stored_zstd_level(&on_disk), Some(22));
+    assert!(on_disk.len() <= low.len());
+
+    let outcome = storage
+        .get_object("music", "low-level.bin", None, None, None)
+        .await
+        .unwrap();
+    match outcome {
+        nebular_os::storage::GetObjectOutcome::Content { stream, .. } => {
+            let bytes = axum::body::to_bytes(
+                axum::body::Body::from_stream(stream.stream),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes.as_ref(), &logical[..]);
+        }
+        _ => panic!("expected content"),
+    }
+
+    // Ensure legacy NOSZ headers still readable
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(BLOB_MAGIC);
+    legacy.extend_from_slice(&(logical.len() as u64).to_le_bytes());
+    legacy.extend_from_slice(&zstd::encode_all(&logical[..], 3).unwrap());
+    assert!(legacy.len() > HEADER_LEN);
+}
+
+#[tokio::test]
+async fn test_dedup_large_object() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::{is_dedup_manifest, DEDUP_MAGIC};
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        dedup_enabled: true,
+        dedup_min_size: 1024,
+        dedup_block_size: 4096,
+        ..EngineOptions::default()
+    })
+    .await;
+
+    let payload = b"dedup-block-payload-".repeat(120); // > 1KB
+    let mut body = std::io::Cursor::new(&payload[..]);
+    storage
+        .put_object("music", "big.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    let path = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "big.bin",
+    );
+    let on_disk = std::fs::read(&path).unwrap();
+    assert!(is_dedup_manifest(&on_disk));
+    assert!(on_disk.starts_with(DEDUP_MAGIC));
+
+    let outcome = storage
+        .get_object("music", "big.bin", None, None, None)
+        .await
+        .unwrap();
+    match outcome {
+        nebular_os::storage::GetObjectOutcome::Content { stream, .. } => {
+            let bytes = axum::body::to_bytes(
+                axum::body::Body::from_stream(stream.stream),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes.as_ref(), &payload[..]);
+        }
+        _ => panic!("expected content"),
+    }
+
+    // Second object with identical payload should share blocks
+    let mut body2 = std::io::Cursor::new(&payload[..]);
+    storage
+        .put_object("music", "big2.bin", None, None, &mut body2)
+        .await
+        .unwrap();
+    let path2 = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "big2.bin",
+    );
+    assert!(path2.exists());
+}
+
+#[tokio::test]
+async fn test_zstd_dictionary_train_and_use() {
+    use nebular_os::storage::compression::{is_compressed_blob, read_stored_dict_id};
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        zstd_dict_enabled: true,
+        zstd_dict_max_bytes: 4096,
+        zstd_level: 19,
+        zstd_level_upload: 3,
+        ..EngineOptions::default()
+    })
+    .await;
+
+    for i in 0..8 {
+        let text = format!("COMMON log line {i} repeated text for dictionary training\n").repeat(120);
+        let mut body = std::io::Cursor::new(text.as_bytes());
+        storage
+            .put_object("logs", &format!("app-{i}.log"), None, None, &mut body)
+            .await
+            .unwrap();
+    }
+
+    let report = storage.train_zstd_dictionary().await.unwrap();
+    assert!(report.samples >= 2);
+    assert!(report.trained);
+    assert!(storage.dict_store().exists_on_disk(0));
+
+    let sample = "log line 99 repeated text for dictionary training\n".repeat(80);
+    let mut body = std::io::Cursor::new(sample.as_bytes());
+    storage
+        .put_object("logs", "new.log", None, None, &mut body)
+        .await
+        .unwrap();
+
+    use nebular_os::storage::blob_path;
+    let path = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "logs",
+        "new.log",
+    );
+    let on_disk = std::fs::read(&path).unwrap();
+    assert!(is_compressed_blob(&on_disk));
+    assert_eq!(read_stored_dict_id(&on_disk), Some(0));
 }

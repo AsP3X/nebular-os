@@ -1,5 +1,8 @@
+pub mod blob_finalize;
 pub mod blob_ops;
+pub mod blocks;
 pub mod compression;
+pub mod dict_store;
 pub mod engine;
 pub mod metadata_backend;
 pub mod object_meta;
@@ -13,7 +16,7 @@ pub mod reconcile;
 pub mod types;
 
 pub use engine::{GetObjectOutcome, StorageEngine};
-pub use maintenance::RecompressReport;
+pub use maintenance::{DictTrainReport, RecompressReport};
 
 use std::path::PathBuf;
 
