@@ -80,6 +80,7 @@ fn metadata_from_etag(
 }
 
 /// Human: Forward a PUT body to the peer that owns this storage class.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_put(
     peers: &PeerRegistry,
     resolution: &AssignmentResolution,
@@ -117,6 +118,7 @@ pub async fn proxy_put(
 }
 
 /// Human: Forward server-side copy to the assigned peer via PUT + x-nd-copy-source.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_copy(
     peers: &PeerRegistry,
     resolution: &AssignmentResolution,
@@ -184,6 +186,7 @@ pub async fn proxy_init_multipart(
 }
 
 /// Human: Forward a multipart part upload to the assigned peer.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_upload_part(
     peers: &PeerRegistry,
     resolution: &AssignmentResolution,

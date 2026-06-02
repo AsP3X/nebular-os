@@ -91,6 +91,7 @@ impl StorageBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_object(
         &self,
         src_bucket: &str,

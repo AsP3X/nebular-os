@@ -85,15 +85,15 @@ impl AssignmentRules {
         ctx: Option<&WriteContext>,
     ) -> String {
         if let Some(ctx) = ctx {
-            if let Some(h) = &ctx.storage_class_header {
-                if !h.is_empty() {
-                    return h.clone();
-                }
+            if let Some(h) = &ctx.storage_class_header
+                && !h.is_empty()
+            {
+                return h.clone();
             }
-            if let Some(h) = &ctx.custom_meta_storage_class {
-                if !h.is_empty() {
-                    return h.clone();
-                }
+            if let Some(h) = &ctx.custom_meta_storage_class
+                && !h.is_empty()
+            {
+                return h.clone();
             }
         }
 
@@ -133,10 +133,9 @@ impl AssignmentRules {
             .rules
             .iter()
             .find(|r| r.storage_class == storage_class)
+            && let Some(node) = &rule.assigned_node
         {
-            if let Some(node) = &rule.assigned_node {
-                return Some(node.clone());
-            }
+            return Some(node.clone());
         }
         peers
             .peers

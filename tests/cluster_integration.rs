@@ -244,7 +244,7 @@ async fn cluster_replicate_eventually() {
 
     let cfg_b = cluster_test_config(
         "node-b",
-        &format!("node-a=http://127.0.0.1:1"),
+        "node-a=http://127.0.0.1:1",
         "member",
         2,
     );
@@ -396,7 +396,7 @@ async fn replicated_assigned_replicates_class_to_peer() {
     let addr_rep = listener_rep.local_addr().unwrap();
 
     let peers_hot = format!("node-rep=http://{};hls-hot;group=default", addr_rep);
-    let cfg_rep = combined_rep_config(&format!("node-hot=http://127.0.0.1:1;group=default"));
+    let cfg_rep = combined_rep_config("node-hot=http://127.0.0.1:1;group=default");
     let (backend_rep, engine_rep, _) = engine_and_backend(&cfg_rep, &tmp_rep).await;
     let app_rep = app_with_metrics(backend_rep, engine_rep, cfg_rep.clone()).await;
     let app_rep_client = app_rep.clone();
@@ -630,7 +630,7 @@ async fn replication_retry_after_failed_push() {
     .unwrap();
 
     let pending = log.list_pending(8).await.unwrap();
-    assert!(pending.is_empty() || pending[0].event_id.len() > 0);
+    assert!(pending.is_empty() || !pending[0].event_id.is_empty());
     let event_id = sqlx::query_as::<_, (String,)>(
         "SELECT event_id FROM replication_log WHERE status = 'failed' LIMIT 1",
     )

@@ -98,11 +98,11 @@ impl PeerRegistry {
                 entry.push(';');
                 entry.push_str(&p.storage_classes.join(","));
             }
-            if let Some(ref g) = p.replication_group {
-                if !g.trim().is_empty() {
-                    entry.push_str(";group=");
-                    entry.push_str(g.trim());
-                }
+            if let Some(ref g) = p.replication_group
+                && !g.trim().is_empty()
+            {
+                entry.push_str(";group=");
+                entry.push_str(g.trim());
             }
             parts.push(entry);
         }

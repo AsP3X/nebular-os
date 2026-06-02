@@ -57,7 +57,7 @@ pub enum GetObjectOutcome {
         stream: GuardedObjectBodyStream,
         content_length: u64,
         total_size: u64,
-        meta: ObjectMetadata,
+        meta: Box<ObjectMetadata>,
     },
 }
 
@@ -469,7 +469,7 @@ impl StorageEngine {
             stream,
             content_length,
             total_size,
-            meta,
+            meta: Box::new(meta),
         })
     }
 

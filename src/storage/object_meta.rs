@@ -174,6 +174,7 @@ impl ObjectMetaStore {
             .ok_or(StorageError::NotFound)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_object(
         &self,
         data_dir: &str,

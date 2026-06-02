@@ -61,11 +61,11 @@ impl ReplicatedBackend {
         }
     }
 
-    fn replication_group<'a>(&self, ctx: Option<&'a WriteContext>) -> String {
+    fn replication_group(&self, ctx: Option<&WriteContext>) -> String {
         replication_group_for_write(ctx, &self.cluster)
     }
 
-    fn storage_class_for_write<'a>(&self, ctx: Option<&'a WriteContext>) -> String {
+    fn storage_class_for_write(&self, ctx: Option<&WriteContext>) -> String {
         ctx.and_then(|c| c.storage_class_header.clone())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| self.cluster.default_storage_class.clone())
@@ -163,6 +163,7 @@ impl ReplicatedBackend {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn copy_object(
         &self,
         src_bucket: &str,

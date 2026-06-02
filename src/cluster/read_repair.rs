@@ -14,6 +14,7 @@ use crate::storage::types::ObjectMetadata;
 
 /// Human: Try each peer until one returns 200/206/304 for the object key.
 /// Agent: Does not write to local disk; streams HTTP body into GetObjectOutcome::Content.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch_from_peers(
     client: &reqwest::Client,
     peers: &PeerRegistry,
@@ -44,10 +45,10 @@ pub async fn fetch_from_peers(
         if let Some(v) = if_none_match {
             req = req.header(header::IF_NONE_MATCH, v);
         }
-        if let Some(ts) = if_modified_since {
-            if let Some(dt) = Utc.timestamp_opt(ts, 0).single() {
-                req = req.header(header::IF_MODIFIED_SINCE, dt.to_rfc2822());
-            }
+        if let Some(ts) = if_modified_since
+            && let Some(dt) = Utc.timestamp_opt(ts, 0).single()
+        {
+            req = req.header(header::IF_MODIFIED_SINCE, dt.to_rfc2822());
         }
 
         let resp = match req.send().await {
@@ -130,7 +131,7 @@ pub async fn fetch_from_peers(
             stream,
             content_length,
             total_size,
-            meta,
+            meta: Box::new(meta),
         });
     }
 
