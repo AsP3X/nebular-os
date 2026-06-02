@@ -1,4 +1,10 @@
 FROM rust:1.88-slim-bookworm AS builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        pkg-config \
+        libssl-dev \
+        libsqlite3-dev \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml .
 COPY Cargo.lock .
