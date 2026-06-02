@@ -4,6 +4,7 @@ use std::fmt;
 use anyhow::{Context, Result};
 
 use crate::cluster::ClusterConfig;
+use crate::storage::metadata_backend::MetadataBackendKind;
 
 /// Human: Optional per-subject bucket allow-lists loaded from NOS_BUCKET_POLICY JSON.
 /// Agent: EMPTY map => allow all buckets; non-empty => sub must list bucket explicitly.
@@ -35,6 +36,9 @@ pub struct NosConfig {
     pub bind_addr: String,
     pub data_dir: String,
     pub meta_path: String,
+    pub metadata_backend: MetadataBackendKind,
+    pub metadata_database_url: Option<String>,
+    pub max_logical_bytes: i64,
     pub jwt_secret: String,
     pub signing_secret: Option<String>,
     pub max_body_size: usize,
@@ -71,6 +75,12 @@ impl fmt::Debug for NosConfig {
             .field("bind_addr", &self.bind_addr)
             .field("data_dir", &self.data_dir)
             .field("meta_path", &self.meta_path)
+            .field("metadata_backend", &self.metadata_backend)
+            .field(
+                "metadata_database_url",
+                &self.metadata_database_url.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("max_logical_bytes", &self.max_logical_bytes)
             .field("jwt_secret", &"[REDACTED]")
             .field("signing_secret", &"[REDACTED]")
             .field("max_body_size", &self.max_body_size)
@@ -115,6 +125,18 @@ impl NosConfig {
             bind_addr: env::var("NOS_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:9000".into()),
             data_dir: env::var("NOS_DATA_DIR").unwrap_or_else(|_| "./data/blobs".into()),
             meta_path: env::var("NOS_META_PATH").unwrap_or_else(|_| "./data/meta/metadata.db".into()),
+            metadata_backend: {
+                let raw = env::var("NOS_METADATA_BACKEND").unwrap_or_else(|_| "sqlite".into());
+                MetadataBackendKind::parse_env(&raw).map_err(anyhow::Error::msg)?
+            },
+            metadata_database_url: env::var("NOS_METADATA_DATABASE_URL")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            max_logical_bytes: env::var("NOS_MAX_LOGICAL_BYTES")
+                .ok()
+                .map(|s| s.parse().context("NOS_MAX_LOGICAL_BYTES must be a valid i64"))
+                .transpose()?
+                .unwrap_or(0),
             jwt_secret: env::var("NOS_JWT_SECRET").context("NOS_JWT_SECRET must be set")?,
             signing_secret: env::var("NOS_SIGNING_SECRET").ok(),
             max_body_size: env::var("NOS_MAX_BODY_SIZE")
@@ -228,5 +250,27 @@ impl NosConfig {
                 .ok()
                 .filter(|s| !s.is_empty()),
         })
+        .and_then(|cfg| cfg.validate_metadata().map(|_| cfg))
+    }
+
+    fn validate_metadata(&self) -> Result<()> {
+        if self.metadata_backend == MetadataBackendKind::Postgres
+            && self
+                .metadata_database_url
+                .as_ref()
+                .is_none_or(|s| s.is_empty())
+        {
+            anyhow::bail!(
+                "NOS_METADATA_DATABASE_URL is required when NOS_METADATA_BACKEND=postgres"
+            );
+        }
+        if self.metadata_backend == MetadataBackendKind::Postgres
+            && self.cluster.mode != crate::cluster::config::ClusterMode::Standalone
+        {
+            anyhow::bail!(
+                "postgres metadata backend requires NOS_CLUSTER_MODE=standalone (cluster replication uses SQLite replication_log)"
+            );
+        }
+        Ok(())
     }
 }

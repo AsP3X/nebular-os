@@ -10,8 +10,6 @@ use crate::storage::error::{internal, StorageError};
 use super::config::{ClusterConfig, ClusterMode};
 use super::peer::PeerRegistry;
 
-const ROW_ID: i64 = 1;
-
 /// Human: JSON blob stored in SQLite — mirrors cluster env without bootstrap secrets.
 /// Agent: Serialized on PUT; merged into ClusterConfig via `into_cluster_config`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,13 +182,7 @@ impl ClusterConfigSnapshot {
 
 impl StorageEngine {
     pub async fn load_cluster_config_snapshot(&self) -> Result<Option<ClusterConfigSnapshot>, StorageError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT json FROM cluster_runtime_config WHERE id = ?")
-                .bind(ROW_ID)
-                .fetch_optional(self.read_pool())
-                .await
-                .map_err(internal)?;
-        let Some((json,)) = row else {
+        let Some(json) = self.object_meta().load_cluster_config_json().await? else {
             return Ok(None);
         };
         let snap: ClusterConfigSnapshot =
@@ -205,15 +197,6 @@ impl StorageEngine {
         let json = serde_json::to_string(snap)
             .context("serialize cluster config")
             .map_err(internal)?;
-        sqlx::query(
-            "INSERT INTO cluster_runtime_config (id, json) VALUES (?, ?)
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json",
-        )
-        .bind(ROW_ID)
-        .bind(json)
-        .execute(self.write_pool())
-        .await
-        .map_err(internal)?;
-        Ok(())
+        self.object_meta().save_cluster_config_json(&json).await
     }
 }

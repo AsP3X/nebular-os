@@ -15,6 +15,7 @@ use crate::storage::engine::ReadinessChecks;
 pub struct HealthResponse {
     pub status: &'static str,
     pub version: &'static str,
+    pub metadata_backend: String,
     pub cluster_mode: &'static str,
     pub node_id: String,
     pub instance_id: String,
@@ -36,6 +37,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> 
     Json(HealthResponse {
         status: "ok",
         version: env!("CARGO_PKG_VERSION"),
+        metadata_backend: state.engine.metadata_backend().as_str().to_string(),
         cluster_mode: cluster.mode.as_str(),
         node_id: cluster.node_id.clone(),
         instance_id: cluster.instance_id.clone(),
@@ -67,6 +69,10 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
     }
 
     tracing::warn!(
+        metadata_backend = %checks.metadata_backend,
+        metadata_write = checks.metadata_write,
+        metadata_read = checks.metadata_read,
+        postgres_ok = ?checks.postgres_ok,
         sqlite_write = checks.sqlite_write,
         sqlite_read = checks.sqlite_read,
         data_dir_writable = checks.data_dir_writable,

@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use sqlx::sqlite::SqlitePoolOptions;
-use sqlx::{Pool, Sqlite, SqlitePool};
+use sqlx::{Pool, Sqlite};
 use tokio::fs;
 
 use super::blob_ops::link_or_copy_blob;
 use super::compression::{self, DEFAULT_ZSTD_LEVEL};
 use super::error::{internal, StorageError};
+use super::metadata_backend::MetadataBackendKind;
+use super::object_meta::{ObjectMetaConnect, ObjectMetaStore};
 use super::range::parse_content_range;
 use super::streaming::{
     finalize_temp_to_blob, open_object_body_stream, stream_body_to_temp, GuardedObjectBodyStream,
@@ -19,9 +20,6 @@ use super::{blob_path, sanitize_bucket, sanitize_key};
 pub(crate) const DEFAULT_UPLOAD_BUFFER: usize = 256 * 1024;
 const DEFAULT_LIST_SCAN_CAP: i64 = 4096;
 
-const META_SELECT: &str = "bucket, key, size, mime_type, etag, created_at, updated_at, custom_meta, deleted_at, storage_class, origin_node";
-const ACTIVE_WHERE: &str = "deleted_at IS NULL";
-
 fn escape_like_pattern(s: &str) -> String {
     s.replace("\\", "\\\\")
         .replace("%", "\\%")
@@ -32,6 +30,11 @@ fn escape_like_pattern(s: &str) -> String {
 /// Per-check results for `GET /health/ready`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReadinessChecks {
+    pub metadata_backend: String,
+    pub metadata_write: bool,
+    pub metadata_read: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postgres_ok: Option<bool>,
     pub sqlite_write: bool,
     pub sqlite_read: bool,
     pub data_dir_writable: bool,
@@ -39,7 +42,12 @@ pub struct ReadinessChecks {
 
 impl ReadinessChecks {
     pub fn ready(&self) -> bool {
-        self.sqlite_write && self.sqlite_read && self.data_dir_writable
+        self.metadata_write
+            && self.metadata_read
+            && self.data_dir_writable
+            && self.sqlite_write
+            && self.sqlite_read
+            && self.postgres_ok.unwrap_or(true)
     }
 }
 
@@ -63,6 +71,9 @@ pub struct EngineOptions {
     pub recompress_batch_size: usize,
     pub read_pool_size: u32,
     pub zstd_level: i32,
+    pub metadata_backend: MetadataBackendKind,
+    pub metadata_database_url: Option<String>,
+    pub max_logical_bytes: i64,
 }
 
 impl Default for EngineOptions {
@@ -77,14 +88,20 @@ impl Default for EngineOptions {
             recompress_batch_size: 100,
             read_pool_size: 4,
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            metadata_backend: MetadataBackendKind::Sqlite,
+            metadata_database_url: None,
+            max_logical_bytes: 0,
         }
     }
 }
 
 #[derive(Clone)]
 pub struct StorageEngine {
-    write_pool: Pool<Sqlite>,
-    read_pool: Pool<Sqlite>,
+    object_meta: ObjectMetaStore,
+    system_write: Pool<Sqlite>,
+    system_read: Pool<Sqlite>,
+    metadata_backend: MetadataBackendKind,
+    max_logical_bytes: i64,
     data_dir: String,
     upload_buffer_size: usize,
     list_scan_cap: i64,
@@ -134,18 +151,30 @@ impl StorageEngine {
         data_dir: &str,
         opts: EngineOptions,
     ) -> Result<Self, StorageError> {
-        let conn_str = Self::resolve_conn_str(meta_path).await?;
-        let write_pool = SqlitePool::connect(&conn_str).await.map_err(internal)?;
-        // Human: Size the read pool from NOS_READ_POOL_SIZE so list/GET metadata queries do not share one connection.
-        // Agent: READS opts.read_pool_size; SqlitePoolOptions::max_connections; separate pool from write_pool.
-        let read_pool_size = opts.read_pool_size.max(1);
-        let read_pool = SqlitePoolOptions::new()
-            .max_connections(read_pool_size)
-            .connect(&conn_str)
-            .await
-            .map_err(internal)?;
+        let object_meta = ObjectMetaStore::connect(ObjectMetaConnect {
+            backend: opts.metadata_backend,
+            sqlite_path: meta_path.to_string(),
+            postgres_url: opts.metadata_database_url.clone(),
+            read_pool_size: opts.read_pool_size,
+        })
+        .await?;
 
-        Self::init_schema(&write_pool).await?;
+        let (system_write, system_read) = match opts.metadata_backend {
+            MetadataBackendKind::Sqlite => {
+                let w = object_meta
+                    .sqlite_write_pool()
+                    .expect("sqlite object meta pool")
+                    .clone();
+                let r = object_meta
+                    .sqlite_read_pool()
+                    .expect("sqlite object meta pool")
+                    .clone();
+                (w, r)
+            }
+            MetadataBackendKind::Postgres => {
+                super::object_meta::connect_system_sqlite(meta_path, opts.read_pool_size).await?
+            }
+        };
 
         fs::create_dir_all(data_dir).await.map_err(internal)?;
         fs::create_dir_all(format!("{}/.tmp", data_dir))
@@ -156,8 +185,11 @@ impl StorageEngine {
             .map_err(internal)?;
 
         Ok(Self {
-            write_pool,
-            read_pool,
+            object_meta,
+            system_write,
+            system_read,
+            metadata_backend: opts.metadata_backend,
+            max_logical_bytes: opts.max_logical_bytes.max(0),
             data_dir: data_dir.to_string(),
             upload_buffer_size: opts.upload_buffer_size.max(4096),
             list_scan_cap: opts.list_scan_cap.max(100),
@@ -170,163 +202,61 @@ impl StorageEngine {
         })
     }
 
-    async fn resolve_conn_str(meta_path: &str) -> Result<String, StorageError> {
-        if meta_path.starts_with("file:") {
-            return Ok(meta_path.to_string());
-        }
-        let meta_path = meta_path.strip_prefix("./").unwrap_or(meta_path);
-        let meta_path_buf = PathBuf::from(meta_path);
-        let meta_path_buf = if meta_path_buf.is_absolute() {
-            meta_path_buf
-        } else {
-            std::env::current_dir()
-                .map_err(internal)?
-                .join(meta_path_buf)
-        };
-        if let Some(parent) = meta_path_buf.parent() {
-            fs::create_dir_all(parent).await.map_err(internal)?;
-        }
-        if !meta_path_buf.exists() {
-            fs::File::create(&meta_path_buf)
-                .await
-                .map_err(internal)?;
-        }
-        Ok(meta_path_buf.to_string_lossy().to_string())
-    }
-
-    async fn init_schema(pool: &Pool<Sqlite>) -> Result<(), StorageError> {
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS objects (
-                bucket      TEXT NOT NULL,
-                key         TEXT NOT NULL,
-                size        INTEGER NOT NULL,
-                mime_type   TEXT,
-                etag        TEXT,
-                created_at  INTEGER NOT NULL,
-                updated_at  INTEGER NOT NULL,
-                custom_meta TEXT,
-                deleted_at  INTEGER,
-                PRIMARY KEY (bucket, key)
-            )",
-        )
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_prefix ON objects(bucket, key)")
-            .execute(pool)
-            .await
-            .map_err(internal)?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS multipart_uploads (
-                upload_id    TEXT PRIMARY KEY,
-                bucket       TEXT NOT NULL,
-                key          TEXT NOT NULL,
-                content_type TEXT,
-                created_at   INTEGER NOT NULL
-            )",
-        )
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS multipart_parts (
-                upload_id    TEXT NOT NULL,
-                part_number  INTEGER NOT NULL,
-                size         INTEGER NOT NULL,
-                etag         TEXT NOT NULL,
-                PRIMARY KEY (upload_id, part_number)
-            )",
-        )
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
-        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN deleted_at INTEGER")
-            .execute(pool)
-            .await;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS replication_log (
-                event_id     TEXT PRIMARY KEY,
-                origin_node  TEXT NOT NULL,
-                op           TEXT NOT NULL,
-                bucket       TEXT NOT NULL,
-                key          TEXT NOT NULL,
-                etag         TEXT,
-                size         INTEGER,
-                payload_path TEXT,
-                created_at   INTEGER NOT NULL,
-                applied_at   INTEGER,
-                status       TEXT NOT NULL DEFAULT 'pending'
-            )",
-        )
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_repl_status ON replication_log(status, created_at)",
-        )
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
-        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN storage_class TEXT DEFAULT 'default'")
-            .execute(pool)
-            .await;
-        let _ = sqlx::query("ALTER TABLE objects ADD COLUMN origin_node TEXT")
-            .execute(pool)
-            .await;
-        let _ = sqlx::query(
-            "ALTER TABLE replication_log ADD COLUMN storage_class TEXT DEFAULT 'default'",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE replication_log ADD COLUMN replication_group TEXT DEFAULT 'default'",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query(
-            "ALTER TABLE replication_log ADD COLUMN attempts INTEGER DEFAULT 0",
-        )
-        .execute(pool)
-        .await;
-        let _ = sqlx::query("ALTER TABLE replication_log ADD COLUMN next_retry_at INTEGER")
-            .execute(pool)
-            .await;
-
-        sqlx::query("PRAGMA foreign_keys = ON")
-            .execute(pool)
-            .await
-            .map_err(internal)?;
-        sqlx::query("PRAGMA journal_mode = WAL")
-            .execute(pool)
-            .await
-            .map_err(internal)?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS cluster_runtime_config (
-                id   INTEGER PRIMARY KEY,
-                json TEXT NOT NULL
-            )",
-        )
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
-        Ok(())
-    }
-
     pub fn write_pool(&self) -> &Pool<Sqlite> {
-        &self.write_pool
+        &self.system_write
     }
 
     pub fn read_pool(&self) -> &Pool<Sqlite> {
-        &self.read_pool
+        &self.system_read
+    }
+
+    pub fn metadata_backend(&self) -> MetadataBackendKind {
+        self.metadata_backend
+    }
+
+    pub fn max_logical_bytes(&self) -> i64 {
+        self.max_logical_bytes
+    }
+
+    pub fn object_meta(&self) -> &ObjectMetaStore {
+        &self.object_meta
+    }
+
+    /// Rejects writes when active logical bytes plus incoming would exceed NOS_MAX_LOGICAL_BYTES.
+    pub async fn ensure_capacity_for_write(
+        &self,
+        bucket: &str,
+        key: &str,
+        incoming_bytes: u64,
+    ) -> Result<(), StorageError> {
+        if self.max_logical_bytes <= 0 {
+            return Ok(());
+        }
+        let current = self.total_bytes().await?;
+        let existing = self
+            .try_fetch_active_metadata(bucket, key)
+            .await?
+            .map(|m| m.size)
+            .unwrap_or(0);
+        let projected = current - existing + incoming_bytes as i64;
+        if projected > self.max_logical_bytes {
+            return Err(StorageError::InsufficientStorage);
+        }
+        Ok(())
+    }
+
+    pub async fn ensure_capacity_for_multipart_complete(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), StorageError> {
+        if self.max_logical_bytes <= 0 {
+            return Ok(());
+        }
+        let total_parts = self.object_meta.sum_multipart_parts_size(upload_id).await?;
+        self.ensure_capacity_for_write(bucket, key, total_parts as u64)
+            .await
     }
 
     pub fn data_dir(&self) -> &str {
@@ -370,15 +300,9 @@ impl StorageEngine {
     ) -> Result<Option<ObjectMetadata>, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
-        let q = format!(
-            "SELECT {META_SELECT} FROM objects WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
-        );
-        sqlx::query_as(&q)
-            .bind(&bucket)
-            .bind(&safe_key)
-            .fetch_optional(&self.read_pool)
+        self.object_meta
+            .try_fetch_active_metadata(&bucket, &safe_key)
             .await
-            .map_err(internal)
     }
 
     /// Human: Validates If-Match / If-None-Match against the current object before a write or delete.
@@ -436,46 +360,13 @@ impl StorageEngine {
 
         // Human: Hard-link the on-disk blob when possible so copies share storage on the same volume.
         // Agent: CALLS link_or_copy_blob(src,dst); fallback fs::copy on EXDEV; metadata row for dst only.
+        self.ensure_capacity_for_write(&dst_bucket, &dst_key, src_meta.size as u64)
+            .await?;
         link_or_copy_blob(&src_path, &dst_path).await?;
 
-        let now = chrono::Utc::now();
-        let unix_now = now.timestamp();
-        sqlx::query(
-            "INSERT INTO objects (bucket, key, size, mime_type, etag, created_at, updated_at, custom_meta, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-             ON CONFLICT(bucket, key) DO UPDATE SET
-                 size = excluded.size,
-                 mime_type = excluded.mime_type,
-                 etag = excluded.etag,
-                 updated_at = excluded.updated_at,
-                 custom_meta = excluded.custom_meta,
-                 deleted_at = NULL",
-        )
-        .bind(&dst_bucket)
-        .bind(&dst_key)
-        .bind(src_meta.size)
-        .bind(&src_meta.mime_type)
-        .bind(&src_meta.etag)
-        .bind(unix_now)
-        .bind(unix_now)
-        .bind(&src_meta.custom_meta)
-        .execute(&self.write_pool)
-        .await
-        .map_err(internal)?;
-
-        Ok(ObjectMetadata {
-            bucket: dst_bucket,
-            key: dst_key,
-            size: src_meta.size,
-            mime_type: src_meta.mime_type,
-            etag: src_meta.etag,
-            created_at: now,
-            updated_at: now,
-            custom_meta: src_meta.custom_meta,
-            deleted_at: None,
-            storage_class: src_meta.storage_class,
-            origin_node: src_meta.origin_node,
-        })
+        self.object_meta
+            .copy_object_metadata(&src_meta, &dst_bucket, &dst_key)
+            .await
     }
 
     async fn write_object_stream(
@@ -506,46 +397,34 @@ impl StorageEngine {
         )
         .await?;
 
-        let now = chrono::Utc::now();
-        let unix_now = now.timestamp();
-        if let Err(e) = sqlx::query(
-            "INSERT INTO objects (bucket, key, size, mime_type, etag, created_at, updated_at, custom_meta, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-             ON CONFLICT(bucket, key) DO UPDATE SET
-                 size = excluded.size,
-                 mime_type = excluded.mime_type,
-                 etag = excluded.etag,
-                 updated_at = excluded.updated_at,
-                 custom_meta = excluded.custom_meta,
-                 deleted_at = NULL",
-        )
-        .bind(bucket)
-        .bind(safe_key)
-        .bind(size as i64)
-        .bind(content_type)
-        .bind(&etag)
-        .bind(unix_now)
-        .bind(unix_now)
-        .bind(custom_meta)
-        .execute(&self.write_pool)
-        .await
+        if let Err(e) = self
+            .ensure_capacity_for_write(bucket, safe_key, size)
+            .await
         {
             let _ = fs::remove_file(&final_path).await;
-            return Err(StorageError::Internal(e.into()));
+            return Err(e);
         }
 
-        let meta = ObjectMetadata {
-            bucket: bucket.to_string(),
-            key: safe_key.to_string(),
-            size: size as i64,
-            mime_type: content_type.map(|s| s.to_string()),
-            etag: Some(etag.clone()),
-            created_at: now,
-            updated_at: now,
-            custom_meta: custom_meta.map(|s| s.to_string()),
-            deleted_at: None,
-            storage_class: None,
-            origin_node: None,
+        let meta = match self
+            .object_meta
+            .upsert_object(
+                &self.data_dir,
+                bucket,
+                safe_key,
+                size as i64,
+                content_type,
+                &etag,
+                custom_meta,
+                None,
+                None,
+            )
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = fs::remove_file(&final_path).await;
+                return Err(e);
+            }
         };
         Ok((meta, etag))
     }
@@ -649,31 +528,15 @@ impl StorageEngine {
                 .await?;
         }
 
-        let exists: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM objects WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
-        ))
-        .bind(&bucket)
-        .bind(&safe_key)
-        .fetch_one(&self.write_pool)
-        .await
-        .map_err(internal)?;
-
-        if exists == 0 {
+        if self.object_meta.active_row_count(&bucket, &safe_key).await? == 0 {
             return Ok(());
         }
 
         let path = blob_path(&self.data_dir, &bucket, &safe_key);
 
-        // Human: TTL 0 hard-deletes metadata and blob; otherwise soft-delete with optional immediate blob drop.
-        // Agent: IF soft_delete_ttl_secs==0 THEN DELETE row + remove_file; ELIF drop_blob THEN UPDATE deleted_at + remove_file; ELSE UPDATE deleted_at only.
         if self.soft_delete_ttl_secs <= 0 {
             let _ = fs::remove_file(&path).await;
-            sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
-                .bind(&bucket)
-                .bind(&safe_key)
-                .execute(&self.write_pool)
-                .await
-                .map_err(internal)?;
+            self.object_meta.hard_delete_object(&bucket, &safe_key).await?;
             return Ok(());
         }
 
@@ -681,33 +544,33 @@ impl StorageEngine {
             let _ = fs::remove_file(&path).await;
         }
 
-        let now = chrono::Utc::now().timestamp();
-        sqlx::query(&format!(
-            "UPDATE objects SET deleted_at = ? WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
-        ))
-        .bind(now)
-        .bind(&bucket)
-        .bind(&safe_key)
-        .execute(&self.write_pool)
-        .await
-        .map_err(internal)?;
-
+        self.object_meta.soft_delete_object(&bucket, &safe_key).await?;
         Ok(())
     }
 
     /// Human: Probes SQLite pools and blob directory writability for orchestrator readiness checks.
     /// Agent: SELECT 1 on write+read pools; WRITE+DELETE probe file under NOS_DATA_DIR/.nos-ready-probe.
     pub async fn probe_readiness(&self) -> ReadinessChecks {
+        let (metadata_write, metadata_read) = self.object_meta.probe().await;
         let sqlite_write = sqlx::query("SELECT 1")
-            .fetch_one(&self.write_pool)
+            .fetch_one(&self.system_write)
             .await
             .is_ok();
         let sqlite_read = sqlx::query("SELECT 1")
-            .fetch_one(&self.read_pool)
+            .fetch_one(&self.system_read)
             .await
             .is_ok();
         let data_dir_writable = Self::probe_data_dir_writable(&self.data_dir).await;
+        let postgres_ok = if self.metadata_backend == MetadataBackendKind::Postgres {
+            Some(metadata_write && metadata_read)
+        } else {
+            None
+        };
         ReadinessChecks {
+            metadata_backend: self.metadata_backend.as_str().to_string(),
+            metadata_write,
+            metadata_read,
+            postgres_ok,
             sqlite_write,
             sqlite_read,
             data_dir_writable,
@@ -730,16 +593,7 @@ impl StorageEngine {
         bucket: &str,
         key: &str,
     ) -> Result<ObjectMetadata, StorageError> {
-        let q = format!(
-            "SELECT {META_SELECT} FROM objects WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
-        );
-        sqlx::query_as(&q)
-            .bind(bucket)
-            .bind(key)
-            .fetch_optional(&self.read_pool)
-            .await
-            .map_err(internal)?
-            .ok_or(StorageError::NotFound)
+        self.object_meta.fetch_active_metadata(bucket, key).await
     }
 
     fn resolve_range(
@@ -785,19 +639,10 @@ impl StorageEngine {
             (limit as i64).saturating_add(1)
         };
 
-        let q = format!(
-            "SELECT {META_SELECT} FROM objects
-             WHERE bucket = ? AND key > ? AND key LIKE ? ESCAPE '\\' AND {ACTIVE_WHERE}
-             ORDER BY key LIMIT ?"
-        );
-        let rows: Vec<ObjectMetadata> = sqlx::query_as(&q)
-            .bind(&bucket)
-            .bind(start_after)
-            .bind(prefix_pattern.clone())
-            .bind(scan_limit)
-            .fetch_all(&self.read_pool)
-            .await
-            .map_err(internal)?;
+        let rows = self
+            .object_meta
+            .list_active_rows(&bucket, start_after, &prefix_pattern, scan_limit)
+            .await?;
 
         if delimiter.is_none() {
             let is_truncated = rows.len() > limit;
@@ -872,17 +717,10 @@ impl StorageEngine {
             if scanned_len as i64 >= self.list_scan_cap {
                 is_truncated = true;
             } else if let Some(ref last) = last_scanned {
-                let count_q = format!(
-                    "SELECT COUNT(*) FROM objects
-                     WHERE bucket = ? AND key > ? AND key LIKE ? ESCAPE '\\' AND {ACTIVE_WHERE}"
-                );
-                let count: i64 = sqlx::query_scalar(&count_q)
-                    .bind(&bucket)
-                    .bind(last)
-                    .bind(prefix_pattern)
-                    .fetch_one(&self.read_pool)
-                    .await
-                    .map_err(internal)?;
+                let count = self
+                    .object_meta
+                    .count_keys_after(&bucket, last, &prefix_pattern)
+                    .await?;
                 is_truncated = count > 0;
             }
         }
@@ -900,38 +738,17 @@ impl StorageEngine {
     pub async fn object_exists(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
-        let q = format!(
-            "SELECT COUNT(*) FROM objects WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE}"
-        );
-        let count: i64 = sqlx::query_scalar(&q)
-            .bind(&bucket)
-            .bind(&safe_key)
-            .fetch_one(&self.read_pool)
-            .await
-            .map_err(internal)?;
-        Ok(count > 0)
+        self.object_meta.object_exists(&bucket, &safe_key).await
     }
 
     pub async fn object_count(&self) -> Result<i64, StorageError> {
-        let q = format!("SELECT COUNT(*) FROM objects WHERE {ACTIVE_WHERE}");
-        let count: i64 = sqlx::query_scalar(&q)
-            .fetch_one(&self.read_pool)
-            .await
-            .map_err(internal)?;
-        Ok(count)
+        self.object_meta.object_count().await
     }
 
     pub async fn total_bytes(&self) -> Result<i64, StorageError> {
-        let q = format!("SELECT COALESCE(SUM(size), 0) FROM objects WHERE {ACTIVE_WHERE}");
-        let total: i64 = sqlx::query_scalar(&q)
-            .fetch_one(&self.read_pool)
-            .await
-            .map_err(internal)?;
-        Ok(total)
+        self.object_meta.total_bytes().await
     }
 
-    /// Human: Records which storage class and node own an object after assignment accepts a write.
-    /// Agent: UPDATE objects SET storage_class, origin_node for active row matching bucket/key.
     pub async fn set_object_placement(
         &self,
         bucket: &str,
@@ -941,21 +758,11 @@ impl StorageEngine {
     ) -> Result<(), StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
-        sqlx::query(
-            "UPDATE objects SET storage_class = ?, origin_node = ? WHERE bucket = ? AND key = ? AND deleted_at IS NULL",
-        )
-        .bind(storage_class)
-        .bind(origin_node)
-        .bind(&bucket)
-        .bind(&safe_key)
-        .execute(&self.write_pool)
-        .await
-        .map_err(internal)?;
-        Ok(())
+        self.object_meta
+            .set_object_placement(&bucket, &safe_key, storage_class, origin_node)
+            .await
     }
 
-    /// Human: Lookup storage class before delete replication enqueue.
-    /// Agent: SELECT storage_class FROM objects WHERE active row; None if missing.
     pub async fn active_storage_class(
         &self,
         bucket: &str,
@@ -963,28 +770,14 @@ impl StorageEngine {
     ) -> Result<Option<String>, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT COALESCE(storage_class, 'default') FROM objects WHERE bucket = ? AND key = ? AND deleted_at IS NULL",
-        )
-        .bind(&bucket)
-        .bind(&safe_key)
-        .fetch_optional(&self.read_pool)
-        .await
-        .map_err(internal)?;
-        Ok(row.map(|(c,)| c))
+        self.object_meta
+            .active_storage_class(&bucket, &safe_key)
+            .await
     }
 
-    /// Human: Per-class object counts for Prometheus metrics.
-    /// Agent: GROUP BY storage_class on active objects.
     pub async fn objects_by_storage_class(
         &self,
     ) -> Result<Vec<(String, i64)>, StorageError> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT COALESCE(storage_class, 'default'), COUNT(*) FROM objects WHERE deleted_at IS NULL GROUP BY storage_class",
-        )
-        .fetch_all(&self.read_pool)
-        .await
-        .map_err(internal)?;
-        Ok(rows)
+        self.object_meta.objects_by_storage_class().await
     }
 }

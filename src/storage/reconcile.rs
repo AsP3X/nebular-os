@@ -20,24 +20,16 @@ impl StorageEngine {
     pub async fn reconcile(&self) -> Result<ReconcileReport, StorageError> {
         let mut report = ReconcileReport::default();
 
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT bucket, key FROM objects WHERE deleted_at IS NULL",
-        )
-        .fetch_all(self.write_pool())
-        .await
-        .map_err(internal)?;
+        let rows = self.object_meta().list_active_bucket_keys().await?;
 
         let mut db_keys: HashSet<(String, String)> = HashSet::new();
         for (bucket, key) in &rows {
             db_keys.insert((bucket.clone(), key.clone()));
             let path = blob_path(self.data_dir(), bucket, key);
             if !path.exists() {
-                sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
-                    .bind(bucket)
-                    .bind(key)
-                    .execute(self.write_pool())
-                    .await
-                    .map_err(internal)?;
+                self.object_meta()
+                    .delete_object_row(bucket, key)
+                    .await?;
                 report.stale_rows_removed += 1;
             }
         }

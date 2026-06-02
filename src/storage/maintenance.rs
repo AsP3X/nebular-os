@@ -20,13 +20,10 @@ impl StorageEngine {
             return Ok(0);
         }
         let cutoff = chrono::Utc::now().timestamp() - self.soft_delete_ttl_secs();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT bucket, key FROM objects WHERE deleted_at IS NOT NULL AND deleted_at < ?",
-        )
-        .bind(cutoff)
-        .fetch_all(self.read_pool())
-        .await
-        .map_err(internal)?;
+        let rows = self
+            .object_meta()
+            .list_soft_deleted_before(cutoff)
+            .await?;
 
         let mut purged = 0u64;
         for (bucket, key) in rows {
@@ -34,12 +31,9 @@ impl StorageEngine {
                 let path = blob_path(self.data_dir(), &bucket, &key);
                 let _ = fs::remove_file(&path).await;
             }
-            sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
-                .bind(&bucket)
-                .bind(&key)
-                .execute(self.write_pool())
-                .await
-                .map_err(internal)?;
+            self.object_meta()
+                .delete_object_row(&bucket, &key)
+                .await?;
             purged += 1;
         }
         Ok(purged)
@@ -51,13 +45,10 @@ impl StorageEngine {
         limit: usize,
     ) -> Result<RecompressReport, StorageError> {
         let limit = limit.max(1) as i64;
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT bucket, key, size FROM objects WHERE deleted_at IS NULL ORDER BY updated_at LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(self.read_pool())
-        .await
-        .map_err(internal)?;
+        let rows = self
+            .object_meta()
+            .list_recompress_candidates(limit)
+            .await?;
 
         let mut report = RecompressReport::default();
         for (bucket, key, size) in rows {

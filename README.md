@@ -4,7 +4,7 @@
 > **private, non-profit** use. Commercial and for-profit use requires a
 > [commercial license](COMMERCIAL-LICENSE.md).
 
-Standalone, self-hosted object storage with an S3-like HTTP API. Blobs live on disk; metadata is tracked in SQLite. JWT auth uses the same `Claims` shape as typical Aurora-style backends (`sub`, `email`, `role`, `exp`, `iat`).
+Standalone, self-hosted object storage with an S3-like HTTP API. Blobs live on disk; object metadata is stored in **SQLite** (default) or **Postgres** (blob-only nodes for [Ownly](https://github.com/AsP3X/nebular-os) when `storage_metadata_mode=ownly`). JWT auth uses the same `Claims` shape as typical Aurora-style backends (`sub`, `email`, `role`, `exp`, `iat`).
 
 Originally developed as `nebula-os` inside the [Aurora](https://github.com/) monorepo; this repository is the extracted, independently versioned crate.
 
@@ -29,7 +29,10 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_SIGNING_SECRET` | HMAC secret for presigned URLs (required, min 32 chars) |
 | `NOS_BIND_ADDR` | Listen address (default `0.0.0.0:9000`) |
 | `NOS_DATA_DIR` | Blob directory (default `./data/blobs`) |
-| `NOS_META_PATH` | SQLite metadata path (default `./data/meta/metadata.db`) |
+| `NOS_META_PATH` | SQLite path for object index (default) and system tables (replication log in cluster modes) |
+| `NOS_METADATA_BACKEND` | `sqlite` (default) or `postgres` |
+| `NOS_METADATA_DATABASE_URL` | Postgres URL when `NOS_METADATA_BACKEND=postgres` |
+| `NOS_MAX_LOGICAL_BYTES` | Optional per-node logical byte cap (`0` = unlimited); returns HTTP 507 when exceeded |
 | `NOS_MAX_BODY_SIZE` | Max upload bytes (default `104857600`) |
 | `NOS_UPLOAD_BUFFER_SIZE` | Read buffer for streaming uploads (default `262144`) |
 | `NOS_ALLOW_PUBLIC_READ` | Allow unauthenticated GET/HEAD on `/{bucket}/{key}` when `true` (default `false`) |
@@ -104,7 +107,7 @@ See [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
 | `POST` | `/:bucket/_multipart/{upload_id}/complete` | Bearer JWT | Complete multipart upload |
 | `DELETE` | `/:bucket/_multipart/{upload_id}` | Bearer JWT | Abort multipart upload |
 | `GET` | `/health` | None | Liveness check (process up) |
-| `GET` | `/health/ready` | None | Readiness check (SQLite + `NOS_DATA_DIR` writable) |
+| `GET` | `/health/ready` | None | Readiness check (metadata backend + `NOS_DATA_DIR` writable; `postgres_ok` when using Postgres) |
 | `GET` | `/_nos/capabilities` | Bearer JWT | Node limits and cluster mode (when enabled) |
 | `GET` | `/metrics` | Optional Bearer (`NOS_METRICS_TOKEN`) | JSON or Prometheus (`Accept: text/plain`) |
 
@@ -170,7 +173,8 @@ docker run --rm -p 9000:9000 \
 ## Scale notes
 
 - SQLite uses separate read/write connection pools (`NOS_READ_POOL_SIZE`) for concurrent listing and downloads.
-- Postgres migration is not included in this release; plan a metadata store migration when single-node SQLite becomes a bottleneck.
+- Set `NOS_METADATA_BACKEND=postgres` and `NOS_METADATA_DATABASE_URL` for blob-only nodes (object index in `nos_*` tables; replication log stays in sidecar SQLite at `NOS_META_PATH`).
+- `GET /metrics` exposes `logical_bytes`, `max_logical_bytes`, and `metadata_backend` for Ownly placement and admin UIs.
 
 ## License
 

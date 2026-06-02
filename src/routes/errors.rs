@@ -29,6 +29,7 @@ pub fn map_storage_error(err: StorageError) -> (StatusCode, Json<serde_json::Val
                 StorageError::NotFound => StatusCode::NOT_FOUND,
                 StorageError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
                 StorageError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                StorageError::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
                 StorageError::InvalidBucket | StorageError::InvalidKey => StatusCode::BAD_REQUEST,
                 StorageError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
                 StorageError::ReadOnlyReplica => StatusCode::SERVICE_UNAVAILABLE,

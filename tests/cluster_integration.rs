@@ -52,6 +52,9 @@ fn cluster_test_config(
         bind_addr: "127.0.0.1:0".into(),
         data_dir: "./data/blobs".into(),
         meta_path: "./data/meta/metadata.db".into(),
+        metadata_backend: nebular_os::storage::metadata_backend::MetadataBackendKind::Sqlite,
+        metadata_database_url: None,
+        max_logical_bytes: 0,
         jwt_secret: TEST_SECRET.into(),
         signing_secret: None,
         max_body_size: 10_000_000,
@@ -137,8 +140,11 @@ async fn engine_and_backend(
         &meta_path_str,
         &data_dir_str,
         EngineOptions {
-            upload_buffer_size: 64 * 1024,
-            read_pool_size: 2,
+            upload_buffer_size: cfg.upload_buffer_size,
+            read_pool_size: cfg.read_pool_size,
+            max_logical_bytes: cfg.max_logical_bytes,
+            metadata_backend: cfg.metadata_backend,
+            metadata_database_url: cfg.metadata_database_url.clone(),
             ..EngineOptions::default()
         },
     )

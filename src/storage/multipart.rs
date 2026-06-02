@@ -4,6 +4,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xxhash_rust::xxh3::Xxh3;
 
+use super::object_meta::blob_rel_path;
 use super::streaming::{finalize_temp_to_blob, hash_temp_file};
 use super::engine::{StorageEngine, TempFileGuard};
 use super::error::{internal, map_io_error, StorageError};
@@ -31,7 +32,6 @@ impl StorageEngine {
             .join(upload_id)
     }
 
-    /// Starts a multipart session for the target object key.
     pub async fn init_multipart(
         &self,
         bucket: &str,
@@ -41,20 +41,16 @@ impl StorageEngine {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
         let upload_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().timestamp();
 
-        sqlx::query(
-            "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, created_at)
-             VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&upload_id)
-        .bind(&bucket)
-        .bind(&safe_key)
-        .bind(content_type)
-        .bind(now)
-        .execute(self.write_pool())
-        .await
-        .map_err(internal)?;
+        self.object_meta()
+            .init_multipart(
+                &upload_id,
+                &bucket,
+                &safe_key,
+                content_type,
+                self.multipart_upload_ttl_secs(),
+            )
+            .await?;
 
         fs::create_dir_all(self.multipart_dir(&upload_id))
             .await
@@ -66,7 +62,6 @@ impl StorageEngine {
         })
     }
 
-    /// Stores one numbered part for an active multipart upload.
     pub async fn upload_part(
         &self,
         bucket: &str,
@@ -105,26 +100,15 @@ impl StorageEngine {
         }
         file.flush().await.map_err(internal)?;
         let etag = format!("{:016x}", hasher.digest());
+        let part_blob = blob_rel_path(upload_id, &format!("{:05}", part_number));
 
-        sqlx::query(
-            "INSERT INTO multipart_parts (upload_id, part_number, size, etag)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(upload_id, part_number) DO UPDATE SET
-                size = excluded.size,
-                etag = excluded.etag",
-        )
-        .bind(upload_id)
-        .bind(part_number)
-        .bind(size as i64)
-        .bind(&etag)
-        .execute(self.write_pool())
-        .await
-        .map_err(internal)?;
+        self.object_meta()
+            .upsert_multipart_part(upload_id, part_number, size as i64, &etag, Some(&part_blob))
+            .await?;
 
         Ok(PartUploadResult { etag })
     }
 
-    /// Concatenates uploaded parts into the final object blob and metadata row.
     pub async fn complete_multipart(
         &self,
         bucket: &str,
@@ -136,13 +120,13 @@ impl StorageEngine {
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
         let session = self.ensure_multipart_session(upload_id, &bucket, &safe_key).await?;
 
-        let parts: Vec<(i32,)> = sqlx::query_as(
-            "SELECT part_number FROM multipart_parts WHERE upload_id = ? ORDER BY part_number",
-        )
-        .bind(upload_id)
-        .fetch_all(self.write_pool())
-        .await
-        .map_err(internal)?;
+        self.ensure_capacity_for_multipart_complete(&bucket, &safe_key, upload_id)
+            .await?;
+
+        let parts = self
+            .object_meta()
+            .list_multipart_part_numbers(upload_id)
+            .await?;
 
         if parts.is_empty() {
             return Err(StorageError::InvalidKey);
@@ -159,9 +143,7 @@ impl StorageEngine {
         };
         let mut out = fs::File::create(&tmp_path).await.map_err(internal)?;
 
-        // Human: Concatenate parts into a temp file on disk, then reuse the same compress-or-store path as PUT.
-        // Agent: WRITES parts into tmp_path; hash_temp_file; finalize_temp_to_blob; no full-RAM Vec.
-        for (part_number,) in parts {
+        for part_number in parts {
             let part_path = self
                 .multipart_dir(upload_id)
                 .join(format!("{:05}", part_number));
@@ -191,51 +173,32 @@ impl StorageEngine {
         )
         .await?;
 
-        let now = chrono::Utc::now();
-        let unix_now = now.timestamp();
-        if let Err(e) = sqlx::query(
-            "INSERT INTO objects (bucket, key, size, mime_type, etag, created_at, updated_at, custom_meta, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-             ON CONFLICT(bucket, key) DO UPDATE SET
-                 size = excluded.size,
-                 mime_type = excluded.mime_type,
-                 etag = excluded.etag,
-                 updated_at = excluded.updated_at,
-                 custom_meta = excluded.custom_meta,
-                 deleted_at = NULL",
-        )
-        .bind(&bucket)
-        .bind(&safe_key)
-        .bind(total_size as i64)
-        .bind(&session.content_type)
-        .bind(&etag)
-        .bind(unix_now)
-        .bind(unix_now)
-        .bind(custom_meta)
-        .execute(self.write_pool())
-        .await
+        let meta = match self
+            .object_meta()
+            .upsert_object(
+                self.data_dir(),
+                &bucket,
+                &safe_key,
+                total_size as i64,
+                session.content_type.as_deref(),
+                &etag,
+                custom_meta,
+                None,
+                None,
+            )
+            .await
         {
-            let _ = fs::remove_file(&final_path).await;
-            return Err(StorageError::Internal(e.into()));
-        }
+            Ok(m) => m,
+            Err(e) => {
+                let _ = fs::remove_file(&final_path).await;
+                return Err(e);
+            }
+        };
 
         self.cleanup_multipart(upload_id).await?;
-        Ok(super::types::ObjectMetadata {
-            bucket: bucket.to_string(),
-            key: safe_key,
-            size: total_size as i64,
-            mime_type: session.content_type,
-            etag: Some(etag),
-            created_at: now,
-            updated_at: now,
-            custom_meta: custom_meta.map(|s| s.to_string()),
-            deleted_at: None,
-            storage_class: None,
-            origin_node: None,
-        })
+        Ok(meta)
     }
 
-    /// Aborts a multipart session and deletes staged part files.
     pub async fn abort_multipart(
         &self,
         bucket: &str,
@@ -250,33 +213,19 @@ impl StorageEngine {
     }
 
     async fn cleanup_multipart(&self, upload_id: &str) -> Result<(), StorageError> {
-        sqlx::query("DELETE FROM multipart_parts WHERE upload_id = ?")
-            .bind(upload_id)
-            .execute(self.write_pool())
-            .await
-            .map_err(internal)?;
-        sqlx::query("DELETE FROM multipart_uploads WHERE upload_id = ?")
-            .bind(upload_id)
-            .execute(self.write_pool())
-            .await
-            .map_err(internal)?;
+        self.object_meta().cleanup_multipart(upload_id).await?;
         let _ = fs::remove_dir_all(self.multipart_dir(upload_id)).await;
         Ok(())
     }
 
-    /// Resolves the object key for an active multipart session.
     pub async fn multipart_key_for_upload(
         &self,
         upload_id: &str,
     ) -> Result<String, StorageError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT key FROM multipart_uploads WHERE upload_id = ?",
-        )
-        .bind(upload_id)
-        .fetch_optional(self.read_pool())
-        .await
-        .map_err(internal)?;
-        row.map(|(k,)| k).ok_or(StorageError::NotFound)
+        self.object_meta()
+            .multipart_object_key(upload_id)
+            .await?
+            .ok_or(StorageError::NotFound)
     }
 
     async fn ensure_multipart_session(
@@ -285,39 +234,28 @@ impl StorageEngine {
         bucket: &str,
         key: &str,
     ) -> Result<MultipartSession, StorageError> {
-        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
-            "SELECT bucket, key, content_type FROM multipart_uploads WHERE upload_id = ?",
-        )
-        .bind(upload_id)
-        .fetch_optional(self.read_pool())
-        .await
-        .map_err(internal)?;
-
-        let Some((b, k, content_type)) = row else {
-            return Err(StorageError::NotFound);
-        };
-        if b != *bucket || k != *key {
-            return Err(StorageError::NotFound);
+        match self
+            .object_meta()
+            .fetch_multipart_session(upload_id, bucket, key)
+            .await?
+        {
+            Some(content_type) => Ok(MultipartSession { content_type }),
+            None => Err(StorageError::NotFound),
         }
-        Ok(MultipartSession { content_type })
     }
 
-    /// Removes multipart sessions and staged part files older than the configured TTL.
     pub async fn purge_stale_multipart_uploads(&self) -> Result<u64, StorageError> {
         if self.multipart_upload_ttl_secs() <= 0 {
             return Ok(0);
         }
         let cutoff = chrono::Utc::now().timestamp() - self.multipart_upload_ttl_secs();
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT upload_id FROM multipart_uploads WHERE created_at < ?",
-        )
-        .bind(cutoff)
-        .fetch_all(self.read_pool())
-        .await
-        .map_err(internal)?;
+        let upload_ids = self
+            .object_meta()
+            .list_stale_multipart_upload_ids(cutoff)
+            .await?;
 
         let mut purged = 0u64;
-        for (upload_id,) in rows {
+        for upload_id in upload_ids {
             self.cleanup_multipart(&upload_id).await?;
             purged += 1;
         }

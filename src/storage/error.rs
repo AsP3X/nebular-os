@@ -39,6 +39,8 @@ pub enum StorageError {
     RangeNotSatisfiable,
     #[error("payload too large")]
     PayloadTooLarge,
+    #[error("insufficient storage")]
+    InsufficientStorage,
     #[error("invalid bucket name")]
     InvalidBucket,
     #[error("invalid key")]
@@ -62,6 +64,7 @@ impl StorageError {
             StorageError::NotFound => "not found",
             StorageError::RangeNotSatisfiable => "range not satisfiable",
             StorageError::PayloadTooLarge => "payload too large",
+            StorageError::InsufficientStorage => "insufficient storage",
             StorageError::InvalidBucket | StorageError::InvalidKey => "invalid request",
             StorageError::PreconditionFailed => "precondition failed",
             StorageError::ReadOnlyReplica => "node is read-only replica",

@@ -25,20 +25,25 @@ async fn main() -> Result<()> {
 
     tracing::info!(?cfg, "Configuration loaded (env)");
 
+    let engine_opts = storage::engine::EngineOptions {
+        upload_buffer_size: cfg.upload_buffer_size,
+        list_scan_cap: cfg.list_scan_cap,
+        multipart_part_size: cfg.multipart_part_size,
+        soft_delete_ttl_secs: cfg.soft_delete_ttl_secs,
+        soft_delete_drop_blob: cfg.soft_delete_drop_blob,
+        multipart_upload_ttl_secs: cfg.multipart_upload_ttl_secs,
+        recompress_batch_size: cfg.recompress_batch_size,
+        read_pool_size: cfg.read_pool_size,
+        zstd_level: cfg.zstd_level,
+        metadata_backend: cfg.metadata_backend,
+        metadata_database_url: cfg.metadata_database_url.clone(),
+        max_logical_bytes: cfg.max_logical_bytes,
+    };
+
     let storage = storage::engine::StorageEngine::with_full_options(
         &cfg.meta_path,
         &cfg.data_dir,
-        storage::engine::EngineOptions {
-            upload_buffer_size: cfg.upload_buffer_size,
-            list_scan_cap: cfg.list_scan_cap,
-            multipart_part_size: cfg.multipart_part_size,
-            soft_delete_ttl_secs: cfg.soft_delete_ttl_secs,
-            soft_delete_drop_blob: cfg.soft_delete_drop_blob,
-            multipart_upload_ttl_secs: cfg.multipart_upload_ttl_secs,
-            recompress_batch_size: cfg.recompress_batch_size,
-            read_pool_size: cfg.read_pool_size,
-            zstd_level: cfg.zstd_level,
-        },
+        engine_opts,
     )
     .await?;
     tracing::info!("Storage engine initialized");

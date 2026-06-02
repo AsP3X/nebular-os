@@ -37,10 +37,21 @@ fn make_token() -> String {
 }
 
 fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<NosConfig> {
+    test_config_with_cap(signing_secret, allow_public_read, 0)
+}
+
+fn test_config_with_cap(
+    signing_secret: Option<String>,
+    allow_public_read: bool,
+    max_logical_bytes: i64,
+) -> Arc<NosConfig> {
     Arc::new(NosConfig {
         bind_addr: "127.0.0.1:0".into(),
         data_dir: "./data/blobs".into(),
         meta_path: "./data/meta/metadata.db".into(),
+        metadata_backend: nebular_os::storage::metadata_backend::MetadataBackendKind::Sqlite,
+        metadata_database_url: None,
+        max_logical_bytes,
         jwt_secret: TEST_SECRET.into(),
         signing_secret,
         max_body_size: 10_000_000,
@@ -88,7 +99,11 @@ async fn standalone_ignores_storage_class_header() {
     assert_eq!(response.status(), StatusCode::CREATED);
 }
 
-async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (axum::Router, String, TempDir) {
+async fn setup_app_with_cap(
+    signing_secret: Option<String>,
+    allow_public_read: bool,
+    max_logical_bytes: i64,
+) -> (axum::Router, String, TempDir) {
     let tmp = TempDir::new().unwrap();
     let data_dir = tmp.path().join("blobs");
 
@@ -98,24 +113,31 @@ async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (
     let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
     let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
 
+    let cfg = test_config_with_cap(signing_secret, allow_public_read, max_logical_bytes);
+
     let storage = StorageEngine::with_full_options(
         &meta_path_str,
         &data_dir_str,
         EngineOptions {
-            upload_buffer_size: 64 * 1024,
-            read_pool_size: 2,
+            upload_buffer_size: cfg.upload_buffer_size,
+            read_pool_size: cfg.read_pool_size,
+            max_logical_bytes: cfg.max_logical_bytes,
+            metadata_backend: cfg.metadata_backend,
+            metadata_database_url: cfg.metadata_database_url.clone(),
             ..EngineOptions::default()
         },
     )
     .await
     .unwrap();
-
-    let cfg = test_config(signing_secret, allow_public_read);
     let metrics = NosMetrics::new();
     let backend = build_backend(storage.clone(), &cfg.cluster, metrics.clone()).unwrap();
     let app = create_app(backend, storage, cfg, metrics).await.unwrap();
 
     (app, make_token(), tmp)
+}
+
+async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (axum::Router, String, TempDir) {
+    setup_app_with_cap(signing_secret, allow_public_read, 0).await
 }
 
 #[tokio::test]
@@ -488,6 +510,36 @@ async fn test_metrics_endpoint() {
     let json: Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("total_objects").is_some());
     assert!(json.get("total_bytes").is_some());
+    assert_eq!(json["metadata_backend"], "sqlite");
+    assert_eq!(json["max_logical_bytes"], 0);
+    assert_eq!(json["logical_bytes"], json["total_bytes"]);
+}
+
+#[tokio::test]
+async fn test_max_logical_bytes_rejects_second_put() {
+    let cap = 20_i64;
+    let (app, token, _tmp) = setup_app_with_cap(None, false, cap).await;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/small.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("12345678901234567890"))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/another.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("overflow"))
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"], "insufficient storage");
 }
 
 #[tokio::test]
