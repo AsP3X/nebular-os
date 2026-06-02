@@ -79,6 +79,10 @@ impl ReplicatedBackend {
         &self.log
     }
 
+    pub fn replication_log_arc(&self) -> Arc<ReplicationLog> {
+        self.log.clone()
+    }
+
     pub async fn pending_replication_events(&self) -> Result<u64, StorageError> {
         self.log.count_pending().await
     }

@@ -31,9 +31,7 @@ pub async fn metrics(
     state.metrics.inc_requests();
 
     let total_objects = state
-        .backend
-        .read()
-        .await
+        .backend()
         .object_count()
         .await
         .map_err(|e| {
@@ -42,9 +40,7 @@ pub async fn metrics(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let total_bytes = state
-        .backend
-        .read()
-        .await
+        .backend()
         .total_bytes()
         .await
         .map_err(|e| {
@@ -53,16 +49,12 @@ pub async fn metrics(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
     let replication_pending_events = state
-        .backend
-        .read()
-        .await
+        .backend()
         .pending_replication_events()
         .await
         .unwrap_or(0);
     let storage_class_counts = state
-        .backend
-        .read()
-        .await
+        .backend()
         .engine()
         .objects_by_storage_class()
         .await

@@ -77,6 +77,13 @@ impl AssignedBackend {
         }
     }
 
+    pub fn replication_log_arc(&self) -> Option<std::sync::Arc<super::replicated::ReplicationLog>> {
+        match &self.inner {
+            AssignedInner::Replicated(b) => Some(b.replication_log_arc()),
+            AssignedInner::Standalone(_) => None,
+        }
+    }
+
     fn ensure_placement(
         &self,
         bucket: &str,

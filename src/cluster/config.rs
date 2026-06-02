@@ -25,7 +25,7 @@ impl ClusterMode {
         }
     }
 
-    fn parse(raw: &str) -> Result<Self> {
+    pub fn parse(raw: &str) -> Result<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "standalone" => Ok(Self::Standalone),
             "replicated" => Ok(Self::Replicated),

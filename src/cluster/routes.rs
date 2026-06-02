@@ -28,15 +28,9 @@ pub struct ClusterHealthResponse {
 /// Human: Peers and operators probe cluster identity and replication backlog.
 /// Agent: GET /_cluster/health; Bearer NOS_CLUSTER_TOKEN; JSON additive ops fields.
 pub async fn cluster_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cluster = state
-        .cluster
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_else(|_| state.config.cluster.clone());
+    let cluster = state.cluster();
     let pending = state
-        .backend
-        .read()
-        .await
+        .backend()
         .pending_replication_events()
         .await
         .unwrap_or(0);
@@ -68,9 +62,7 @@ pub async fn cluster_object_get(
     let if_modified_since = parse_if_modified_since(&headers);
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .engine()
         .get_object(
             &bucket,
@@ -120,7 +112,7 @@ pub async fn cluster_object_head(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((bucket, key)): axum::extract::Path<(String, String)>,
 ) -> impl IntoResponse {
-    match state.backend.read().await.engine().object_exists(&bucket, &key).await {
+    match state.backend().engine().object_exists(&bucket, &key).await {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => (
             StatusCode::NOT_FOUND,
@@ -175,7 +167,7 @@ pub async fn assignment_resolve(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AssignmentResolveRequest>,
 ) -> axum::response::Response {
-    let resolution = match &*state.backend.read().await {
+    let resolution = match &state.backend() {
         StorageBackend::Assigned(b) => {
             let ctx = WriteContext {
                 storage_class_header: body.storage_class_header.clone(),
@@ -208,11 +200,7 @@ pub async fn assignment_resolve(
 }
 
 pub async fn cluster_capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cluster = state
-        .cluster
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_else(|_| state.config.cluster.clone());
+    let cluster = state.cluster();
     (
         StatusCode::OK,
         Json(ClusterCapabilitiesResponse {

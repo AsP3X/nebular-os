@@ -60,10 +60,9 @@ pub struct NosConfig {
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
-    /// Human: Operator token for first-time PUT /_cluster/config before cluster_token exists.
-    /// Agent: READS NOS_CLUSTER_BOOTSTRAP_TOKEN env; OPTIONAL; ≥32 chars when set.
-    pub cluster_bootstrap_token: Option<String>,
     pub cluster: ClusterConfig,
+    /// Human: One-time operator token for PUT /_cluster/config before cluster_token is set.
+    pub cluster_bootstrap_token: Option<String>,
 }
 
 impl fmt::Debug for NosConfig {
@@ -224,10 +223,10 @@ impl NosConfig {
                 .unwrap_or_default(),
             s3_access_key: env::var("NOS_S3_ACCESS_KEY").ok().filter(|s| !s.is_empty()),
             s3_secret_key: env::var("NOS_S3_SECRET_KEY").ok().filter(|s| !s.is_empty()),
+            cluster: ClusterConfig::from_env()?,
             cluster_bootstrap_token: env::var("NOS_CLUSTER_BOOTSTRAP_TOKEN")
                 .ok()
                 .filter(|s| !s.is_empty()),
-            cluster: ClusterConfig::from_env()?,
         })
     }
 }

@@ -96,9 +96,7 @@ pub async fn put_object(
     let if_none_match = parse_if_none_match(&headers);
 
     if let Err(e) = state
-        .backend
-        .read()
-        .await
+        .backend()
         .ensure_write_preconditions(
             &params.bucket,
             &params.key,
@@ -114,9 +112,7 @@ pub async fn put_object(
 
     if let Some((src_bucket, src_key)) = parse_copy_source(&headers) {
         match state
-            .backend
-            .read()
-            .await
+            .backend()
             .copy_object(
                 &src_bucket,
                 &src_key,
@@ -157,9 +153,7 @@ pub async fn put_object(
     };
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .put_object(
             &params.bucket,
             &params.key,
@@ -201,9 +195,7 @@ pub async fn get_object(
     let if_modified_since = parse_if_modified_since(headers);
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .get_object(
             &params.bucket,
             &params.key,
@@ -262,9 +254,7 @@ pub async fn head_object(
     let if_modified_since = parse_if_modified_since(headers);
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .head_object(
             &params.bucket,
             &params.key,
@@ -298,9 +288,7 @@ pub async fn delete_object(
     let if_match = parse_if_match(req.headers());
     let write_ctx = write_context_from_headers(req.headers(), None);
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .delete_object(
             &params.bucket,
             &params.key,

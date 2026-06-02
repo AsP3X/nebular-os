@@ -25,17 +25,11 @@ pub struct HealthResponse {
 }
 
 /// Human: Cheap liveness probe — process is up; cluster fields are additive for operators.
-/// Agent: HTTP 200 JSON; NO SQLite or disk I/O; READS cluster RwLock for display fields.
+/// Agent: HTTP 200 JSON; NO SQLite or disk I/O; READS config.cluster for display fields.
 pub async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    let cluster = state
-        .cluster
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_else(|_| state.config.cluster.clone());
+    let cluster = state.cluster();
     let replication_lag_events = state
-        .backend
-        .read()
-        .await
+        .backend()
         .pending_replication_events()
         .await
         .unwrap_or(0);
@@ -60,7 +54,7 @@ pub struct ReadyResponse {
 /// Human: Readiness probe verifies metadata DB and blob directory before accepting traffic.
 /// Agent: CALLS StorageBackend::probe_readiness; 200 when all checks true else 503 {error:not ready}.
 pub async fn ready(State(state): State<Arc<AppState>>) -> Response {
-    let checks = state.backend.read().await.probe_readiness().await;
+    let checks = state.backend().probe_readiness().await;
     if checks.ready() {
         return (
             StatusCode::OK,

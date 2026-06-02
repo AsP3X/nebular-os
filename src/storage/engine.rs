@@ -299,17 +299,6 @@ impl StorageEngine {
             .execute(pool)
             .await;
 
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS cluster_runtime_config (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                json TEXT NOT NULL,
-                applied_at INTEGER NOT NULL
-            )",
-        )
-        .execute(pool)
-        .await
-        .map_err(internal)?;
-
         sqlx::query("PRAGMA foreign_keys = ON")
             .execute(pool)
             .await
@@ -318,6 +307,17 @@ impl StorageEngine {
             .execute(pool)
             .await
             .map_err(internal)?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cluster_runtime_config (
+                id   INTEGER PRIMARY KEY,
+                json TEXT NOT NULL
+            )",
+        )
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+
         Ok(())
     }
 
@@ -986,32 +986,5 @@ impl StorageEngine {
         .await
         .map_err(internal)?;
         Ok(rows)
-    }
-
-    /// Human: Load Ownly-applied runtime cluster JSON persisted across restarts.
-    /// Agent: READS cluster_runtime_config row id=1; RETURNS None when unset.
-    pub async fn load_cluster_runtime_config(&self) -> Result<Option<String>, StorageError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT json FROM cluster_runtime_config WHERE id = 1")
-                .fetch_optional(&self.read_pool)
-                .await
-                .map_err(internal)?;
-        Ok(row.map(|(json,)| json))
-    }
-
-    /// Human: Persist runtime cluster topology after PUT /_cluster/config succeeds.
-    /// Agent: UPSERT cluster_runtime_config id=1; WRITES applied_at unix timestamp.
-    pub async fn save_cluster_runtime_config(&self, json: &str) -> Result<(), StorageError> {
-        let applied_at = chrono::Utc::now().timestamp();
-        sqlx::query(
-            "INSERT INTO cluster_runtime_config (id, json, applied_at) VALUES (1, $1, $2) \
-             ON CONFLICT(id) DO UPDATE SET json = excluded.json, applied_at = excluded.applied_at",
-        )
-        .bind(json)
-        .bind(applied_at)
-        .execute(&self.write_pool)
-        .await
-        .map_err(internal)?;
-        Ok(())
     }
 }

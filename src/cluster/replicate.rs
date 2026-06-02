@@ -57,9 +57,7 @@ pub async fn replicate(
     match result {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
-            // Human: Client JSON stays generic; logs retain the underlying I/O or SQL cause.
-            // Agent: {:?} on StorageError surfaces Internal(anyhow) chain for ops debugging.
-            tracing::error!(error = ?e, "replicate apply failed");
+            tracing::error!(error = %e, "replicate apply failed");
             let status = match &e {
                 StorageError::NotFound => StatusCode::NOT_FOUND,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -76,10 +74,9 @@ pub async fn replicate(
 async fn apply_json(state: &AppState, body: Bytes) -> Result<(), StorageError> {
     let event: ReplicationEvent =
         serde_json::from_slice(&body).map_err(internal)?;
-    let backend = state.backend.read().await;
-    let log = replication_log_from_backend(&backend)?;
-    let engine = backend.engine();
-    apply_replication_event_bytes(engine, log, &event, None).await
+    let log = replication_log(state)?;
+    let backend = state.backend();
+    apply_replication_event_bytes(backend.engine(), log.as_ref(), &event, None).await
 }
 
 async fn apply_multipart(
@@ -108,19 +105,18 @@ async fn apply_multipart(
     let event_raw = event_json.ok_or(StorageError::NotFound)?;
     let event: ReplicationEvent =
         serde_json::from_str(&event_raw).map_err(internal)?;
-    let backend = state.backend.read().await;
-    let log = replication_log_from_backend(&backend)?;
-    let engine = backend.engine();
-    apply_replication_event_bytes(engine, log, &event, blob).await
+    let log = replication_log(state)?;
+    let backend = state.backend();
+    apply_replication_event_bytes(backend.engine(), log.as_ref(), &event, blob).await
 }
 
-fn replication_log_from_backend(
-    backend: &StorageBackend,
-) -> Result<&crate::cluster::replicated::ReplicationLog, StorageError> {
-    match backend {
-        StorageBackend::Replicated(r) => Ok(r.replication_log()),
+fn replication_log(
+    state: &AppState,
+) -> Result<std::sync::Arc<crate::cluster::replicated::ReplicationLog>, StorageError> {
+    match state.backend() {
+        StorageBackend::Replicated(r) => Ok(r.replication_log_arc()),
         StorageBackend::Assigned(b) => b
-            .replication_log()
+            .replication_log_arc()
             .ok_or_else(|| internal(anyhow::anyhow!("replicate on assigned standalone inner"))),
         StorageBackend::Standalone(_) => {
             Err(internal(anyhow::anyhow!("replicate on non-replicated backend")))

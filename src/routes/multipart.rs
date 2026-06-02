@@ -51,9 +51,7 @@ pub async fn init_multipart(
     let write_ctx = write_context_from_headers(headers, None);
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .init_multipart(
             &params.bucket,
             &query.key,
@@ -73,9 +71,7 @@ pub async fn upload_part(
     req: Request,
 ) -> Response {
     let key = match state
-        .backend
-        .read()
-        .await
+        .backend()
         .multipart_key_for_upload(&params.upload_id)
         .await
     {
@@ -84,7 +80,7 @@ pub async fn upload_part(
     };
 
     let write_ctx = write_context_from_headers(req.headers(), None);
-    let max_part = state.backend.read().await.multipart_part_size();
+    let max_part = state.backend().multipart_part_size();
     let body_stream = req.into_body().into_data_stream();
     let body_reader = tokio_util::io::StreamReader::new(
         body_stream.map(|result| {
@@ -97,9 +93,7 @@ pub async fn upload_part(
     };
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .upload_part(
             &params.bucket,
             &key,
@@ -121,9 +115,7 @@ pub async fn complete_multipart(
     req: Request,
 ) -> Response {
     let key = match state
-        .backend
-        .read()
-        .await
+        .backend()
         .multipart_key_for_upload(&params.upload_id)
         .await
     {
@@ -147,9 +139,7 @@ pub async fn complete_multipart(
     let write_ctx = write_context_from_headers(req.headers(), custom_meta.as_deref());
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .complete_multipart(
             &params.bucket,
             &key,
@@ -169,9 +159,7 @@ pub async fn abort_multipart(
     Path(params): Path<UploadSessionParams>,
 ) -> Response {
     let key = match state
-        .backend
-        .read()
-        .await
+        .backend()
         .multipart_key_for_upload(&params.upload_id)
         .await
     {
@@ -180,9 +168,7 @@ pub async fn abort_multipart(
     };
 
     match state
-        .backend
-        .read()
-        .await
+        .backend()
         .abort_multipart(&params.bucket, &key, &params.upload_id)
         .await
     {

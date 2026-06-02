@@ -1,5 +1,13 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+static WORKER_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Human: Invalidate background replication loops after PUT /_cluster/config hot reload.
+pub fn bump_worker_epoch() {
+    WORKER_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
 
 use reqwest::multipart;
 use tokio::fs::File;
@@ -27,7 +35,12 @@ pub fn spawn_replication_worker(
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let started_epoch = WORKER_EPOCH.load(Ordering::SeqCst);
         loop {
+            if WORKER_EPOCH.load(Ordering::SeqCst) != started_epoch {
+                tracing::info!("replication worker stopping after cluster config reload");
+                break;
+            }
             ticker.tick().await;
             if let Err(e) = drain_once(&client, &log, &peers, &cluster, &token, &metrics).await {
                 tracing::error!(error = %e, "replication worker tick failed");

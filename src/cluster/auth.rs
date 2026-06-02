@@ -1,8 +1,3 @@
-// Human: Inter-node routes use a shared secret, not end-user JWTs.
-// Agent: Compares Authorization Bearer to config.cluster.cluster_token; 401 JSON {error:unauthorized}.
-
-use std::sync::Arc;
-
 use axum::{
     extract::{Request, State},
     http::{header, StatusCode},
@@ -11,6 +6,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
+use std::sync::Arc;
 
 use crate::routes::AppState;
 
@@ -22,71 +18,42 @@ fn bearer_token(req: &Request) -> &str {
         .unwrap_or("")
 }
 
-// Human: Runtime config accepts bootstrap token (first apply) or active cluster token.
-// Agent: GET/PUT /_cluster/config; READS bootstrap_token + cluster RwLock; 401 when neither matches.
-pub async fn runtime_config_auth_middleware(
+/// Human: Inter-node routes use cluster token; bootstrap token allowed until cluster is configured.
+/// Agent: Compares Bearer to cluster_token or NOS_CLUSTER_BOOTSTRAP_TOKEN; 401 JSON {error:unauthorized}.
+pub async fn cluster_token_middleware(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Response {
     let provided = bearer_token(&req);
     if provided.is_empty() {
-        return unauthorized();
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "unauthorized" })),
+        )
+            .into_response();
     }
 
     if state
         .bootstrap_token
         .as_deref()
-        .is_some_and(|expected| provided == expected)
+        .is_some_and(|t| provided == t)
     {
         return next.run(req).await;
     }
 
-    if state
+    let cluster_token = state
         .cluster
         .read()
-        .ok()
-        .and_then(|cluster| cluster.cluster_token.clone())
-        .is_some_and(|expected| provided == expected)
-    {
-        return next.run(req).await;
-    }
-
-    unauthorized()
-}
-
-fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": "unauthorized" })),
-    )
-        .into_response()
-}
-
-/// Human: Inter-node replication routes require the active cluster token.
-/// Agent: Compares Authorization Bearer to cluster.cluster_token; 401 JSON {error:unauthorized}.
-pub async fn cluster_token_middleware(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let expected = match state
-        .cluster
-        .read()
-        .ok()
-        .and_then(|c| c.cluster_token.clone())
-    {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "cluster token not configured" })),
-            )
-                .into_response();
-        }
+        .map(|c| c.cluster_token.clone())
+        .unwrap_or(None);
+    let Some(expected) = cluster_token.filter(|t| !t.is_empty()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "cluster token not configured" })),
+        )
+            .into_response();
     };
-
-    let provided = bearer_token(&req);
 
     if provided != expected {
         return (

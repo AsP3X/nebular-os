@@ -58,6 +58,8 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 
 Unset `NOS_CLUSTER_MODE` for standalone (default). See [docs/plans/cluster-modes.md](docs/plans/cluster-modes.md).
 
+**Ownly / admin-driven clusters:** Start each Nebular node with only JWT secrets plus `NOS_CLUSTER_BOOTSTRAP_TOKEN` (≥ 32 chars). Leave `NOS_CLUSTER_MODE` unset. After the node is reachable, Ownly (setup wizard or Storage Nodes admin) calls `PUT /_cluster/config` with the bootstrap token to set mode, `cluster_token`, peers, and assignment rules. Config is stored in SQLite and survives restarts; no container env churn when adding nodes.
+
 | Variable | Description |
 |----------|-------------|
 | `NOS_CLUSTER_MODE` | `standalone` (default), `replicated`, `assigned`, or `replicated+assigned` |
@@ -71,6 +73,7 @@ Unset `NOS_CLUSTER_MODE` for standalone (default). See [docs/plans/cluster-modes
 | `NOS_ASSIGNMENT_FORWARD` | When `true`, proxy PUT/copy/multipart writes to the assigned peer instead of `409` |
 | `NOS_REPLICATION_ASYNC` | Must be `true` (default); `false` is rejected at startup (quorum deferred) |
 | `NOS_REPLICATION_READ_REPAIR` | When `true`, fetch missing blobs from peers on GET |
+| `NOS_CLUSTER_BOOTSTRAP_TOKEN` | Operator token for `GET`/`PUT /_cluster/config` before cluster is configured (optional) |
 | `x-nd-storage-class` | Optional client header (ignored in standalone) |
 
 Multi-node local dev: `docker compose --profile cluster up --build` (hot on port 9001, cold on 9002; default single-node service unchanged on 9000).
@@ -105,7 +108,7 @@ See [docs/openapi.yaml](docs/openapi.yaml) for the full contract.
 | `GET` | `/_nos/capabilities` | Bearer JWT | Node limits and cluster mode (when enabled) |
 | `GET` | `/metrics` | Optional Bearer (`NOS_METRICS_TOKEN`) | JSON or Prometheus (`Accept: text/plain`) |
 
-Cluster-only routes (require `NOS_CLUSTER_TOKEN`): `GET /_cluster/health`, `POST /_cluster/replicate`, `POST /_cluster/assignment/resolve`, etc.
+Cluster routes (Bearer `NOS_CLUSTER_TOKEN`, or `NOS_CLUSTER_BOOTSTRAP_TOKEN` until configured): `GET`/`PUT /_cluster/config`, `GET /_cluster/health`, `POST /_cluster/replicate`, `POST /_cluster/assignment/resolve`, etc.
 
 ## Use as a Rust dependency
 
@@ -138,11 +141,11 @@ use nebular_os::storage::engine::StorageEngine;
 let cfg = Arc::new(NosConfig::from_env()?);
 let storage = StorageEngine::new(&cfg.meta_path, &cfg.data_dir).await?;
 let metrics = NosMetrics::new();
-let backend = build_backend(storage, &cfg, metrics.clone())?;
-let app = create_app(backend, cfg, metrics).await?;
+let backend = build_backend(storage.clone(), &cfg.cluster, metrics.clone())?;
+let app = create_app(backend, storage, cfg, metrics).await?;
 ```
 
-**Breaking change (cluster branch):** `build_backend` and `create_app` require `Arc<NosMetrics>` so replication counters and Prometheus/JSON metrics stay in sync.
+**Breaking change (cluster branch):** `build_backend(engine, &cluster, metrics)` and `create_app(backend, engine, cfg, metrics)` require a shared `Arc<NosMetrics>`.
 
 Object **list** JSON and **GET** response headers may include `storage_class` and `origin_node` when set in metadata (`x-nd-storage-class`, `x-nd-origin-node` on GET).
 

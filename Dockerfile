@@ -1,9 +1,4 @@
 FROM rust:1.88-slim-bookworm AS builder
-# Human: reqwest (cluster peer forward/replication) links OpenSSL via native-tls at build time.
-# Agent: INSTALL libssl-dev + pkg-config before cargo build; matches ownly backend Dockerfile.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends libssl-dev pkg-config \
-    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY Cargo.toml .
 COPY Cargo.lock .
@@ -15,7 +10,7 @@ FROM debian:bookworm-slim
 # Human: curl is required for Docker / Compose health probes (see ownly and sugarai compose).
 # Agent: INSTALL ca-certificates + curl; HEALTHCHECK hits GET /health on NOS_BIND_ADDR.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl libssl3 \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/nebular-os /usr/local/bin/nebular-os

@@ -17,12 +17,13 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cfg = Arc::new(config::NosConfig::from_env()?);
+    let mut cfg = config::NosConfig::from_env()?;
     secrets::validate_jwt_secret(&cfg.jwt_secret)?;
     if let Some(ref signing) = cfg.signing_secret {
         secrets::validate_signing_secret(signing)?;
     }
-    tracing::info!(?cfg, "Configuration loaded");
+
+    tracing::info!(?cfg, "Configuration loaded (env)");
 
     let storage = storage::engine::StorageEngine::with_full_options(
         &cfg.meta_path,
@@ -41,6 +42,24 @@ async fn main() -> Result<()> {
     )
     .await?;
     tracing::info!("Storage engine initialized");
+
+    if let Some(snap) = storage.load_cluster_config_snapshot().await? {
+        match snap.into_cluster_config() {
+            Ok(loaded) => {
+                tracing::info!(
+                    mode = loaded.mode.as_str(),
+                    node_id = %loaded.node_id,
+                    "Loaded persisted cluster configuration"
+                );
+                cfg.cluster = loaded;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Ignoring invalid persisted cluster config");
+            }
+        }
+    }
+
+    let cfg = Arc::new(cfg);
 
     if cfg.reconcile_on_startup {
         let report = storage.reconcile().await?;
@@ -72,12 +91,8 @@ async fn main() -> Result<()> {
     spawn_storage_maintenance(storage.clone(), cfg.clone());
 
     let metrics = NosMetrics::new();
-    let mut cfg_for_backend = (*cfg).clone();
-    if let Some(runtime_cluster) = cluster::runtime_config::cluster_config_from_storage(&storage).await? {
-        cfg_for_backend.cluster = runtime_cluster;
-    }
-    let backend = cluster::build_backend(storage.clone(), &cfg_for_backend, metrics.clone())?;
-    let app = server::create_app(backend, storage, Arc::new(cfg_for_backend), metrics).await?;
+    let backend = cluster::build_backend(storage.clone(), &cfg.cluster, metrics.clone())?;
+    let app = server::create_app(backend, storage, cfg.clone(), metrics).await?;
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!("Listening on {}", cfg.bind_addr);

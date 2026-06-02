@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::config::NosConfig;
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
+use super::config::ClusterConfig;
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
 use crate::storage::types::{ListResult, ObjectMetadata};
@@ -364,15 +364,15 @@ impl StorageBackend {
 /// Agent: Standalone passthrough; Replicated* / Assigned* per ClusterMode flags.
 pub fn build_backend(
     engine: StorageEngine,
-    cfg: &NosConfig,
+    cluster: &ClusterConfig,
     metrics: Arc<NosMetrics>,
 ) -> anyhow::Result<StorageBackend> {
-    if cfg.cluster.is_standalone() {
+    if cluster.is_standalone() {
         return Ok(StorageBackend::standalone(engine));
     }
 
-    let cluster = Arc::new(cfg.cluster.clone());
-    let peers = cfg.cluster.peer_registry()?;
+    let cluster = Arc::new(cluster.clone());
+    let peers = cluster.peer_registry()?;
     if !peers.peers.contains_key(&cluster.node_id) {
         tracing::warn!(
             node_id = %cluster.node_id,
@@ -380,7 +380,7 @@ pub fn build_backend(
         );
     }
 
-    let inner = if cfg.cluster.mode_includes_replication() {
+    let inner = if cluster.mode_includes_replication() {
         AssignedInner::Replicated(ReplicatedBackend::new(
             engine,
             cluster.clone(),
@@ -391,8 +391,8 @@ pub fn build_backend(
         AssignedInner::Standalone(StandaloneBackend::new(engine))
     };
 
-    if cfg.cluster.mode_includes_assignment() {
-        let rules = cfg.cluster.assignment_rules()?;
+    if cluster.mode_includes_assignment() {
+        let rules = cluster.assignment_rules()?;
         return Ok(StorageBackend::Assigned(AssignedBackend::new(
             inner,
             cluster,
@@ -405,5 +405,5 @@ pub fn build_backend(
         return Ok(StorageBackend::Replicated(r));
     }
 
-    anyhow::bail!("unsupported cluster mode {:?}", cfg.cluster.mode)
+    anyhow::bail!("unsupported cluster mode {:?}", cluster.mode)
 }

@@ -83,6 +83,35 @@ impl PeerRegistry {
         Ok(Self { peers })
     }
 
+    /// Human: Build NOS_CLUSTER_PEERS string from admin JSON peer list.
+    pub fn peers_to_raw(peers: &[super::store::ClusterPeerSnapshot]) -> Result<String> {
+        use anyhow::bail;
+        let mut parts = Vec::new();
+        for p in peers {
+            let id = p.id.trim();
+            let url = p.url.trim();
+            if id.is_empty() || url.is_empty() {
+                bail!("each peer requires non-empty id and url");
+            }
+            let mut entry = format!("{id}={url}");
+            if !p.storage_classes.is_empty() {
+                entry.push(';');
+                entry.push_str(&p.storage_classes.join(","));
+            }
+            if let Some(ref g) = p.replication_group {
+                if !g.trim().is_empty() {
+                    entry.push_str(";group=");
+                    entry.push_str(g.trim());
+                }
+            }
+            parts.push(entry);
+        }
+        if parts.is_empty() {
+            bail!("peers must list at least one node");
+        }
+        Ok(parts.join(","))
+    }
+
     pub fn peer_url(&self, node_id: &str) -> Option<&str> {
         self.peers.get(node_id).map(|p| p.url.as_str())
     }

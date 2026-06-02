@@ -22,7 +22,7 @@ pub struct CapabilitiesResponse {
 /// Human: Clients discover server limits and cluster placement without writing an object.
 /// Agent: GET /_nos/capabilities; JWT/presigned middleware; READS AppState.config.cluster.
 pub async fn capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let cluster = &state.config.cluster;
+    let cluster = state.cluster();
     Json(CapabilitiesResponse {
         version: env!("CARGO_PKG_VERSION"),
         cluster_mode: cluster.mode.as_str(),
