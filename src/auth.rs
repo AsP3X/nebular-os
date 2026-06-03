@@ -133,7 +133,7 @@ fn is_public_object_read(req: &Request) -> bool {
         return false;
     }
     let path = req.uri().path().trim_start_matches('/');
-    if path == "health" || path == "metrics" {
+    if path == "health" || path.starts_with("health/") || path == "metrics" {
         return false;
     }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();

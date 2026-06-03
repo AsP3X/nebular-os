@@ -92,9 +92,7 @@ pub async fn create_app(
         ));
     }
 
-    let mut public_routes = Router::new()
-        .route("/health", get(health::health))
-        .route("/health/ready", get(health::ready));
+    let mut public_routes = Router::new();
 
     // Human: Cluster API when clustered or bootstrap token enables runtime config from Ownly.
     // Agent: MERGE /_cluster/* when !standalone OR NOS_CLUSTER_BOOTSTRAP_TOKEN; config routes always in that set.
@@ -130,9 +128,13 @@ pub async fn create_app(
 
     let cors = build_cors(&cfg);
 
+    // Human: Register liveness/readiness after merge so static paths win over `/{bucket}/{*key}`.
+    // Agent: MERGE order alone is not enough — `health`+`ready` matched object routes and returned 401.
     let app = public_routes
         .merge(metrics_router)
         .merge(protected_routes)
+        .route("/health", get(health::health))
+        .route("/health/ready", get(health::ready))
         .layer(NormalizePathLayer::trim_trailing_slash())
         .layer(cors)
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
