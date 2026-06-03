@@ -10,6 +10,7 @@ COPY Cargo.toml .
 COPY Cargo.lock .
 RUN mkdir src && echo 'fn main() {}' > src/main.rs && cargo build --release && rm -rf src
 COPY src ./src
+COPY migrations ./migrations
 RUN cargo build --release
 
 FROM debian:bookworm-slim
@@ -24,6 +25,6 @@ RUN printf '#!/bin/sh\nmkdir -p /data/blobs /data/meta\nexec nebular-os "$@"\n' 
 EXPOSE 9000
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=5 \
-    CMD curl -fsS "http://127.0.0.1:9000/health" || exit 1
+    CMD curl -fsS "http://127.0.0.1:9000/health/ready" || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
