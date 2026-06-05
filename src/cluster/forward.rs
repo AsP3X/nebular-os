@@ -250,3 +250,90 @@ pub async fn proxy_complete_multipart(
         .and_then(|v| v.get("etag").and_then(|e| e.as_str().map(str::to_string)));
     Ok(metadata_from_etag(bucket, key, None, custom_meta, etag))
 }
+
+fn peer_auth(ctx: Option<&WriteContext>) -> Result<String, StorageError> {
+    auth_header(ctx).map(str::to_string)
+}
+
+/// Human: Forward prefix delete to a peer node (cluster fan-out).
+pub async fn proxy_delete_prefix(
+    peer_base: &str,
+    bucket: &str,
+    prefix: &str,
+    limit: Option<u64>,
+    start_after: Option<&str>,
+    ctx: Option<&WriteContext>,
+) -> Result<crate::storage::types::DeletePrefixOutcome, StorageError> {
+    use crate::storage::types::{DeletePrefixOutcome, DeletePrefixResponse};
+    let mut url = format!(
+        "{}/{bucket}?prefix={}",
+        peer_base.trim_end_matches('/'),
+        urlencoding::encode(prefix)
+    );
+    if let Some(l) = limit {
+        url.push_str(&format!("&limit={l}"));
+    }
+    if let Some(sa) = start_after {
+        url.push_str(&format!("&start_after={}", urlencoding::encode(sa)));
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .delete(&url)
+        .header(header::AUTHORIZATION, peer_auth(ctx)?)
+        .send()
+        .await
+        .map_err(internal)?;
+    if !resp.status().is_success() {
+        return Err(internal(anyhow::anyhow!(
+            "peer prefix delete returned {}",
+            resp.status()
+        )));
+    }
+    let body: DeletePrefixResponse = resp
+        .json()
+        .await
+        .map_err(|e| internal(anyhow::anyhow!(e)))?;
+    Ok(DeletePrefixOutcome {
+        deleted: body.deleted,
+        failed: body.failed,
+        truncated: body.truncated,
+        next_start_after: body.next_start_after,
+        deleted_objects: Vec::new(),
+    })
+}
+
+/// Human: Forward batch delete to a peer node (cluster fan-out).
+pub async fn proxy_batch_delete(
+    peer_base: &str,
+    bucket: &str,
+    keys: &[String],
+    ctx: Option<&WriteContext>,
+) -> Result<crate::storage::types::DeletePrefixOutcome, StorageError> {
+    use crate::storage::types::{DeletePrefixOutcome, DeletePrefixResponse};
+    let url = format!("{}/{bucket}/_batch_delete", peer_base.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&url)
+        .header(header::AUTHORIZATION, peer_auth(ctx)?)
+        .json(&serde_json::json!({ "keys": keys }))
+        .send()
+        .await
+        .map_err(internal)?;
+    if !resp.status().is_success() {
+        return Err(internal(anyhow::anyhow!(
+            "peer batch delete returned {}",
+            resp.status()
+        )));
+    }
+    let body: DeletePrefixResponse = resp
+        .json()
+        .await
+        .map_err(|e| internal(anyhow::anyhow!(e)))?;
+    Ok(DeletePrefixOutcome {
+        deleted: body.deleted,
+        failed: body.failed,
+        truncated: body.truncated,
+        next_start_after: body.next_start_after,
+        deleted_objects: Vec::new(),
+    })
+}

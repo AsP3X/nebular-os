@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use tokio::fs;
 
+use super::blocks::BlockStore;
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
 use super::{blob_path, sanitize_bucket};
@@ -13,6 +14,26 @@ pub struct ReconcileReport {
     pub replication_pending_events: u64,
     /// Pending put events whose payload blob file is missing on disk.
     pub replication_pending_missing_blob: u64,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct OrphanBlob {
+    pub bucket: String,
+    pub key: String,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct OrphanListResult {
+    pub orphans: Vec<OrphanBlob>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct OrphanGcReport {
+    pub removed: u64,
+    pub bytes_reclaimed: u64,
+    pub truncated: bool,
 }
 
 impl StorageEngine {
@@ -65,6 +86,144 @@ impl StorageEngine {
             "storage::reconcile completed"
         );
         Ok(report)
+    }
+
+    /// Lists on-disk blobs with no active metadata row, optionally filtered by bucket/prefix.
+    pub async fn list_orphan_blobs(
+        &self,
+        bucket_filter: Option<&str>,
+        prefix_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<OrphanListResult, StorageError> {
+        let rows = self.object_meta().list_active_bucket_keys().await?;
+        let db_keys: HashSet<(String, String)> = rows.into_iter().collect();
+        let mut orphans = Vec::new();
+        let mut truncated = false;
+
+        let data_dir = self.data_dir();
+        let mut entries = fs::read_dir(data_dir).await.map_err(internal)?;
+        while let Some(entry) = entries.next_entry().await.map_err(internal)? {
+            if orphans.len() >= limit {
+                truncated = true;
+                break;
+            }
+            let file_type = entry.file_type().await.map_err(internal)?;
+            if !file_type.is_dir() {
+                continue;
+            }
+            let bucket_name = entry.file_name().to_string_lossy().to_string();
+            if bucket_name.starts_with('.') {
+                continue;
+            }
+            let bucket = match sanitize_bucket(&bucket_name) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Some(filter) = bucket_filter
+                && bucket != filter
+            {
+                continue;
+            }
+            Self::collect_orphans_in_bucket(
+                entry.path(),
+                &bucket,
+                prefix_filter,
+                &db_keys,
+                &mut orphans,
+                limit,
+                &mut truncated,
+            )
+            .await?;
+        }
+
+        Ok(OrphanListResult { orphans, truncated })
+    }
+
+    /// Removes up to `limit` orphan blobs matching optional bucket/prefix filters.
+    pub async fn gc_orphan_blobs(
+        &self,
+        bucket_filter: Option<&str>,
+        prefix_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<OrphanGcReport, StorageError> {
+        let listed = self
+            .list_orphan_blobs(bucket_filter, prefix_filter, limit)
+            .await?;
+        let mut report = OrphanGcReport {
+            truncated: listed.truncated,
+            ..Default::default()
+        };
+        for orphan in listed.orphans {
+            let path = blob_path(self.data_dir(), &orphan.bucket, &orphan.key);
+            if path.exists() {
+                BlockStore::release_blob(self.system_write_pool(), self.data_dir(), &path).await?;
+                let _ = fs::remove_file(&path).await;
+                report.removed += 1;
+                report.bytes_reclaimed += orphan.bytes;
+            }
+        }
+        Ok(report)
+    }
+
+    async fn collect_orphans_in_bucket(
+        bucket_dir: std::path::PathBuf,
+        bucket: &str,
+        prefix_filter: Option<&str>,
+        db_keys: &HashSet<(String, String)>,
+        orphans: &mut Vec<OrphanBlob>,
+        limit: usize,
+        truncated: &mut bool,
+    ) -> Result<(), StorageError> {
+        let mut stack = vec![bucket_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            if orphans.len() >= limit {
+                *truncated = true;
+                return Ok(());
+            }
+            let mut rd = fs::read_dir(&dir).await.map_err(internal)?;
+            while let Some(ent) = rd.next_entry().await.map_err(internal)? {
+                if orphans.len() >= limit {
+                    *truncated = true;
+                    return Ok(());
+                }
+                let ft = ent.file_type().await.map_err(internal)?;
+                if ft.is_dir() {
+                    stack.push(ent.path());
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let path = ent.path();
+                let rel = path
+                    .strip_prefix(&bucket_dir)
+                    .map_err(internal)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let key = rel
+                    .split_once('/')
+                    .map(|(_, k)| k.to_string())
+                    .unwrap_or(rel);
+                if key.is_empty() {
+                    continue;
+                }
+                if let Some(prefix) = prefix_filter
+                    && !key.starts_with(prefix)
+                {
+                    continue;
+                }
+                if db_keys.contains(&(bucket.to_string(), key.clone())) {
+                    continue;
+                }
+                let bytes = ent.metadata().await.map_err(internal)?.len();
+                orphans.push(OrphanBlob {
+                    bucket: bucket.to_string(),
+                    key,
+                    bytes,
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn replication_reconcile_hints(&self) -> Result<ReplicationHints, StorageError> {

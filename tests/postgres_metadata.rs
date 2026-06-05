@@ -78,6 +78,7 @@ async fn postgres_app() -> Option<(axum::Router, String, TempDir, testcontainers
         data_dir: data_dir_str.to_string(),
         meta_path: meta_path_str.to_string(),
         metadata_backend: MetadataBackendKind::Postgres,
+        metadata_mode: nebular_os::storage::metadata_mode::MetadataMode::Full,
         metadata_database_url: Some(format!(
             "postgres://postgres:postgres@127.0.0.1:{host_port}/postgres"
         )),
@@ -99,6 +100,12 @@ async fn postgres_app() -> Option<(axum::Router, String, TempDir, testcontainers
         rate_limit_rps: 0,
         rate_limit_burst: 50,
         list_scan_cap: 4096,
+        bulk_delete_concurrency: 32,
+        bulk_delete_batch_limit: 1000,
+        upload_max_in_flight_bytes: 32 * 1024 * 1024,
+        upload_permit_unit: 5 * 1024 * 1024,
+        orphan_gc_interval_secs: 0,
+        rate_limit_bypass_roles: vec!["admin".into()],
         multipart_part_size: 8 * 1024 * 1024,
         read_pool_size: 2,
         cors_origins: vec![],

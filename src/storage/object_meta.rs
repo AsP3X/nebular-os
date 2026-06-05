@@ -363,6 +363,90 @@ impl ObjectMetaStore {
         Ok(())
     }
 
+    /// Soft-deletes many active objects in one metadata transaction.
+    pub async fn soft_delete_objects(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<u64, StorageError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        match &self.inner {
+            ObjectMetaInner::Sqlite { write, .. } => {
+                let now = Utc::now().timestamp();
+                let q = format!(
+                    "UPDATE objects SET deleted_at = ? WHERE bucket = ? AND key = ? AND {ACTIVE_WHERE_SQLITE}"
+                );
+                let mut tx = write.begin().await.map_err(internal)?;
+                for key in keys {
+                    sqlx::query(&q)
+                        .bind(now)
+                        .bind(bucket)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(internal)?;
+                }
+                tx.commit().await.map_err(internal)?;
+            }
+            ObjectMetaInner::Postgres { write, .. } => {
+                let q = format!(
+                    "UPDATE nos_objects SET deleted_at = now() WHERE bucket = $1 AND object_key = $2 AND {ACTIVE_WHERE_PG}"
+                );
+                let mut tx = write.begin().await.map_err(internal)?;
+                for key in keys {
+                    sqlx::query(&q)
+                        .bind(bucket)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(internal)?;
+                }
+                tx.commit().await.map_err(internal)?;
+            }
+        }
+        Ok(keys.len() as u64)
+    }
+
+    /// Hard-deletes metadata rows for many objects in one transaction.
+    pub async fn hard_delete_objects(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<u64, StorageError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        match &self.inner {
+            ObjectMetaInner::Sqlite { write, .. } => {
+                let mut tx = write.begin().await.map_err(internal)?;
+                for key in keys {
+                    sqlx::query("DELETE FROM objects WHERE bucket = ? AND key = ?")
+                        .bind(bucket)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(internal)?;
+                }
+                tx.commit().await.map_err(internal)?;
+            }
+            ObjectMetaInner::Postgres { write, .. } => {
+                let mut tx = write.begin().await.map_err(internal)?;
+                for key in keys {
+                    sqlx::query("DELETE FROM nos_objects WHERE bucket = $1 AND object_key = $2")
+                        .bind(bucket)
+                        .bind(key)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(internal)?;
+                }
+                tx.commit().await.map_err(internal)?;
+            }
+        }
+        Ok(keys.len() as u64)
+    }
+
     pub async fn list_active_rows(
         &self,
         bucket: &str,
@@ -432,6 +516,39 @@ impl ObjectMetaStore {
                 sqlx::query_scalar(&q)
                     .bind(bucket)
                     .bind(last_key)
+                    .bind(prefix_pattern)
+                    .fetch_one(read)
+                    .await
+                    .map_err(internal)
+            }
+        }
+    }
+
+    pub async fn count_active_with_prefix(
+        &self,
+        bucket: &str,
+        prefix_pattern: &str,
+    ) -> Result<i64, StorageError> {
+        match &self.inner {
+            ObjectMetaInner::Sqlite { read, .. } => {
+                let q = format!(
+                    "SELECT COUNT(*) FROM {OBJECTS_TABLE_SQLITE}
+                     WHERE bucket = ? AND key LIKE ? ESCAPE '\\' AND {ACTIVE_WHERE_SQLITE}"
+                );
+                sqlx::query_scalar(&q)
+                    .bind(bucket)
+                    .bind(prefix_pattern)
+                    .fetch_one(read)
+                    .await
+                    .map_err(internal)
+            }
+            ObjectMetaInner::Postgres { read, .. } => {
+                let q = format!(
+                    "SELECT COUNT(*)::bigint FROM {OBJECTS_TABLE_PG}
+                     WHERE bucket = $1 AND object_key LIKE $2 ESCAPE '\\' AND {ACTIVE_WHERE_PG}"
+                );
+                sqlx::query_scalar(&q)
+                    .bind(bucket)
                     .bind(prefix_pattern)
                     .fetch_one(read)
                     .await

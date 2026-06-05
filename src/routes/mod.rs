@@ -1,8 +1,10 @@
+pub mod batch;
 pub mod bucket;
 pub mod capabilities;
 pub mod errors;
 pub mod health;
 pub mod helpers;
+pub mod maintenance;
 pub mod metrics;
 pub mod multipart;
 pub mod object;
@@ -16,6 +18,7 @@ use std::sync::RwLock;
 use crate::cluster::config::ClusterConfig;
 use crate::config::NosConfig;
 use crate::middleware::rate_limit::ClientBucket;
+use crate::middleware::UploadBudget;
 use crate::observability::NosMetrics;
 use crate::cluster::StorageBackend;
 use crate::storage::engine::StorageEngine;
@@ -32,6 +35,7 @@ pub struct AppState {
     pub metrics_token: Option<Arc<String>>,
     pub metrics: Arc<NosMetrics>,
     pub rate_limiters: Arc<DashMap<String, ClientBucket>>,
+    pub upload_budget: Option<Arc<UploadBudget>>,
     pub max_body_size: usize,
     pub allow_public_read: bool,
 }
@@ -51,6 +55,11 @@ impl AppState {
             .read()
             .expect("cluster lock poisoned")
             .clone()
+    }
+
+    /// Human: Direct access to the local storage engine (capabilities, admin).
+    pub fn engine(&self) -> &StorageEngine {
+        &self.engine
     }
 }
 

@@ -9,6 +9,7 @@ pub mod object_meta;
 pub mod streaming;
 pub mod error;
 pub mod maintenance;
+pub mod metadata_mode;
 pub mod multipart;
 pub mod precondition;
 pub mod range;

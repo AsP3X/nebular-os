@@ -17,10 +17,10 @@ use crate::cluster::StorageBackend;
 use crate::config::NosConfig;
 use crate::middleware::{
     metrics_auth::metrics_auth_middleware, rate_limit::rate_limit_middleware,
-    rate_limit::new_rate_limit_map,
+    rate_limit::new_rate_limit_map, upload_budget::upload_budget_middleware,
 };
 use crate::observability::NosMetrics;
-use crate::routes::{bucket, capabilities, health, metrics, multipart, object, AppState};
+use crate::routes::{batch, bucket, capabilities, health, maintenance, metrics, multipart, object, AppState};
 
 pub async fn create_app(
     backend: StorageBackend,
@@ -31,6 +31,14 @@ pub async fn create_app(
     let cluster = Arc::new(std::sync::RwLock::new(cfg.cluster.clone()));
     let backend = Arc::new(std::sync::RwLock::new(backend));
     let bootstrap_token = cfg.cluster_bootstrap_token.clone().map(Arc::new);
+    let upload_budget = if cfg.upload_max_in_flight_bytes > 0 {
+        Some(crate::middleware::UploadBudget::new(
+            cfg.upload_max_in_flight_bytes,
+            cfg.upload_permit_unit,
+        ))
+    } else {
+        None
+    };
     let state = Arc::new(AppState {
         backend,
         cluster,
@@ -42,6 +50,7 @@ pub async fn create_app(
         metrics_token: cfg.metrics_token.clone().map(Arc::new),
         metrics,
         rate_limiters: new_rate_limit_map(),
+        upload_budget,
         max_body_size: cfg.max_body_size,
         allow_public_read: cfg.allow_public_read,
     });
@@ -74,7 +83,13 @@ pub async fn create_app(
 
     let mut protected_routes = Router::new()
         .route("/_nos/capabilities", get(capabilities::capabilities))
+        .route("/_nos/maintenance/orphans", get(maintenance::list_orphans))
+        .route(
+            "/_nos/maintenance/gc_orphans",
+            axum::routing::post(maintenance::gc_orphans),
+        )
         .merge(multipart_routes)
+        .route("/{bucket}/_batch_delete", axum::routing::post(batch::batch_delete))
         .route(
             "/{bucket}/{*key}",
             put(object::put_object)
@@ -82,8 +97,14 @@ pub async fn create_app(
                 .get(object::get_object)
                 .head(object::head_object),
         )
-        .route("/{bucket}", get(bucket::list_objects))
-        .layer(auth_layer);
+        .route("/{bucket}", get(bucket::list_objects).delete(bucket::delete_objects_by_prefix));
+
+    if cfg.upload_max_in_flight_bytes > 0 {
+        protected_routes = protected_routes.layer(middleware::from_fn_with_state(
+            state.clone(),
+            upload_budget_middleware,
+        ));
+    }
 
     if cfg.rate_limit_rps > 0 {
         protected_routes = protected_routes.layer(middleware::from_fn_with_state(
@@ -91,6 +112,8 @@ pub async fn create_app(
             rate_limit_middleware,
         ));
     }
+
+    protected_routes = protected_routes.layer(auth_layer);
 
     let mut public_routes = Router::new();
 

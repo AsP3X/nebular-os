@@ -8,7 +8,7 @@ use crate::observability::NosMetrics;
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
-use crate::storage::types::{ListResult, ObjectMetadata};
+use crate::storage::types::{DeletePrefixOutcome, ListCountResult, ListResult, ObjectMetadata};
 
 use super::log::ReplicationLog;
 use super::worker::spawn_replication_worker;
@@ -266,6 +266,55 @@ impl ReplicatedBackend {
             .enqueue_delete(bucket, key, &storage_class, &group)
             .await?;
         Ok(())
+    }
+
+    pub async fn delete_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: Option<u64>,
+        start_after: Option<&str>,
+        write_ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        self.ensure_writable()?;
+        let group = self.replication_group(write_ctx);
+        let outcome = self
+            .inner
+            .delete_objects_by_prefix(bucket, prefix, limit, start_after)
+            .await?;
+        for obj in &outcome.deleted_objects {
+            let storage_class = obj.storage_class.as_deref().unwrap_or("default");
+            self.log
+                .enqueue_delete(bucket, &obj.key, storage_class, &group)
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    pub async fn delete_objects_batch(
+        &self,
+        bucket: &str,
+        keys: &[String],
+        write_ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        self.ensure_writable()?;
+        let group = self.replication_group(write_ctx);
+        let outcome = self.inner.delete_objects_batch(bucket, keys).await?;
+        for obj in &outcome.deleted_objects {
+            let storage_class = obj.storage_class.as_deref().unwrap_or("default");
+            self.log
+                .enqueue_delete(bucket, &obj.key, storage_class, &group)
+                .await?;
+        }
+        Ok(outcome)
+    }
+
+    pub async fn count_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<ListCountResult, StorageError> {
+        self.inner.count_objects_by_prefix(bucket, prefix).await
     }
 
     pub async fn list_objects(

@@ -1,8 +1,10 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use sqlx::{Pool, Sqlite};
 use tokio::fs;
+use tokio::sync::Semaphore;
 
 use super::blob_ops::link_or_copy_blob;
 use super::blocks::BlockStore;
@@ -10,6 +12,7 @@ use super::compression::{self, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_LEVEL_UPLOAD};
 use super::dict_store::DictStore;
 use super::error::{internal, StorageError};
 use super::metadata_backend::MetadataBackendKind;
+use super::metadata_mode::MetadataMode;
 use super::object_meta::{ObjectMetaConnect, ObjectMetaStore};
 use super::range::parse_content_range;
 use super::streaming::{
@@ -18,11 +21,16 @@ use super::streaming::{
 };
 use super::blob_finalize::ReadContext;
 use super::precondition::{check_write_preconditions, etag_matches};
-use super::types::{ListItem, ListResult, ObjectMetadata};
+use super::types::{
+    DeletedObjectRef, DeletePrefixFailure, DeletePrefixOutcome, ListCountResult, ListItem,
+    ListResult, ObjectMetadata,
+};
 use super::{blob_path, sanitize_bucket, sanitize_key};
 
 pub(crate) const DEFAULT_UPLOAD_BUFFER: usize = 256 * 1024;
 const DEFAULT_LIST_SCAN_CAP: i64 = 4096;
+const DEFAULT_BULK_DELETE_CONCURRENCY: usize = 32;
+const DEFAULT_BULK_DELETE_BATCH_LIMIT: u64 = 1000;
 
 fn escape_like_pattern(s: &str) -> String {
     s.replace("\\", "\\\\")
@@ -83,8 +91,11 @@ pub struct EngineOptions {
     pub dedup_block_size: usize,
     pub dedup_min_size: u64,
     pub metadata_backend: MetadataBackendKind,
+    pub metadata_mode: MetadataMode,
     pub metadata_database_url: Option<String>,
     pub max_logical_bytes: i64,
+    pub bulk_delete_concurrency: usize,
+    pub bulk_delete_batch_limit: u64,
 }
 
 impl Default for EngineOptions {
@@ -107,8 +118,11 @@ impl Default for EngineOptions {
             dedup_block_size: 256 * 1024,
             dedup_min_size: 1024 * 1024,
             metadata_backend: MetadataBackendKind::Sqlite,
+            metadata_mode: MetadataMode::Full,
             metadata_database_url: None,
             max_logical_bytes: 0,
+            bulk_delete_concurrency: DEFAULT_BULK_DELETE_CONCURRENCY,
+            bulk_delete_batch_limit: DEFAULT_BULK_DELETE_BATCH_LIMIT,
         }
     }
 }
@@ -119,6 +133,7 @@ pub struct StorageEngine {
     system_write: Pool<Sqlite>,
     system_read: Pool<Sqlite>,
     metadata_backend: MetadataBackendKind,
+    metadata_mode: MetadataMode,
     max_logical_bytes: i64,
     data_dir: String,
     upload_buffer_size: usize,
@@ -138,6 +153,8 @@ pub struct StorageEngine {
     dedup_min_size: u64,
     dict_store: DictStore,
     block_store: BlockStore,
+    bulk_delete_concurrency: usize,
+    bulk_delete_batch_limit: u64,
 }
 
 pub(crate) struct TempFileGuard {
@@ -224,6 +241,7 @@ impl StorageEngine {
             system_write,
             system_read,
             metadata_backend: opts.metadata_backend,
+            metadata_mode: opts.metadata_mode,
             max_logical_bytes: opts.max_logical_bytes.max(0),
             data_dir: data_dir.to_string(),
             upload_buffer_size: opts.upload_buffer_size.max(4096),
@@ -243,6 +261,8 @@ impl StorageEngine {
             dedup_min_size: opts.dedup_min_size,
             dict_store: DictStore::new(data_dir),
             block_store: BlockStore::new(data_dir),
+            bulk_delete_concurrency: opts.bulk_delete_concurrency.clamp(1, 256),
+            bulk_delete_batch_limit: opts.bulk_delete_batch_limit.clamp(1, 10_000),
         })
     }
 
@@ -256,6 +276,10 @@ impl StorageEngine {
 
     pub fn metadata_backend(&self) -> MetadataBackendKind {
         self.metadata_backend
+    }
+
+    pub fn metadata_mode(&self) -> MetadataMode {
+        self.metadata_mode
     }
 
     pub fn max_logical_bytes(&self) -> i64 {
@@ -321,6 +345,14 @@ impl StorageEngine {
 
     pub fn soft_delete_drop_blob(&self) -> bool {
         self.soft_delete_drop_blob
+    }
+
+    pub fn bulk_delete_concurrency(&self) -> usize {
+        self.bulk_delete_concurrency
+    }
+
+    pub fn bulk_delete_batch_limit(&self) -> u64 {
+        self.bulk_delete_batch_limit
     }
 
     pub fn multipart_upload_ttl_secs(&self) -> i64 {
@@ -533,6 +565,26 @@ impl StorageEngine {
             return Err(e);
         }
 
+        if self.metadata_mode.is_blob_only() {
+            let now = chrono::Utc::now();
+            return Ok((
+                ObjectMetadata {
+                    bucket: bucket.to_string(),
+                    key: safe_key.to_string(),
+                    size: size as i64,
+                    mime_type: content_type.map(str::to_string),
+                    etag: Some(etag.clone()),
+                    created_at: now,
+                    updated_at: now,
+                    custom_meta: custom_meta.map(str::to_string),
+                    deleted_at: None,
+                    storage_class: None,
+                    origin_node: None,
+                },
+                etag,
+            ));
+        }
+
         let meta = match self
             .object_meta
             .upsert_object(
@@ -565,12 +617,13 @@ impl StorageEngine {
         if_none_match: Option<&str>,
         if_modified_since: Option<i64>,
     ) -> Result<GetObjectOutcome, StorageError> {
-        let meta = self
-            .fetch_active_metadata(
-                &sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?,
-                &sanitize_key(key).map_err(|_| StorageError::InvalidKey)?,
-            )
-            .await?;
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        let meta = if self.metadata_mode.is_blob_only() {
+            self.fetch_blob_only_metadata(&bucket, &safe_key).await?
+        } else {
+            self.fetch_active_metadata(&bucket, &safe_key).await?
+        };
 
         if self.is_not_modified(&meta, if_none_match, if_modified_since) {
             return Ok(GetObjectOutcome::NotModified(meta));
@@ -608,12 +661,13 @@ impl StorageEngine {
         if_none_match: Option<&str>,
         if_modified_since: Option<i64>,
     ) -> Result<Option<ObjectMetadata>, StorageError> {
-        let meta = self
-            .fetch_active_metadata(
-                &sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?,
-                &sanitize_key(key).map_err(|_| StorageError::InvalidKey)?,
-            )
-            .await?;
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        let meta = if self.metadata_mode.is_blob_only() {
+            self.fetch_blob_only_metadata(&bucket, &safe_key).await?
+        } else {
+            self.fetch_active_metadata(&bucket, &safe_key).await?
+        };
         if self.is_not_modified(&meta, if_none_match, if_modified_since) {
             return Ok(None);
         }
@@ -651,9 +705,17 @@ impl StorageEngine {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
 
-        if if_match.is_some() {
+        if if_match.is_some() && !self.metadata_mode.is_blob_only() {
             self.ensure_write_preconditions(&bucket, &safe_key, if_match, None)
                 .await?;
+        }
+
+        if self.metadata_mode.is_blob_only() {
+            let path = blob_path(&self.data_dir, &bucket, &safe_key);
+            if !path.exists() {
+                return Ok(());
+            }
+            return self.drop_object_blob(&bucket, &safe_key).await;
         }
 
         if self.object_meta.active_row_count(&bucket, &safe_key).await? == 0 {
@@ -680,6 +742,284 @@ impl StorageEngine {
 
         self.object_meta.soft_delete_object(&bucket, &safe_key).await?;
         Ok(())
+    }
+
+    async fn drop_object_blob(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
+        let path = blob_path(&self.data_dir, bucket, key);
+        if path.exists() {
+            BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
+        }
+        let _ = fs::remove_file(&path).await;
+        Ok(())
+    }
+
+    /// Deletes explicit object keys using parallel blob drops and a batch metadata transaction.
+    pub async fn delete_objects_batch(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        if keys.is_empty() {
+            return Ok(DeletePrefixOutcome {
+                deleted: 0,
+                failed: Vec::new(),
+                truncated: false,
+                next_start_after: None,
+                deleted_objects: Vec::new(),
+            });
+        }
+
+        let mut pending = Vec::with_capacity(keys.len());
+        let mut failed = Vec::new();
+        for key in keys {
+            match sanitize_key(key) {
+                Ok(safe_key) => {
+                    if self.metadata_mode.is_blob_only() {
+                        pending.push(DeletedObjectRef {
+                            key: safe_key,
+                            storage_class: None,
+                        });
+                    } else if self.object_meta.active_row_count(&bucket, &safe_key).await? > 0 {
+                        let meta = self.object_meta.fetch_active_metadata(&bucket, &safe_key).await;
+                        match meta {
+                            Ok(m) => pending.push(DeletedObjectRef {
+                                key: safe_key,
+                                storage_class: m.storage_class,
+                            }),
+                            Err(e) => failed.push(DeletePrefixFailure {
+                                key: safe_key,
+                                error: e.to_string(),
+                            }),
+                        }
+                    }
+                }
+                Err(_) => failed.push(DeletePrefixFailure {
+                    key: key.clone(),
+                    error: "invalid key".to_string(),
+                }),
+            }
+        }
+
+        let mut outcome = self.delete_objects_internal(&bucket, pending).await?;
+        outcome.failed.extend(failed);
+        Ok(outcome)
+    }
+
+    /// Deletes up to `limit` active objects whose keys start with `prefix`, using parallel blob
+    /// drops and a single metadata transaction per batch.
+    pub async fn delete_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: Option<u64>,
+        start_after: Option<&str>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        if prefix.is_empty() {
+            return Err(StorageError::InvalidKey);
+        }
+        let safe_prefix = sanitize_key(prefix).map_err(|_| StorageError::InvalidKey)?;
+        let limit = limit
+            .unwrap_or(self.bulk_delete_batch_limit)
+            .min(self.bulk_delete_batch_limit)
+            .max(1) as usize;
+        let start_after = start_after.unwrap_or("");
+
+        if self.metadata_mode.is_blob_only() {
+            return self
+                .delete_blob_only_prefix(&bucket, &safe_prefix, limit, start_after)
+                .await;
+        }
+
+        let prefix_pattern = format!("{}%", escape_like_pattern(&safe_prefix));
+
+        let rows = self
+            .object_meta
+            .list_active_rows(
+                &bucket,
+                start_after,
+                &prefix_pattern,
+                (limit as i64).saturating_add(1),
+            )
+            .await?;
+
+        let truncated = rows.len() > limit;
+        let page: Vec<_> = rows.into_iter().take(limit).collect();
+        let next_start_after = if truncated {
+            page.last().map(|r| r.key.clone())
+        } else {
+            None
+        };
+
+        if page.is_empty() {
+            return Ok(DeletePrefixOutcome {
+                deleted: 0,
+                failed: Vec::new(),
+                truncated: false,
+                next_start_after: None,
+                deleted_objects: Vec::new(),
+            });
+        }
+
+        let pending: Vec<DeletedObjectRef> = page
+            .iter()
+            .map(|r| DeletedObjectRef {
+                key: r.key.clone(),
+                storage_class: r.storage_class.clone(),
+            })
+            .collect();
+
+        let mut outcome = self.delete_objects_internal(&bucket, pending).await?;
+        outcome.truncated = truncated;
+        outcome.next_start_after = next_start_after;
+        Ok(outcome)
+    }
+
+    async fn delete_objects_internal(
+        &self,
+        bucket: &str,
+        pending: Vec<DeletedObjectRef>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        if pending.is_empty() {
+            return Ok(DeletePrefixOutcome {
+                deleted: 0,
+                failed: Vec::new(),
+                truncated: false,
+                next_start_after: None,
+                deleted_objects: Vec::new(),
+            });
+        }
+
+        let keys: Vec<String> = pending.iter().map(|r| r.key.clone()).collect();
+        let needs_blob_drop =
+            self.metadata_mode.is_blob_only() || self.soft_delete_ttl_secs <= 0 || self.soft_delete_drop_blob;
+
+        let mut blob_ok_keys: Vec<String> = Vec::with_capacity(keys.len());
+        let mut failed: Vec<DeletePrefixFailure> = Vec::new();
+
+        if needs_blob_drop {
+            let semaphore = Arc::new(Semaphore::new(self.bulk_delete_concurrency));
+            let mut join_set = tokio::task::JoinSet::new();
+            for key in keys {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| internal(anyhow::anyhow!("bulk delete worker pool closed")))?;
+                let engine = self.clone();
+                let bucket = bucket.to_string();
+                join_set.spawn(async move {
+                    let result = engine.drop_object_blob(&bucket, &key).await;
+                    drop(permit);
+                    (key, result)
+                });
+            }
+            while let Some(joined) = join_set.join_next().await {
+                match joined {
+                    Ok((key, Ok(()))) => blob_ok_keys.push(key),
+                    Ok((key, Err(e))) => failed.push(DeletePrefixFailure {
+                        key,
+                        error: e.to_string(),
+                    }),
+                    Err(e) => failed.push(DeletePrefixFailure {
+                        key: String::new(),
+                        error: format!("bulk delete task failed: {e}"),
+                    }),
+                }
+            }
+        } else {
+            blob_ok_keys = keys;
+        }
+
+        let deleted_objects: Vec<DeletedObjectRef> = pending
+            .into_iter()
+            .filter(|r| blob_ok_keys.iter().any(|k| k == &r.key))
+            .collect();
+
+        let (deleted, deleted_objects) = if blob_ok_keys.is_empty() || self.metadata_mode.is_blob_only() {
+            (blob_ok_keys.len() as u64, deleted_objects)
+        } else if self.soft_delete_ttl_secs <= 0 {
+            let metadata_result = self
+                .object_meta
+                .hard_delete_objects(bucket, &blob_ok_keys)
+                .await;
+            match metadata_result {
+                Ok(n) => (n, deleted_objects),
+                Err(e) => {
+                    let err = e.to_string();
+                    for key in blob_ok_keys {
+                        failed.push(DeletePrefixFailure {
+                            key,
+                            error: err.clone(),
+                        });
+                    }
+                    (0, Vec::new())
+                }
+            }
+        } else {
+            let metadata_result = self
+                .object_meta
+                .soft_delete_objects(bucket, &blob_ok_keys)
+                .await;
+            match metadata_result {
+                Ok(n) => (n, deleted_objects),
+                Err(e) => {
+                    let err = e.to_string();
+                    for key in blob_ok_keys {
+                        failed.push(DeletePrefixFailure {
+                            key,
+                            error: err.clone(),
+                        });
+                    }
+                    (0, Vec::new())
+                }
+            }
+        };
+
+        failed.retain(|f| !f.key.is_empty());
+
+        Ok(DeletePrefixOutcome {
+            deleted,
+            failed,
+            truncated: false,
+            next_start_after: None,
+            deleted_objects,
+        })
+    }
+
+    async fn delete_blob_only_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: usize,
+        start_after: &str,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        let keys = self
+            .list_blob_only_keys(bucket, Some(prefix), limit.saturating_add(1))
+            .await?;
+        let truncated = keys.len() > limit;
+        let page: Vec<_> = keys
+            .into_iter()
+            .filter(|k| k.as_str() > start_after)
+            .take(limit)
+            .collect();
+        let next_start_after = if truncated {
+            page.last().cloned()
+        } else {
+            None
+        };
+        let pending: Vec<DeletedObjectRef> = page
+            .into_iter()
+            .map(|key| DeletedObjectRef {
+                key,
+                storage_class: None,
+            })
+            .collect();
+        let mut outcome = self.delete_objects_internal(bucket, pending).await?;
+        outcome.truncated = truncated;
+        outcome.next_start_after = next_start_after;
+        Ok(outcome)
     }
 
     /// Human: Probes SQLite pools and blob directory writability for orchestrator readiness checks.
@@ -751,6 +1091,128 @@ impl StorageEngine {
                 }
             }
         }
+    }
+
+    /// Returns the count of active objects under `prefix` without listing every key.
+    pub async fn count_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<ListCountResult, StorageError> {
+        let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
+        let prefix = prefix.unwrap_or("");
+        if self.metadata_mode.is_blob_only() {
+            let keys = self
+                .list_blob_only_keys(&bucket, Some(prefix), i64::MAX as usize)
+                .await?;
+            return Ok(ListCountResult {
+                count: keys.len() as u64,
+                prefix: Some(prefix.to_string()),
+            });
+        }
+        let prefix_pattern = format!("{}%", escape_like_pattern(prefix));
+        let count = self
+            .object_meta
+            .count_active_with_prefix(&bucket, &prefix_pattern)
+            .await?;
+        Ok(ListCountResult {
+            count: count.max(0) as u64,
+            prefix: Some(prefix.to_string()),
+        })
+    }
+
+    async fn fetch_blob_only_metadata(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<ObjectMetadata, StorageError> {
+        let path = blob_path(&self.data_dir, bucket, key);
+        if !path.exists() {
+            return Err(StorageError::NotFound);
+        }
+        let fs_meta = fs::metadata(&path).await.map_err(internal)?;
+        let file_len = fs_meta.len();
+        let path_for_size = path.clone();
+        let logical = tokio::task::spawn_blocking(move || {
+            match std::fs::File::open(&path_for_size) {
+                Ok(f) => super::compression::read_blob_header_size(f).unwrap_or(file_len),
+                Err(_) => file_len,
+            }
+        })
+        .await
+        .map_err(internal)?;
+        let now = chrono::Utc::now();
+        let updated_at = fs_meta
+            .modified()
+            .ok()
+            .map(chrono::DateTime::<chrono::Utc>::from)
+            .unwrap_or(now);
+        Ok(ObjectMetadata {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            size: logical as i64,
+            mime_type: None,
+            etag: None,
+            created_at: updated_at,
+            updated_at,
+            custom_meta: None,
+            deleted_at: None,
+            storage_class: None,
+            origin_node: None,
+        })
+    }
+
+    async fn list_blob_only_keys(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let bucket_dir = std::path::PathBuf::from(self.data_dir()).join(bucket);
+        if !bucket_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let prefix = prefix.unwrap_or("");
+        let mut keys = Vec::new();
+        let mut stack = vec![bucket_dir.clone()];
+        while let Some(dir) = stack.pop() {
+            if keys.len() >= limit {
+                break;
+            }
+            let mut rd = fs::read_dir(&dir).await.map_err(internal)?;
+            while let Some(ent) = rd.next_entry().await.map_err(internal)? {
+                if keys.len() >= limit {
+                    break;
+                }
+                let ft = ent.file_type().await.map_err(internal)?;
+                if ft.is_dir() {
+                    stack.push(ent.path());
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+                let rel = ent
+                    .path()
+                    .strip_prefix(&bucket_dir)
+                    .map_err(internal)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let key = rel
+                    .split_once('/')
+                    .map(|(_, k)| k.to_string())
+                    .unwrap_or(rel);
+                if key.is_empty() {
+                    continue;
+                }
+                if !prefix.is_empty() && !key.starts_with(prefix) {
+                    continue;
+                }
+                keys.push(key);
+            }
+        }
+        keys.sort();
+        Ok(keys)
     }
 
     pub async fn list_objects(

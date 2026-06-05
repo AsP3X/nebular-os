@@ -9,6 +9,9 @@ pub struct NosMetrics {
     pub bytes_uploaded_total: AtomicU64,
     pub bytes_downloaded_total: AtomicU64,
     pub replication_errors_total: AtomicU64,
+    pub objects_deleted_total: AtomicU64,
+    pub upload_rejected_total: AtomicU64,
+    pub orphan_gc_bytes_reclaimed_total: AtomicU64,
 }
 
 impl NosMetrics {
@@ -36,8 +39,24 @@ impl NosMetrics {
         self.replication_errors_total.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_objects_deleted(&self, n: u64) {
+        self.objects_deleted_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn inc_upload_rejected(&self) {
+        self.upload_rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_orphan_gc_bytes(&self, n: u64) {
+        self.orphan_gc_bytes_reclaimed_total.fetch_add(n, Ordering::Relaxed);
+    }
+
     pub fn replication_errors_total(&self) -> u64 {
         self.replication_errors_total.load(Ordering::Relaxed)
+    }
+
+    pub fn upload_in_flight_bytes(&self, budget: Option<&super::middleware::UploadBudget>) -> u64 {
+        budget.map(|b| b.in_flight_bytes()).unwrap_or(0)
     }
 
     /// Renders Prometheus exposition format for scrape targets.
@@ -47,6 +66,7 @@ impl NosMetrics {
         total_bytes: i64,
         replication_pending_events: u64,
         storage_class_counts: &[(String, i64)],
+        upload_in_flight_bytes: u64,
     ) -> String {
         let mut out = format!(
             "# HELP nos_http_requests_total Total HTTP requests handled.\n\
@@ -61,6 +81,18 @@ impl NosMetrics {
              # HELP nos_bytes_downloaded_total Total downloaded bytes.\n\
              # TYPE nos_bytes_downloaded_total counter\n\
              nos_bytes_downloaded_total {}\n\
+             # HELP nos_objects_deleted_total Objects deleted via batch/prefix delete.\n\
+             # TYPE nos_objects_deleted_total counter\n\
+             nos_objects_deleted_total {}\n\
+             # HELP nos_upload_rejected_total Upload requests rejected due to capacity.\n\
+             # TYPE nos_upload_rejected_total counter\n\
+             nos_upload_rejected_total {}\n\
+             # HELP nos_orphan_gc_bytes_reclaimed_total Bytes reclaimed by orphan GC.\n\
+             # TYPE nos_orphan_gc_bytes_reclaimed_total counter\n\
+             nos_orphan_gc_bytes_reclaimed_total {}\n\
+             # HELP nos_upload_in_flight_bytes Current weighted upload buffer usage.\n\
+             # TYPE nos_upload_in_flight_bytes gauge\n\
+             nos_upload_in_flight_bytes {}\n\
              # HELP nos_objects_total Live objects in metadata DB.\n\
              # TYPE nos_objects_total gauge\n\
              nos_objects_total {}\n\
@@ -80,6 +112,10 @@ impl NosMetrics {
             self.http_errors_total.load(Ordering::Relaxed),
             self.bytes_uploaded_total.load(Ordering::Relaxed),
             self.bytes_downloaded_total.load(Ordering::Relaxed),
+            self.objects_deleted_total.load(Ordering::Relaxed),
+            self.upload_rejected_total.load(Ordering::Relaxed),
+            self.orphan_gc_bytes_reclaimed_total.load(Ordering::Relaxed),
+            upload_in_flight_bytes,
             total_objects,
             total_bytes,
             total_bytes,

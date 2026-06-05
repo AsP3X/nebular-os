@@ -7,8 +7,10 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::routes::helpers::write_context_from_headers;
 use crate::routes::AppState;
 use crate::s3_compat::{self, xml};
+use crate::storage::types::DeletePrefixResponse;
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -16,9 +18,17 @@ pub struct ListQuery {
     delimiter: Option<String>,
     limit: Option<u64>,
     start_after: Option<String>,
+    count_only: Option<bool>,
     /// S3 ListObjectsV2 uses `list-type=2`; we accept it when `NOS_S3_COMPAT` is enabled.
     #[serde(rename = "list-type")]
     list_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeletePrefixQuery {
+    prefix: String,
+    limit: Option<u64>,
+    start_after: Option<String>,
 }
 
 /// Human: List object keys in a bucket; returns JSON by default or S3 ListObjectsV2 XML when compat is on.
@@ -34,12 +44,28 @@ pub async fn list_objects(
     // Human: Decide response shape before we hit storage so errors use the same format the client expects.
     // Agent: use_s3_xml IF NOS_S3_COMPAT AND (list-type=2 OR wants_s3_response Accept/query).
     let use_s3_xml = state.config.s3_compat
+        && query.count_only != Some(true)
         && (query.list_type.as_deref() == Some("2")
             || s3_compat::wants_s3_response(
                 req.headers(),
                 req.uri().query(),
                 state.config.s3_compat,
             ));
+
+    if query.count_only == Some(true) {
+        match state
+            .backend()
+            .count_objects_by_prefix(&bucket, query.prefix.as_deref())
+            .await
+        {
+            Ok(result) => return Json(result).into_response(),
+            Err(e) => {
+                tracing::error!(%bucket, error = %e, "count_objects_by_prefix failed");
+                let (status, json) = crate::routes::errors::map_storage_error(e);
+                return (status, json).into_response();
+            }
+        }
+    }
 
     match state
         .backend()
@@ -80,6 +106,52 @@ pub async fn list_objects(
                     true,
                 );
             }
+            (status, json).into_response()
+        }
+    }
+}
+
+/// Human: Bulk-delete active objects under a key prefix in one server-side batch.
+/// Agent: DELETE /{bucket}?prefix=…; parallel blob drops + single metadata transaction; JSON { deleted, failed, truncated }.
+pub async fn delete_objects_by_prefix(
+    State(state): State<Arc<AppState>>,
+    Path(bucket): Path<String>,
+    Query(query): Query<DeletePrefixQuery>,
+    req: Request,
+) -> impl IntoResponse {
+    tracing::info!(
+        %bucket,
+        prefix = %query.prefix,
+        limit = ?query.limit,
+        "delete_objects_by_prefix started"
+    );
+
+    let write_ctx = write_context_from_headers(req.headers(), None);
+    match state
+        .backend()
+        .delete_objects_by_prefix(
+            &bucket,
+            &query.prefix,
+            query.limit,
+            query.start_after.as_deref(),
+            Some(&write_ctx),
+        )
+        .await
+    {
+        Ok(outcome) => {
+            state.metrics.add_objects_deleted(outcome.deleted);
+            tracing::info!(
+                %bucket,
+                deleted = outcome.deleted,
+                failed = outcome.failed.len(),
+                truncated = outcome.truncated,
+                "delete_objects_by_prefix completed"
+            );
+            Json(DeletePrefixResponse::from(outcome)).into_response()
+        }
+        Err(e) => {
+            tracing::error!(%bucket, error = %e, "delete_objects_by_prefix failed");
+            let (status, json) = crate::routes::errors::map_storage_error(e);
             (status, json).into_response()
         }
     }

@@ -73,6 +73,9 @@ pub async fn metrics(
             total_bytes,
             replication_pending_events,
             &storage_class_counts,
+            state
+                .metrics
+                .upload_in_flight_bytes(state.upload_budget.as_deref()),
         );
         return Ok((
             StatusCode::OK,

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::cluster::ClusterConfig;
 use crate::storage::metadata_backend::MetadataBackendKind;
+use crate::storage::metadata_mode::MetadataMode;
 
 /// Human: Optional per-subject bucket allow-lists loaded from NOS_BUCKET_POLICY JSON.
 /// Agent: EMPTY map => allow all buckets; non-empty => sub must list bucket explicitly.
@@ -37,6 +38,7 @@ pub struct NosConfig {
     pub data_dir: String,
     pub meta_path: String,
     pub metadata_backend: MetadataBackendKind,
+    pub metadata_mode: MetadataMode,
     pub metadata_database_url: Option<String>,
     pub max_logical_bytes: i64,
     pub jwt_secret: String,
@@ -56,6 +58,12 @@ pub struct NosConfig {
     pub rate_limit_rps: u32,
     pub rate_limit_burst: u32,
     pub list_scan_cap: i64,
+    pub bulk_delete_concurrency: usize,
+    pub bulk_delete_batch_limit: u64,
+    pub upload_max_in_flight_bytes: u64,
+    pub upload_permit_unit: u64,
+    pub orphan_gc_interval_secs: u64,
+    pub rate_limit_bypass_roles: Vec<String>,
     pub multipart_part_size: usize,
     pub read_pool_size: u32,
     pub cors_origins: Vec<String>,
@@ -107,6 +115,8 @@ impl fmt::Debug for NosConfig {
             .field("rate_limit_rps", &self.rate_limit_rps)
             .field("rate_limit_burst", &self.rate_limit_burst)
             .field("list_scan_cap", &self.list_scan_cap)
+            .field("bulk_delete_concurrency", &self.bulk_delete_concurrency)
+            .field("bulk_delete_batch_limit", &self.bulk_delete_batch_limit)
             .field("multipart_part_size", &self.multipart_part_size)
             .field("read_pool_size", &self.read_pool_size)
             .field("cors_origins", &self.cors_origins)
@@ -140,6 +150,10 @@ impl NosConfig {
             metadata_backend: {
                 let raw = env::var("NOS_METADATA_BACKEND").unwrap_or_else(|_| "sqlite".into());
                 MetadataBackendKind::parse_env(&raw).map_err(anyhow::Error::msg)?
+            },
+            metadata_mode: {
+                let raw = env::var("NOS_METADATA_MODE").unwrap_or_else(|_| "full".into());
+                MetadataMode::parse_env(&raw).map_err(anyhow::Error::msg)?
             },
             metadata_database_url: env::var("NOS_METADATA_DATABASE_URL")
                 .ok()
@@ -221,6 +235,52 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_LIST_SCAN_CAP must be a valid i64"))
                 .transpose()?
                 .unwrap_or(4096),
+            bulk_delete_concurrency: env::var("NOS_BULK_DELETE_CONCURRENCY")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_BULK_DELETE_CONCURRENCY must be a valid usize")
+                })
+                .transpose()?
+                .unwrap_or(32),
+            bulk_delete_batch_limit: env::var("NOS_BULK_DELETE_BATCH_LIMIT")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_BULK_DELETE_BATCH_LIMIT must be a valid u64")
+                })
+                .transpose()?
+                .unwrap_or(1000),
+            upload_max_in_flight_bytes: env::var("NOS_UPLOAD_MAX_IN_FLIGHT_BYTES")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_UPLOAD_MAX_IN_FLIGHT_BYTES must be a valid u64")
+                })
+                .transpose()?
+                .unwrap_or(32 * 1024 * 1024),
+            upload_permit_unit: env::var("NOS_UPLOAD_PERMIT_UNIT")
+                .ok()
+                .map(|s| s.parse().context("NOS_UPLOAD_PERMIT_UNIT must be a valid u64"))
+                .transpose()?
+                .unwrap_or(5 * 1024 * 1024),
+            orphan_gc_interval_secs: env::var("NOS_ORPHAN_GC_INTERVAL_SECS")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_ORPHAN_GC_INTERVAL_SECS must be a valid u64")
+                })
+                .transpose()?
+                .unwrap_or(0),
+            rate_limit_bypass_roles: env::var("NOS_RATE_LIMIT_BYPASS_ROLES")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|r| r.trim().to_ascii_lowercase())
+                        .filter(|r| !r.is_empty())
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["admin".into()]),
             multipart_part_size: env::var("NOS_MULTIPART_PART_SIZE")
                 .ok()
                 .map(|s| s.parse().context("NOS_MULTIPART_PART_SIZE must be a valid usize"))
@@ -314,6 +374,7 @@ impl NosConfig {
             );
         }
         if self.metadata_backend == MetadataBackendKind::Postgres
+            && self.metadata_mode != MetadataMode::BlobOnly
             && self.cluster.mode != crate::cluster::config::ClusterMode::Standalone
         {
             anyhow::bail!(

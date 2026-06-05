@@ -160,11 +160,103 @@ paths:
         - in: query
           name: start_after
           schema: { type: string }
+        - in: query
+          name: count_only
+          schema:
+            type: boolean
+            description: Return object count under prefix without listing keys
       responses:
         "200":
           description: List result with pagination fields
         "401":
           $ref: "#/components/responses/Unauthorized"
+    delete:
+      summary: Bulk delete objects by key prefix
+      description: >
+        Deletes up to `delete_prefix_batch_limit` active objects per request.
+        Returns `{ deleted, failed, truncated, next_start_after? }`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - in: query
+          name: prefix
+          required: true
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+        - in: query
+          name: start_after
+          schema: { type: string }
+      responses:
+        "200":
+          description: Prefix delete result
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /{bucket}/_batch_delete:
+    post:
+      summary: Batch delete explicit object keys
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keys]
+              properties:
+                keys:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Batch delete result `{ deleted, failed, truncated? }`
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /_nos/maintenance/orphans:
+    get:
+      summary: List orphan blobs (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: bucket
+          schema: { type: string }
+        - in: query
+          name: prefix
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Orphan list
+        "403":
+          description: Admin role required
+  /_nos/maintenance/gc_orphans:
+    post:
+      summary: Remove orphan blobs (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: bucket
+          schema: { type: string }
+        - in: query
+          name: prefix
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer }
+      responses:
+        "200":
+          description: GC report
+        "403":
+          description: Admin role required
   /{bucket}/{key}:
     put:
       summary: Upload or copy object

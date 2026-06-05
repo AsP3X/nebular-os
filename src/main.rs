@@ -43,8 +43,11 @@ async fn main() -> Result<()> {
         dedup_block_size: cfg.dedup_block_size,
         dedup_min_size: cfg.dedup_min_size,
         metadata_backend: cfg.metadata_backend,
+        metadata_mode: cfg.metadata_mode,
         metadata_database_url: cfg.metadata_database_url.clone(),
         max_logical_bytes: cfg.max_logical_bytes,
+        bulk_delete_concurrency: cfg.bulk_delete_concurrency,
+        bulk_delete_batch_limit: cfg.bulk_delete_batch_limit,
     };
 
     let storage = storage::engine::StorageEngine::with_full_options(
@@ -79,14 +82,21 @@ async fn main() -> Result<()> {
     }
 
     if cfg.recompress_on_startup {
-        let report = storage
-            .recompress_blobs(cfg.recompress_batch_size)
-            .await?;
-        tracing::info!(?report, "Startup blob recompression finished");
-        if cfg.zstd_dict_enabled {
-            let dict_report = storage.train_zstd_dictionary().await?;
-            tracing::info!(?dict_report, "Startup dictionary training finished");
-        }
+        let engine = storage.clone();
+        let batch = cfg.recompress_batch_size;
+        let dict = cfg.zstd_dict_enabled;
+        tokio::spawn(async move {
+            match engine.recompress_blobs(batch).await {
+                Ok(report) => tracing::info!(?report, "Background startup blob recompression finished"),
+                Err(e) => tracing::error!(error = %e, "Background startup blob recompression failed"),
+            }
+            if dict {
+                match engine.train_zstd_dictionary().await {
+                    Ok(report) => tracing::info!(?report, "Background startup dictionary training finished"),
+                    Err(e) => tracing::error!(error = %e, "Background startup dictionary training failed"),
+                }
+            }
+        });
     }
 
     if cfg.reconcile_interval_secs > 0 {
@@ -127,12 +137,15 @@ fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::N
     let purge_soft = cfg.soft_delete_ttl_secs > 0;
     let purge_multipart = cfg.multipart_upload_ttl_secs > 0;
     let recompress = cfg.recompress_interval_secs > 0;
-    if !purge_soft && !purge_multipart && !recompress {
+    let orphan_gc = cfg.orphan_gc_interval_secs > 0;
+    if !purge_soft && !purge_multipart && !recompress && !orphan_gc {
         return;
     }
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(300));
+        let mut orphan_ticker = orphan_gc
+            .then(|| tokio::time::interval(Duration::from_secs(cfg.orphan_gc_interval_secs)));
         loop {
             ticker.tick().await;
             if purge_soft {
@@ -167,6 +180,16 @@ fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::N
                         Ok(_) => {}
                         Err(e) => tracing::error!(error = %e, "Dictionary training failed"),
                     }
+                }
+            }
+            if let Some(t) = orphan_ticker.as_mut() {
+                t.tick().await;
+                match storage.gc_orphan_blobs(None, None, 500).await {
+                    Ok(report) if report.removed > 0 => {
+                        tracing::info!(?report, "Periodic orphan GC completed")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "Periodic orphan GC failed"),
                 }
             }
         }

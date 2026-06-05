@@ -4,7 +4,7 @@ use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
 use super::config::ClusterConfig;
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
-use crate::storage::types::{ListResult, ObjectMetadata};
+use crate::storage::types::{DeletePrefixOutcome, ListCountResult, ListResult, ObjectMetadata};
 
 use super::assigned::{AssignedBackend, AssignedInner};
 use super::assignment::WriteContext;
@@ -217,6 +217,55 @@ impl StorageBackend {
             Self::Standalone(b) => b.delete_object(bucket, key, if_match).await,
             Self::Replicated(b) => b.delete_object(bucket, key, if_match, write_ctx).await,
             Self::Assigned(b) => b.delete_object(bucket, key, if_match, write_ctx).await,
+        }
+    }
+
+    pub async fn delete_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: Option<u64>,
+        start_after: Option<&str>,
+        write_ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        match self {
+            Self::Standalone(b) => {
+                b.delete_objects_by_prefix(bucket, prefix, limit, start_after)
+                    .await
+            }
+            Self::Replicated(b) => {
+                b.delete_objects_by_prefix(bucket, prefix, limit, start_after, write_ctx)
+                    .await
+            }
+            Self::Assigned(b) => {
+                b.delete_objects_by_prefix(bucket, prefix, limit, start_after, write_ctx)
+                    .await
+            }
+        }
+    }
+
+    pub async fn delete_objects_batch(
+        &self,
+        bucket: &str,
+        keys: &[String],
+        write_ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        match self {
+            Self::Standalone(b) => b.delete_objects_batch(bucket, keys).await,
+            Self::Replicated(b) => b.delete_objects_batch(bucket, keys, write_ctx).await,
+            Self::Assigned(b) => b.delete_objects_batch(bucket, keys, write_ctx).await,
+        }
+    }
+
+    pub async fn count_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<ListCountResult, StorageError> {
+        match self {
+            Self::Standalone(b) => b.count_objects_by_prefix(bucket, prefix).await,
+            Self::Replicated(b) => b.count_objects_by_prefix(bucket, prefix).await,
+            Self::Assigned(b) => b.count_objects_by_prefix(bucket, prefix).await,
         }
     }
 

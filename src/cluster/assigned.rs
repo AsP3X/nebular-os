@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
-use crate::storage::types::{ListResult, ObjectMetadata};
+use crate::storage::types::{DeletePrefixFailure, DeletePrefixOutcome, ListCountResult, ListResult, ObjectMetadata};
 
 use super::assignment::{
     replication_group_for_write, AssignmentResolution, AssignmentRules, WriteContext,
@@ -311,6 +311,123 @@ impl AssignedBackend {
         match &self.inner {
             AssignedInner::Standalone(b) => b.delete_object(bucket, key, if_match).await,
             AssignedInner::Replicated(b) => b.delete_object(bucket, key, if_match, ctx).await,
+        }
+    }
+
+    pub async fn delete_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: Option<u64>,
+        start_after: Option<&str>,
+        ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        let local = match &self.inner {
+            AssignedInner::Standalone(b) => {
+                b.delete_objects_by_prefix(bucket, prefix, limit, start_after)
+                    .await
+            }
+            AssignedInner::Replicated(b) => {
+                b.delete_objects_by_prefix(bucket, prefix, limit, start_after, ctx)
+                    .await
+            }
+        }?;
+        self.fanout_delete_prefix(local, bucket, prefix, limit, start_after, ctx)
+            .await
+    }
+
+    pub async fn delete_objects_batch(
+        &self,
+        bucket: &str,
+        keys: &[String],
+        ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        let local = match &self.inner {
+            AssignedInner::Standalone(b) => b.delete_objects_batch(bucket, keys).await,
+            AssignedInner::Replicated(b) => b.delete_objects_batch(bucket, keys, ctx).await,
+        }?;
+        self.fanout_batch_delete(local, bucket, keys, ctx).await
+    }
+
+    async fn fanout_delete_prefix(
+        &self,
+        mut local: DeletePrefixOutcome,
+        bucket: &str,
+        prefix: &str,
+        limit: Option<u64>,
+        start_after: Option<&str>,
+        ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        if self.peers.peers.is_empty() {
+            return Ok(local);
+        }
+        for (peer_id, peer) in &self.peers.peers {
+            if peer_id == &self.cluster.node_id {
+                continue;
+            }
+            match forward::proxy_delete_prefix(
+                &peer.url,
+                bucket,
+                prefix,
+                limit,
+                start_after,
+                ctx,
+            )
+            .await
+            {
+                Ok(remote) => Self::merge_delete_outcome(&mut local, remote),
+                Err(e) => local.failed.push(DeletePrefixFailure {
+                    key: format!("peer:{peer_id}"),
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(local)
+    }
+
+    async fn fanout_batch_delete(
+        &self,
+        mut local: DeletePrefixOutcome,
+        bucket: &str,
+        keys: &[String],
+        ctx: Option<&WriteContext>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        if self.peers.peers.is_empty() {
+            return Ok(local);
+        }
+        for (peer_id, peer) in &self.peers.peers {
+            if peer_id == &self.cluster.node_id {
+                continue;
+            }
+            match forward::proxy_batch_delete(&peer.url, bucket, keys, ctx).await {
+                Ok(remote) => Self::merge_delete_outcome(&mut local, remote),
+                Err(e) => local.failed.push(DeletePrefixFailure {
+                    key: format!("peer:{peer_id}"),
+                    error: e.to_string(),
+                }),
+            }
+        }
+        Ok(local)
+    }
+
+    fn merge_delete_outcome(local: &mut DeletePrefixOutcome, remote: DeletePrefixOutcome) {
+        local.deleted += remote.deleted;
+        local.failed.extend(remote.failed);
+        local.truncated |= remote.truncated;
+        local.deleted_objects.extend(remote.deleted_objects);
+        if local.next_start_after.is_none() {
+            local.next_start_after = remote.next_start_after;
+        }
+    }
+
+    pub async fn count_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<ListCountResult, StorageError> {
+        match &self.inner {
+            AssignedInner::Standalone(b) => b.count_objects_by_prefix(bucket, prefix).await,
+            AssignedInner::Replicated(b) => b.count_objects_by_prefix(bucket, prefix).await,
         }
     }
 

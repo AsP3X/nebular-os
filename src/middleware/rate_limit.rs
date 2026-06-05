@@ -1,22 +1,24 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
-    http::StatusCode,
+    extract::{Request, State},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
-use dashmap::DashMap;
 use serde_json::json;
 
+use crate::auth::Claims;
 use crate::routes::AppState;
 
 pub struct ClientBucket {
-    tokens: f64,
-    last_refill: Instant,
+    pub tokens: f64,
+    pub last_refill: std::time::Instant,
+}
+
+pub fn new_rate_limit_map() -> Arc<dashmap::DashMap<String, ClientBucket>> {
+    Arc::new(dashmap::DashMap::new())
 }
 
 /// Per-IP token bucket limiting for protected routes.
@@ -30,14 +32,25 @@ pub async fn rate_limit_middleware(
         return next.run(req).await;
     }
 
+    if is_bulk_delete_exempt(&req) {
+        return next.run(req).await;
+    }
+
+    if let Some(claims) = req.extensions().get::<Claims>() {
+        let role = claims.role.to_ascii_lowercase();
+        if state.config.rate_limit_bypass_roles.iter().any(|r| r == &role) {
+            return next.run(req).await;
+        }
+    }
+
     let ip = req
         .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|c| c.0.to_string())
         .unwrap_or_else(|| "unknown".to_string());
     let burst = state.config.rate_limit_burst as f64;
     let rate = rps as f64;
-    let now = Instant::now();
+    let now = std::time::Instant::now();
 
     let mut entry = state
         .rate_limiters
@@ -53,17 +66,26 @@ pub async fn rate_limit_middleware(
 
     if entry.tokens < 1.0 {
         state.metrics.inc_errors();
-        return (
+        let mut resp = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({ "error": "rate limit exceeded" })),
         )
             .into_response();
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return resp;
     }
 
     entry.tokens -= 1.0;
     next.run(req).await
 }
 
-pub fn new_rate_limit_map() -> Arc<DashMap<String, ClientBucket>> {
-    Arc::new(DashMap::new())
+fn is_bulk_delete_exempt(req: &Request) -> bool {
+    if req.method() == Method::DELETE {
+        let query = req.uri().query().unwrap_or("");
+        if query.contains("prefix=") {
+            return true;
+        }
+    }
+    req.uri().path().ends_with("/_batch_delete")
 }

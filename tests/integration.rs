@@ -50,6 +50,7 @@ fn test_config_with_cap(
         data_dir: "./data/blobs".into(),
         meta_path: "./data/meta/metadata.db".into(),
         metadata_backend: nebular_os::storage::metadata_backend::MetadataBackendKind::Sqlite,
+        metadata_mode: nebular_os::storage::metadata_mode::MetadataMode::Full,
         metadata_database_url: None,
         max_logical_bytes,
         jwt_secret: TEST_SECRET.into(),
@@ -69,6 +70,12 @@ fn test_config_with_cap(
         rate_limit_rps: 0,
         rate_limit_burst: 50,
         list_scan_cap: 4096,
+        bulk_delete_concurrency: 32,
+        bulk_delete_batch_limit: 1000,
+        upload_max_in_flight_bytes: 32 * 1024 * 1024,
+        upload_permit_unit: 5 * 1024 * 1024,
+        orphan_gc_interval_secs: 0,
+        rate_limit_bypass_roles: vec!["admin".into()],
         multipart_part_size: 8 * 1024 * 1024,
         read_pool_size: 2,
         cors_origins: vec![],
@@ -242,6 +249,137 @@ async fn test_list_objects() {
         .collect();
     assert!(keys.contains(&"a.mp3".to_string()));
     assert!(keys.contains(&"b.mp3".to_string()));
+}
+
+#[tokio::test]
+async fn test_delete_objects_by_prefix() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    for key in &["purge/a.bin", "purge/b.bin", "keep/c.bin"] {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/music/{key}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("data"))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri("/music?prefix=purge/")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["deleted"], 2);
+    assert_eq!(json["failed"].as_array().unwrap().len(), 0);
+    assert_eq!(json["truncated"], false);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    let keys: Vec<String> = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["key"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(keys, vec!["keep/c.bin".to_string()]);
+}
+
+#[tokio::test]
+async fn test_capabilities_advertises_delete_prefix() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_nos/capabilities")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["api"]["delete_prefix"], true);
+    assert_eq!(json["api"]["batch_delete"], true);
+    assert_eq!(json["api"]["list_count_only"], true);
+    assert!(json["api"]["delete_prefix_batch_limit"].as_u64().unwrap() >= 1);
+    assert!(json["api"]["bulk_delete_concurrency"].as_u64().unwrap() >= 1);
+}
+
+#[tokio::test]
+async fn test_batch_delete() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    for key in &["batch/a.bin", "batch/b.bin", "keep/x.bin"] {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/music/{key}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("data"))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/music/_batch_delete")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"keys":["batch/a.bin","batch/b.bin"]}"#))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["deleted"], 2);
+}
+
+#[tokio::test]
+async fn test_list_count_only() {
+    let (app, token, _tmp) = setup_app(None, false).await;
+
+    for key in &["count/a.bin", "count/b.bin"] {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/music/{key}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from("x"))
+            .unwrap();
+        app.clone().oneshot(req).await.unwrap();
+    }
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music?prefix=count/&count_only=true")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["count"], 2);
 }
 
 #[tokio::test]

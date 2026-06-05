@@ -1,7 +1,7 @@
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
-use crate::storage::types::{ListResult, ObjectMetadata};
+use crate::storage::types::{DeletePrefixOutcome, ListCountResult, ListResult, ObjectMetadata};
 
 /// Human: Phase 0 facade — every HTTP storage call delegates to the local engine unchanged.
 /// Agent: StandaloneBackend wraps StorageEngine Clone; ClusterBackend variant added in later phases.
@@ -101,6 +101,34 @@ impl StandaloneBackend {
         if_match: Option<&str>,
     ) -> Result<(), StorageError> {
         self.0.delete_object(bucket, key, if_match).await
+    }
+
+    pub async fn delete_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: Option<u64>,
+        start_after: Option<&str>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        self.0
+            .delete_objects_by_prefix(bucket, prefix, limit, start_after)
+            .await
+    }
+
+    pub async fn delete_objects_batch(
+        &self,
+        bucket: &str,
+        keys: &[String],
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        self.0.delete_objects_batch(bucket, keys).await
+    }
+
+    pub async fn count_objects_by_prefix(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<ListCountResult, StorageError> {
+        self.0.count_objects_by_prefix(bucket, prefix).await
     }
 
     pub async fn list_objects(
