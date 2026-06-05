@@ -26,12 +26,11 @@ impl DictStore {
     }
 
     pub fn load(&self, id: u16) -> Result<Option<Arc<Vec<u8>>>, StorageError> {
-        if id == 0 {
-            if let Ok(guard) = self.cache.read() {
-                if let Some(dict) = guard.as_ref() {
-                    return Ok(Some(dict.clone()));
-                }
-            }
+        if id == 0
+            && let Ok(guard) = self.cache.read()
+            && let Some(dict) = guard.as_ref()
+        {
+            return Ok(Some(dict.clone()));
         }
         let path = self.dict_path(id);
         if !path.exists() {
@@ -42,10 +41,8 @@ impl DictStore {
             return Ok(None);
         }
         let arc = Arc::new(bytes);
-        if id == 0 {
-            if let Ok(mut guard) = self.cache.write() {
-                *guard = Some(arc.clone());
-            }
+        if id == 0 && let Ok(mut guard) = self.cache.write() {
+            *guard = Some(arc.clone());
         }
         Ok(Some(arc))
     }
@@ -56,10 +53,8 @@ impl DictStore {
             std::fs::create_dir_all(parent).map_err(|e| internal(anyhow::anyhow!(e)))?;
         }
         std::fs::write(&path, dict).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        if id == 0 {
-            if let Ok(mut guard) = self.cache.write() {
-                *guard = Some(Arc::new(dict.to_vec()));
-            }
+        if id == 0 && let Ok(mut guard) = self.cache.write() {
+            *guard = Some(Arc::new(dict.to_vec()));
         }
         Ok(())
     }
@@ -108,10 +103,8 @@ impl DictStore {
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| internal(anyhow::anyhow!(e)))?;
         }
-        if id == 0 {
-            if let Ok(mut guard) = self.cache.write() {
-                *guard = None;
-            }
+        if id == 0 && let Ok(mut guard) = self.cache.write() {
+            *guard = None;
         }
         Ok(())
     }

@@ -41,10 +41,10 @@ pub async fn finalize_temp_to_blob(
     logical_size: u64,
     opts: BlobFinalizeOptions,
 ) -> Result<(), StorageError> {
-    if let Some(existing) = &opts.existing_blob {
-        if existing.exists() {
-            BlockStore::release_blob(&opts.system_pool, &opts.data_dir, existing).await?;
-        }
+    if let Some(existing) = &opts.existing_blob
+        && existing.exists()
+    {
+        BlockStore::release_blob(&opts.system_pool, &opts.data_dir, existing).await?;
     }
 
     if let Some(parent) = final_path.parent() {
