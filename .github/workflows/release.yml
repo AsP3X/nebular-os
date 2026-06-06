@@ -26,75 +26,63 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive: tar.gz
             bin: nebular-os
             cross: false
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            archive: tar.gz
             bin: nebular-os
             cross: false
           - name: linux-i686
             os: ubuntu-latest
             target: i686-unknown-linux-gnu
-            archive: tar.gz
             bin: nebular-os
             cross: true
           - name: linux-armv7
             os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
-            archive: tar.gz
             bin: nebular-os
             cross: true
           - name: linux-riscv64
             os: ubuntu-latest
             target: riscv64gc-unknown-linux-gnu
-            archive: tar.gz
             bin: nebular-os
             cross: true
           - name: linux-ppc64le
             os: ubuntu-latest
             target: powerpc64le-unknown-linux-gnu
-            archive: tar.gz
             bin: nebular-os
             cross: true
           - name: linux-s390x
             os: ubuntu-latest
             target: s390x-unknown-linux-gnu
-            archive: tar.gz
             bin: nebular-os
             cross: true
           # Windows — MSVC on windows-latest
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: zip
             bin: nebular-os.exe
             cross: false
           - name: windows-aarch64
             os: windows-latest
             target: aarch64-pc-windows-msvc
-            archive: zip
             bin: nebular-os.exe
             cross: false
           - name: windows-i686
             os: windows-latest
             target: i686-pc-windows-msvc
-            archive: zip
             bin: nebular-os.exe
             cross: false
           # macOS — Intel and Apple Silicon
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
-            archive: tar.gz
             bin: nebular-os
             cross: false
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
-            archive: tar.gz
             bin: nebular-os
             cross: false
 
@@ -125,30 +113,22 @@ jobs:
           fi
 
       - name: Strip (Unix, native)
-        if: matrix.archive == 'tar.gz' && matrix.cross == false
+        if: matrix.os != 'windows-latest' && matrix.cross == false
         run: strip "target/${{ matrix.target }}/release/${{ matrix.bin }}"
 
-      - name: Package (tar.gz)
-        if: matrix.archive == 'tar.gz'
+      - name: Stage release binary
         shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          STAGING="nebular-os-${VERSION}-${{ matrix.name }}"
-          mkdir -p "$STAGING"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$STAGING/"
-          tar -czf "${STAGING}.tar.gz" -C . "$STAGING"
-          echo "ASSET=${STAGING}.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Package (zip)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
-          $staging = "nebular-os-$version-${{ matrix.name }}"
-          New-Item -ItemType Directory -Path $staging
-          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" $staging/
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          ASSET="nebular-os-${VERSION}-${{ matrix.name }}"
+          if [ "${{ matrix.bin }}" = "nebular-os.exe" ]; then
+            ASSET="${ASSET}.exe"
+          fi
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$ASSET"
+          if [ "${{ matrix.bin }}" != "nebular-os.exe" ]; then
+            chmod +x "$ASSET"
+          fi
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

@@ -126,7 +126,7 @@ Cluster routes (Bearer `NOS_CLUSTER_TOKEN`, or `NOS_CLUSTER_BOOTSTRAP_TOKEN` unt
 
 ```toml
 [dependencies]
-nebular-os = { git = "https://github.com/AsP3X/nebular-os.git", tag = "v0.1.2" }
+nebular-os = { git = "https://github.com/AsP3X/nebular-os.git", tag = "v0.1.3" }
 ```
 
 **Path (local development):**
@@ -176,8 +176,8 @@ docker pull ghcr.io/asp3x/nebular-os:latest
 
 Tagged releases publish standalone binaries on
 [GitHub Releases](https://github.com/AsP3X/nebular-os/releases). Push a `v*` tag
-to run the release workflow. Assets are named `nebular-os-<version>-<platform>.<ext>`
-with a `SHA256SUMS.txt` checksum file.
+to run the release workflow. Assets are named `nebular-os-<version>-<platform>`
+(`.exe` on Windows) with a `SHA256SUMS.txt` checksum file.
 
 | Platform | Architectures |
 |----------|---------------|
@@ -188,10 +188,10 @@ with a `SHA256SUMS.txt` checksum file.
 Example (Linux x86_64):
 
 ```bash
-VERSION=0.1.2
-curl -LO "https://github.com/AsP3X/nebular-os/releases/download/v${VERSION}/nebular-os-${VERSION}-linux-x86_64.tar.gz"
-tar -xzf "nebular-os-${VERSION}-linux-x86_64.tar.gz"
-./nebular-os-${VERSION}-linux-x86_64/nebular-os
+VERSION=0.1.3
+curl -LO "https://github.com/AsP3X/nebular-os/releases/download/v${VERSION}/nebular-os-${VERSION}-linux-x86_64"
+chmod +x "nebular-os-${VERSION}-linux-x86_64"
+./nebular-os-${VERSION}-linux-x86_64
 ```
 
 ```bash

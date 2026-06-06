@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-06-07
+
+### Changed
+
+- GitHub release assets are published as bare platform binaries (`nebular-os-<version>-<platform>`, `.exe` on Windows) instead of tar.gz/zip archives.
+
 ## [0.1.2] — 2026-06-06
 
 ### Added
@@ -68,6 +74,7 @@ See `.env.example` and `README.md` for full operator notes, including alignment 
 - Cluster modes: standalone, replicated, assigned, replicated+assigned; runtime config via `PUT /_cluster/config` and bootstrap token.
 - Write preconditions (`If-Match`, `If-None-Match`), readiness probe (`/health/ready`), and metrics (`/metrics` JSON or Prometheus text).
 
-[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.3
 [0.1.2]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.2
 [0.1.0]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.0
