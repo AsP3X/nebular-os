@@ -36,10 +36,10 @@ urlencoding = "2"
 zstd = "0.13"
 bytes = "1"
 tokio-stream = "0.1"
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 testcontainers = "0.23"
