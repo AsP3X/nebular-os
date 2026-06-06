@@ -6,8 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-06-06
+
 ### Added
 
+- **GitHub Releases** with standalone binaries for Linux (x86_64, aarch64, i686, armv7, riscv64, ppc64le, s390x, loongarch64), Windows (x86_64, aarch64, i686), and macOS (x86_64, aarch64), plus `SHA256SUMS.txt`.
 - **Postgres metadata backend** (`NOS_METADATA_BACKEND=postgres`): object index in Postgres (`nos_objects`, `nos_multipart_uploads`, `nos_multipart_parts`) while blobs stay on disk under `NOS_DATA_DIR`. Migrations ship in `migrations/001_nos_object_index.sql`.
 - **SQLite metadata backend** remains the default (`NOS_METADATA_BACKEND=sqlite` or unset); behavior for existing deployments is unchanged when env vars are not set.
 - **Per-node logical byte cap** via `NOS_MAX_LOGICAL_BYTES` (0 = unlimited). PUT and multipart complete reject when active `logical_bytes` plus incoming size would exceed the cap, returning **HTTP 507** with `{"error":"insufficient storage"}`.
@@ -23,6 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- HTTP client uses **rustls** instead of OpenSSL-native TLS for easier cross-platform release builds.
 - Cluster runtime config persistence uses the active metadata backend (SQLite `cluster_runtime_config` or Postgres `nos_cluster_runtime_config`).
 - In postgres mode, a sidecar SQLite file at `NOS_META_PATH` still hosts `replication_log` for cluster replication; **postgres + non-standalone cluster modes are rejected at startup**.
 - PUT and multipart complete now finalize through `blob_finalize` (compress with upload level, or dedup when enabled). GET transparently reads **NOSZ**, **NOS2**, **NOSD**, and legacy raw blobs.
@@ -64,5 +68,6 @@ See `.env.example` and `README.md` for full operator notes, including alignment 
 - Cluster modes: standalone, replicated, assigned, replicated+assigned; runtime config via `PUT /_cluster/config` and bootstrap token.
 - Write preconditions (`If-Match`, `If-None-Match`), readiness probe (`/health/ready`), and metrics (`/metrics` JSON or Prometheus text).
 
-[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.2
 [0.1.0]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.0

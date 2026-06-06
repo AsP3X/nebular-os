@@ -126,7 +126,7 @@ Cluster routes (Bearer `NOS_CLUSTER_TOKEN`, or `NOS_CLUSTER_BOOTSTRAP_TOKEN` unt
 
 ```toml
 [dependencies]
-nebular-os = { git = "https://github.com/AsP3X/nebular-os.git", tag = "v0.1.0" }
+nebular-os = { git = "https://github.com/AsP3X/nebular-os.git", tag = "v0.1.2" }
 ```
 
 **Path (local development):**
@@ -188,7 +188,7 @@ with a `SHA256SUMS.txt` checksum file.
 Example (Linux x86_64):
 
 ```bash
-VERSION=0.1.0
+VERSION=0.1.2
 curl -LO "https://github.com/AsP3X/nebular-os/releases/download/v${VERSION}/nebular-os-${VERSION}-linux-x86_64.tar.gz"
 tar -xzf "nebular-os-${VERSION}-linux-x86_64.tar.gz"
 ./nebular-os-${VERSION}-linux-x86_64/nebular-os
