@@ -174,9 +174,25 @@ Published images (linux/amd64 and linux/arm64) are on GitHub Container Registry:
 docker pull ghcr.io/asp3x/nebular-os:latest
 ```
 
-Tagged releases also publish platform binaries (Linux, Windows, macOS) on
+Tagged releases publish standalone binaries on
 [GitHub Releases](https://github.com/AsP3X/nebular-os/releases). Push a `v*` tag
-to run the release workflow.
+to run the release workflow. Assets are named `nebular-os-<version>-<platform>.<ext>`
+with a `SHA256SUMS.txt` checksum file.
+
+| Platform | Architectures |
+|----------|---------------|
+| Linux | x86_64, aarch64, i686, armv7, riscv64, ppc64le, s390x, loongarch64 |
+| Windows | x86_64, aarch64, i686 |
+| macOS | x86_64 (Intel), aarch64 (Apple Silicon) |
+
+Example (Linux x86_64):
+
+```bash
+VERSION=0.1.0
+curl -LO "https://github.com/AsP3X/nebular-os/releases/download/v${VERSION}/nebular-os-${VERSION}-linux-x86_64.tar.gz"
+tar -xzf "nebular-os-${VERSION}-linux-x86_64.tar.gz"
+./nebular-os-${VERSION}-linux-x86_64/nebular-os
+```
 
 ```bash
 docker build -t nebular-os .

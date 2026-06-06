@@ -22,31 +22,87 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux — native runners where available, cross for the rest
           - name: linux-x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             bin: nebular-os
+            cross: false
           - name: linux-aarch64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
             bin: nebular-os
+            cross: false
+          - name: linux-i686
+            os: ubuntu-latest
+            target: i686-unknown-linux-gnu
+            archive: tar.gz
+            bin: nebular-os
+            cross: true
+          - name: linux-armv7
+            os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            archive: tar.gz
+            bin: nebular-os
+            cross: true
+          - name: linux-riscv64
+            os: ubuntu-latest
+            target: riscv64gc-unknown-linux-gnu
+            archive: tar.gz
+            bin: nebular-os
+            cross: true
+          - name: linux-ppc64le
+            os: ubuntu-latest
+            target: powerpc64le-unknown-linux-gnu
+            archive: tar.gz
+            bin: nebular-os
+            cross: true
+          - name: linux-s390x
+            os: ubuntu-latest
+            target: s390x-unknown-linux-gnu
+            archive: tar.gz
+            bin: nebular-os
+            cross: true
+          - name: linux-loongarch64
+            os: ubuntu-latest
+            target: loongarch64-unknown-linux-gnu
+            archive: tar.gz
+            bin: nebular-os
+            cross: true
+          # Windows — MSVC on windows-latest
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
             bin: nebular-os.exe
+            cross: false
+          - name: windows-aarch64
+            os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            bin: nebular-os.exe
+            cross: false
+          - name: windows-i686
+            os: windows-latest
+            target: i686-pc-windows-msvc
+            archive: zip
+            bin: nebular-os.exe
+            cross: false
+          # macOS — Intel and Apple Silicon
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
             bin: nebular-os
+            cross: false
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             bin: nebular-os
+            cross: false
 
     steps:
       - uses: actions/checkout@v4
@@ -59,15 +115,28 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
-      - name: Strip (Unix)
-        if: matrix.archive == 'tar.gz'
-        run: strip target/${{ matrix.target }}/release/${{ matrix.bin }}
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
+
+      - name: Strip (Unix, native)
+        if: matrix.archive == 'tar.gz' && matrix.cross == false
+        run: strip "target/${{ matrix.target }}/release/${{ matrix.bin }}"
 
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
+        shell: bash
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           STAGING="nebular-os-${VERSION}-${{ matrix.name }}"
@@ -92,6 +161,32 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: ${{ env.ASSET }}
+          compression-level: 0
+
+  prepare-release:
+    name: Prepare release assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum nebular-os-* > SHA256SUMS.txt
+          ls -la
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          compression-level: 0
+          retention-days: 7
 
   docker:
     name: Docker (multi-arch)
@@ -134,13 +229,13 @@ jobs:
   github-release:
     name: GitHub Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build-binaries
+    needs: prepare-release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: release-assets
           path: dist
-          merge-multiple: true
 
       - name: Create release
         uses: softprops/action-gh-release@v2
