@@ -181,7 +181,7 @@ with a `SHA256SUMS.txt` checksum file.
 
 | Platform | Architectures |
 |----------|---------------|
-| Linux | x86_64, aarch64, i686, armv7, riscv64, ppc64le, s390x, loongarch64 |
+| Linux | x86_64, aarch64, i686, armv7, riscv64, ppc64le, s390x |
 | Windows | x86_64, aarch64, i686 |
 | macOS | x86_64 (Intel), aarch64 (Apple Silicon) |
 

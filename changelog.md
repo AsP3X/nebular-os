@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **GitHub Releases** with standalone binaries for Linux (x86_64, aarch64, i686, armv7, riscv64, ppc64le, s390x, loongarch64), Windows (x86_64, aarch64, i686), and macOS (x86_64, aarch64), plus `SHA256SUMS.txt`.
+- **GitHub Releases** with standalone binaries for Linux (x86_64, aarch64, i686, armv7, riscv64, ppc64le, s390x), Windows (x86_64, aarch64, i686), and macOS (x86_64, aarch64), plus `SHA256SUMS.txt`.
 - **Postgres metadata backend** (`NOS_METADATA_BACKEND=postgres`): object index in Postgres (`nos_objects`, `nos_multipart_uploads`, `nos_multipart_parts`) while blobs stay on disk under `NOS_DATA_DIR`. Migrations ship in `migrations/001_nos_object_index.sql`.
 - **SQLite metadata backend** remains the default (`NOS_METADATA_BACKEND=sqlite` or unset); behavior for existing deployments is unchanged when env vars are not set.
 - **Per-node logical byte cap** via `NOS_MAX_LOGICAL_BYTES` (0 = unlimited). PUT and multipart complete reject when active `logical_bytes` plus incoming size would exceed the cap, returning **HTTP 507** with `{"error":"insufficient storage"}`.
