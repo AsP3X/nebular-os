@@ -1686,3 +1686,84 @@ async fn test_zstd_dictionary_train_and_use() {
     assert!(is_compressed_blob(&on_disk));
     assert_eq!(read_stored_dict_id(&on_disk), Some(0));
 }
+
+#[tokio::test]
+async fn test_nested_keys_use_flat_blob_paths() {
+    use nebular_os::storage::{blob_path, blob_path_legacy, encode_blob_filename, hash_prefix};
+
+    let (app, token, tmp) = setup_app(None, false).await;
+    let data_dir = tmp.path().join("blobs");
+    let main_key = "users/tenant/files/e972685e-a486-4626-a7dc-5256b4be54dc";
+    let sidecar_key = "users/tenant/files/e972685e-a486-4626-a7dc-5256b4be54dc/grid-thumbnail.jpg";
+
+    for (key, body) in [
+        (main_key, b"original image bytes".as_slice()),
+        (sidecar_key, b"thumbnail bytes".as_slice()),
+    ] {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/media/{key}"))
+            .header("authorization", format!("Bearer {}", token))
+            .header("content-type", "application/octet-stream")
+            .body(Body::from(body.to_vec()))
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "PUT failed for {key}");
+    }
+
+    let shard = hash_prefix(main_key);
+    let nested_main = data_dir.join("media").join(&shard).join(main_key);
+    assert!(
+        !nested_main.exists(),
+        "main object must not use nested directories under the shard"
+    );
+
+    let encoded_main = data_dir
+        .join("media")
+        .join(&shard)
+        .join(encode_blob_filename(main_key));
+    assert!(encoded_main.is_file());
+
+    let sidecar_shard = hash_prefix(sidecar_key);
+    let encoded_sidecar = data_dir
+        .join("media")
+        .join(&sidecar_shard)
+        .join(encode_blob_filename(sidecar_key));
+    assert!(encoded_sidecar.is_file());
+
+    let legacy_sidecar = blob_path_legacy(
+        &data_dir.to_string_lossy(),
+        "media",
+        sidecar_key,
+    );
+    assert!(
+        !legacy_sidecar.exists(),
+        "sidecar must not require a directory where the main blob file lives"
+    );
+
+    for key in [main_key, sidecar_key] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/media/{key}"))
+            .header("authorization", format!("Bearer {}", token))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET failed for {key}");
+    }
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/media/{main_key}"))
+        .header("authorization", format!("Bearer {}", token))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"original image bytes");
+
+    let path = blob_path(&data_dir.to_string_lossy(), "media", main_key);
+    assert_eq!(path, encoded_main);
+}

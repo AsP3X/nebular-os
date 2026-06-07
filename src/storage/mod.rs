@@ -1,4 +1,5 @@
 pub mod blob_finalize;
+pub mod blob_paths;
 pub mod blob_ops;
 pub mod blocks;
 pub mod compression;
@@ -18,8 +19,6 @@ pub mod types;
 
 pub use engine::{GetObjectOutcome, StorageEngine};
 pub use maintenance::{DictTrainReport, RecompressReport};
-
-use std::path::PathBuf;
 
 pub fn sanitize_bucket(bucket: &str) -> anyhow::Result<String> {
     if bucket.is_empty() {
@@ -59,15 +58,7 @@ pub fn sanitize_key(key: &str) -> anyhow::Result<String> {
     Ok(key)
 }
 
-pub fn hash_prefix(key: &str) -> String {
-    let hash = xxhash_rust::xxh3::xxh3_64(key.as_bytes());
-    format!("{:02x}", hash & 0xFF)
-}
-
-pub fn blob_path(base: &str, bucket: &str, key: &str) -> PathBuf {
-    let prefix = hash_prefix(key);
-    PathBuf::from(base)
-        .join(bucket)
-        .join(prefix)
-        .join(key)
-}
+pub use blob_paths::{
+    blob_path, blob_path_legacy, blob_path_variants, blob_rel_path, decode_blob_filename,
+    encode_blob_filename, first_existing_blob_path, hash_prefix, object_key_from_blob_relpath,
+};

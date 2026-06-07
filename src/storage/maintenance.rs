@@ -2,7 +2,7 @@ use std::path::Path;
 
 use tokio::fs;
 
-use super::blob_path;
+use super::{blob_path_variants, first_existing_blob_path};
 use super::blocks::BlockStore;
 use super::compression::{
     compress_file_to_storage, decompress_blob, detect_blob_format, encode_blob_for_storage,
@@ -41,12 +41,13 @@ impl StorageEngine {
         let mut purged = 0u64;
         for (bucket, key) in rows {
             if !self.soft_delete_drop_blob() {
-                let path = blob_path(self.data_dir(), &bucket, &key);
-                if path.exists() {
-                    BlockStore::release_blob(self.system_write_pool(), self.data_dir(), &path)
-                        .await?;
+                for path in blob_path_variants(self.data_dir(), &bucket, &key) {
+                    if path.exists() {
+                        BlockStore::release_blob(self.system_write_pool(), self.data_dir(), &path)
+                            .await?;
+                        let _ = fs::remove_file(&path).await;
+                    }
                 }
-                let _ = fs::remove_file(&path).await;
             }
             self.object_meta()
                 .delete_object_row(&bucket, &key)
@@ -76,7 +77,11 @@ impl StorageEngine {
         let mut report = RecompressReport::default();
         for (bucket, key, size) in rows {
             report.scanned += 1;
-            let path = blob_path(self.data_dir(), &bucket, &key);
+            let variants = blob_path_variants(self.data_dir(), &bucket, &key);
+            let Some(path) = first_existing_blob_path(&variants).await.map_err(internal)? else {
+                report.skipped += 1;
+                continue;
+            };
             let Ok(blob) = fs::read(&path).await else {
                 report.skipped += 1;
                 continue;
@@ -208,7 +213,10 @@ impl StorageEngine {
             if size <= 0 || size as u64 > max_sample as u64 {
                 continue;
             }
-            let path = blob_path(self.data_dir(), &bucket, &key);
+            let variants = blob_path_variants(self.data_dir(), &bucket, &key);
+            let Some(path) = first_existing_blob_path(&variants).await.ok().flatten() else {
+                continue;
+            };
             let Ok(blob) = fs::read(&path).await else {
                 continue;
             };

@@ -4,7 +4,10 @@ use tokio::fs;
 use super::blocks::BlockStore;
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
-use super::{blob_path, sanitize_bucket};
+use super::{
+    blob_path, blob_path_variants, first_existing_blob_path, object_key_from_blob_relpath,
+    sanitize_bucket,
+};
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct ReconcileReport {
@@ -46,8 +49,12 @@ impl StorageEngine {
         let mut db_keys: HashSet<(String, String)> = HashSet::new();
         for (bucket, key) in &rows {
             db_keys.insert((bucket.clone(), key.clone()));
-            let path = blob_path(self.data_dir(), bucket, key);
-            if !path.exists() {
+            let variants = blob_path_variants(self.data_dir(), bucket, key);
+            if first_existing_blob_path(&variants)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
                 self.object_meta()
                     .delete_object_row(bucket, key)
                     .await?;
@@ -200,13 +207,9 @@ impl StorageEngine {
                     .map_err(internal)?
                     .to_string_lossy()
                     .replace('\\', "/");
-                let key = rel
-                    .split_once('/')
-                    .map(|(_, k)| k.to_string())
-                    .unwrap_or(rel);
-                if key.is_empty() {
+                let Some(key) = object_key_from_blob_relpath(&rel) else {
                     continue;
-                }
+                };
                 if let Some(prefix) = prefix_filter
                     && !key.starts_with(prefix)
                 {
@@ -289,13 +292,9 @@ impl StorageEngine {
                     .map_err(internal)?
                     .to_string_lossy()
                     .replace('\\', "/");
-                let key = rel
-                    .split_once('/')
-                    .map(|(_, k)| k.to_string())
-                    .unwrap_or(rel);
-                if key.is_empty() {
+                let Some(key) = object_key_from_blob_relpath(&rel) else {
                     continue;
-                }
+                };
                 if !db_keys.contains(&(bucket.to_string(), key)) {
                     let _ = fs::remove_file(path).await;
                     report.orphan_blobs_removed += 1;

@@ -25,7 +25,10 @@ use super::types::{
     DeletedObjectRef, DeletePrefixFailure, DeletePrefixOutcome, ListCountResult, ListItem,
     ListResult, ObjectMetadata,
 };
-use super::{blob_path, sanitize_bucket, sanitize_key};
+use super::{
+    blob_path, blob_path_variants, first_existing_blob_path, object_key_from_blob_relpath,
+    sanitize_bucket, sanitize_key,
+};
 
 pub(crate) const DEFAULT_UPLOAD_BUFFER: usize = 256 * 1024;
 const DEFAULT_LIST_SCAN_CAP: i64 = 4096;
@@ -437,6 +440,25 @@ impl StorageEngine {
         }
     }
 
+    async fn existing_blob_path(&self, bucket: &str, key: &str) -> Result<PathBuf, StorageError> {
+        let variants = blob_path_variants(&self.data_dir, bucket, key);
+        first_existing_blob_path(&variants)
+            .await
+            .map_err(internal)?
+            .ok_or(StorageError::NotFound)
+    }
+
+    async fn existing_blob_path_optional(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<PathBuf>, StorageError> {
+        let variants = blob_path_variants(&self.data_dir, bucket, key);
+        first_existing_blob_path(&variants)
+            .await
+            .map_err(internal)
+    }
+
     /// Human: Loads active object metadata when present, without treating a miss as an error.
     /// Agent: SELECT objects WHERE deleted_at IS NULL; RETURNS Option (None = no live row).
     pub async fn try_fetch_active_metadata(
@@ -501,7 +523,7 @@ impl StorageEngine {
         }
 
         let src_meta = self.fetch_active_metadata(&src_bucket, &src_key).await?;
-        let src_path = blob_path(&self.data_dir, &src_bucket, &src_key);
+        let src_path = self.existing_blob_path(&src_bucket, &src_key).await?;
         let dst_path = blob_path(&self.data_dir, &dst_bucket, &dst_key);
 
         // Human: Hard-link the on-disk blob when possible so copies share storage on the same volume.
@@ -544,18 +566,24 @@ impl StorageEngine {
             stream_body_to_temp(body, PathBuf::from(&tmp_path).as_path(), self.upload_buffer_size)
                 .await?;
 
-        let existing = if final_path.exists() {
-            Some(final_path.clone())
-        } else {
-            None
-        };
+        let existing = self
+            .existing_blob_path_optional(bucket, safe_key)
+            .await?;
         finalize_temp_to_blob(
             PathBuf::from(&tmp_path).as_path(),
             &final_path,
             size,
-            self.blob_finalize_options(existing),
+            self.blob_finalize_options(existing.clone()),
         )
         .await?;
+
+        if let Some(old) = existing
+            && old != final_path
+            && old.exists()
+        {
+            BlockStore::release_blob(&self.system_write, &self.data_dir, &old).await?;
+            let _ = fs::remove_file(&old).await;
+        }
 
         if let Err(e) = self
             .ensure_capacity_for_write(bucket, safe_key, size)
@@ -632,7 +660,9 @@ impl StorageEngine {
         let total_size = meta.size as u64;
         let range = range_header.and_then(|h| parse_content_range(h, total_size));
 
-        let path = blob_path(&self.data_dir, &meta.bucket, &meta.key);
+        let path = self
+            .existing_blob_path(&meta.bucket, &meta.key)
+            .await?;
         let (start, _end, content_length) = Self::resolve_range(range, total_size)?;
 
         // Human: Stream object bytes from disk, decompressing via spill file or channel when the blob is zstd-wrapped.
@@ -711,8 +741,12 @@ impl StorageEngine {
         }
 
         if self.metadata_mode.is_blob_only() {
-            let path = blob_path(&self.data_dir, &bucket, &safe_key);
-            if !path.exists() {
+            let variants = blob_path_variants(&self.data_dir, &bucket, &safe_key);
+            if first_existing_blob_path(&variants)
+                .await
+                .map_err(internal)?
+                .is_none()
+            {
                 return Ok(());
             }
             return self.drop_object_blob(&bucket, &safe_key).await;
@@ -722,22 +756,14 @@ impl StorageEngine {
             return Ok(());
         }
 
-        let path = blob_path(&self.data_dir, &bucket, &safe_key);
-
         if self.soft_delete_ttl_secs <= 0 {
-            if path.exists() {
-                BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
-            }
-            let _ = fs::remove_file(&path).await;
+            self.drop_object_blob(&bucket, &safe_key).await?;
             self.object_meta.hard_delete_object(&bucket, &safe_key).await?;
             return Ok(());
         }
 
         if self.soft_delete_drop_blob {
-            if path.exists() {
-                BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
-            }
-            let _ = fs::remove_file(&path).await;
+            self.drop_object_blob(&bucket, &safe_key).await?;
         }
 
         self.object_meta.soft_delete_object(&bucket, &safe_key).await?;
@@ -745,11 +771,12 @@ impl StorageEngine {
     }
 
     async fn drop_object_blob(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
-        let path = blob_path(&self.data_dir, bucket, key);
-        if path.exists() {
-            BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
+        for path in blob_path_variants(&self.data_dir, bucket, key) {
+            if path.exists() {
+                BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
+                let _ = fs::remove_file(&path).await;
+            }
         }
-        let _ = fs::remove_file(&path).await;
         Ok(())
     }
 
@@ -1126,10 +1153,7 @@ impl StorageEngine {
         bucket: &str,
         key: &str,
     ) -> Result<ObjectMetadata, StorageError> {
-        let path = blob_path(&self.data_dir, bucket, key);
-        if !path.exists() {
-            return Err(StorageError::NotFound);
-        }
+        let path = self.existing_blob_path(bucket, key).await?;
         let fs_meta = fs::metadata(&path).await.map_err(internal)?;
         let file_len = fs_meta.len();
         let path_for_size = path.clone();
@@ -1198,13 +1222,9 @@ impl StorageEngine {
                     .map_err(internal)?
                     .to_string_lossy()
                     .replace('\\', "/");
-                let key = rel
-                    .split_once('/')
-                    .map(|(_, k)| k.to_string())
-                    .unwrap_or(rel);
-                if key.is_empty() {
+                let Some(key) = object_key_from_blob_relpath(&rel) else {
                     continue;
-                }
+                };
                 if !prefix.is_empty() && !key.starts_with(prefix) {
                     continue;
                 }

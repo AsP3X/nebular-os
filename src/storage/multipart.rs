@@ -4,7 +4,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use xxhash_rust::xxh3::Xxh3;
 
-use super::object_meta::blob_rel_path;
+use super::blob_rel_path;
 use super::streaming::{finalize_temp_to_blob, hash_temp_file};
 use super::engine::{StorageEngine, TempFileGuard};
 use super::error::{internal, map_io_error, StorageError};

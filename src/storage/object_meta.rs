@@ -9,7 +9,7 @@ use tokio::fs;
 use super::error::{internal, StorageError};
 use super::metadata_backend::MetadataBackendKind;
 use super::types::ObjectMetadata;
-use super::hash_prefix;
+use super::blob_rel_path;
 
 const META_SELECT_SQLITE: &str =
     "bucket, key, size, mime_type, etag, created_at, updated_at, custom_meta, deleted_at, storage_class, origin_node";
@@ -1081,11 +1081,6 @@ impl ObjectMetaStore {
         }
         Ok(())
     }
-}
-
-pub(crate) fn blob_rel_path(bucket: &str, key: &str) -> String {
-    let prefix = hash_prefix(key);
-    format!("{bucket}/{prefix}/{key}")
 }
 
 async fn resolve_sqlite_conn_str(meta_path: &str) -> Result<String, StorageError> {
