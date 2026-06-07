@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-06-07
+
+### Fixed
+
+- **Flat encoded blob filenames**: object keys with `/` are stored as a single percent-encoded filename under the hash shard instead of nested directories. This fixes PUT failures when a parent key and a nested sidecar (e.g. `users/…/files/{uuid}` and `…/grid-thumbnail.jpg`) land in the same shard. Reads and deletes still fall back to the legacy nested on-disk layout until objects are overwritten.
+
 ## [0.1.3] — 2026-06-07
 
 ### Changed
@@ -74,7 +80,8 @@ See `.env.example` and `README.md` for full operator notes, including alignment 
 - Cluster modes: standalone, replicated, assigned, replicated+assigned; runtime config via `PUT /_cluster/config` and bootstrap token.
 - Write preconditions (`If-Match`, `If-None-Match`), readiness probe (`/health/ready`), and metrics (`/metrics` JSON or Prometheus text).
 
-[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.4
 [0.1.3]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.3
 [0.1.2]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.2
 [0.1.0]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.0
