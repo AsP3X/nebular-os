@@ -9,6 +9,7 @@ use tokio::fs::{self, File};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
+use super::compressibility::CompressionContext;
 use super::compression::{
     compress_file_to_storage, decompress_file_to_temp, read_blob_header_size, BLOB_MAGIC, HEADER_LEN,
 };
@@ -328,6 +329,7 @@ pub async fn finalize_temp_to_blob(
     final_path: &Path,
     logical_size: u64,
     zstd_level: i32,
+    ctx: CompressionContext<'_>,
 ) -> Result<(), StorageError> {
     if let Some(parent) = final_path.parent() {
         fs::create_dir_all(parent).await.map_err(internal)?;
@@ -337,8 +339,17 @@ pub async fn finalize_temp_to_blob(
     }
     let tmp = tmp_path.to_path_buf();
     let fin = final_path.to_path_buf();
+    let owned_key = ctx.object_key.map(str::to_string);
+    let owned_ct = ctx.content_type.map(str::to_string);
+    let min_size = ctx.min_size;
     tokio::task::spawn_blocking(move || {
-        compress_file_to_storage(&tmp, &fin, logical_size, zstd_level)
+        let ctx = CompressionContext::new(
+            owned_key.as_deref(),
+            owned_ct.as_deref(),
+            logical_size,
+            min_size,
+        );
+        compress_file_to_storage(&tmp, &fin, logical_size, zstd_level, ctx)
     })
     .await
     .map_err(internal)??;

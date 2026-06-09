@@ -2,6 +2,11 @@ use std::fs::File;
 use std::io::{copy, Read, Write};
 use std::path::Path;
 
+use zstd::zstd_safe::CParameter;
+
+use super::compressibility::{
+    prefix_looks_incompressible, should_attempt_compression, CompressionContext,
+};
 use super::error::{internal, StorageError};
 
 // Human: Every stored blob is prefixed with a magic tag and logical size so reads can tell compressed from legacy raw files.
@@ -12,6 +17,10 @@ pub const HEADER_LEN: usize = 12;
 /// Human: Default zstd level when env does not override (22 = smallest on disk, highest CPU).
 /// Agent: DEFAULT_ZSTD_LEVEL=22; overridden by NOS_ZSTD_LEVEL in config/engine.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 22;
+
+/// Human: Enable long-distance matching once payloads are large enough to benefit.
+/// Agent: LDM_THRESHOLD=128KiB; paired with level>=10 in tune_encoder_for_size.
+const LDM_SIZE_THRESHOLD: u64 = 128 * 1024;
 
 /// Human: Clamp user-provided zstd level into the range the zstd crate supports.
 /// Agent: CLAMP 1..=22; used for NOS_ZSTD_LEVEL parsing.
@@ -36,23 +45,114 @@ pub fn read_blob_header_size(mut file: File) -> Result<u64, StorageError> {
     Ok(u64::from_le_bytes(header[4..HEADER_LEN].try_into().unwrap()))
 }
 
+// Human: Pick a zstd window large enough for the payload but within library limits.
+// Agent: window_log=ilog2(size).clamp(10,27); 2^log is ZSTD search distance.
+fn adaptive_window_log(logical_size: u64) -> u32 {
+    let bits = 64 - logical_size.max(1).leading_zeros();
+    bits.clamp(10, 27)
+}
+
+// Human: Apply size-aware zstd knobs that improve ratio without changing the on-disk format.
+// Agent: SETS pledged size, content-size flag, window_log, optional LDM via set_parameter.
+fn tune_encoder_for_size<E>(
+    encoder: &mut E,
+    logical_size: u64,
+    level: i32,
+    pledged_src_size: bool,
+) -> Result<(), StorageError>
+where
+    E: EncoderTuning,
+{
+    let level = clamp_zstd_level(level);
+    if pledged_src_size && logical_size > 0 {
+        encoder
+            .set_pledged_src_size(Some(logical_size))
+            .map_err(internal)?;
+        encoder.include_contentsize(true).map_err(internal)?;
+    }
+    if logical_size >= 4096 {
+        encoder
+            .set_parameter(CParameter::WindowLog(adaptive_window_log(logical_size)))
+            .map_err(internal)?;
+    }
+    if logical_size >= LDM_SIZE_THRESHOLD && level >= 10 {
+        encoder
+            .set_parameter(CParameter::EnableLongDistanceMatching(true))
+            .map_err(internal)?;
+    }
+    Ok(())
+}
+
+trait EncoderTuning {
+    fn set_pledged_src_size(&mut self, size: Option<u64>) -> std::io::Result<()>;
+    fn include_contentsize(&mut self, include: bool) -> std::io::Result<()>;
+    fn set_parameter(&mut self, parameter: CParameter) -> std::io::Result<()>;
+}
+
+impl EncoderTuning for zstd::stream::write::Encoder<'_, File> {
+    fn set_pledged_src_size(&mut self, size: Option<u64>) -> std::io::Result<()> {
+        self.set_pledged_src_size(size)
+    }
+    fn include_contentsize(&mut self, include: bool) -> std::io::Result<()> {
+        self.include_contentsize(include)
+    }
+    fn set_parameter(&mut self, parameter: CParameter) -> std::io::Result<()> {
+        self.set_parameter(parameter)
+    }
+}
+
+impl EncoderTuning for zstd::bulk::Compressor<'_> {
+    fn set_pledged_src_size(&mut self, _size: Option<u64>) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn include_contentsize(&mut self, include: bool) -> std::io::Result<()> {
+        self.include_contentsize(include)
+    }
+    fn set_parameter(&mut self, parameter: CParameter) -> std::io::Result<()> {
+        self.set_parameter(parameter)
+    }
+}
+
 // Human: Compress arbitrary bytes with zstd and wrap them in the Nebular blob header.
 // Agent: WRITES magic+uncompressed_size LE + zstd payload; INPUT logical bytes; OUTPUT on-disk blob bytes.
-pub fn compress_blob(uncompressed: &[u8], level: i32) -> Result<Vec<u8>, StorageError> {
-    let mut out = Vec::with_capacity(HEADER_LEN + uncompressed.len() / 2 + 64);
+pub fn compress_blob(
+    uncompressed: &[u8],
+    level: i32,
+    ctx: CompressionContext<'_>,
+) -> Result<Vec<u8>, StorageError> {
+    if !should_attempt_compression(ctx) {
+        return Ok(uncompressed.to_vec());
+    }
+
+    let mut compressor =
+        zstd::bulk::Compressor::new(clamp_zstd_level(level)).map_err(internal)?;
+    tune_encoder_for_size(
+        &mut compressor,
+        uncompressed.len() as u64,
+        level,
+        false,
+    )?;
+    let compressed = compressor.compress(uncompressed).map_err(internal)?;
+
+    let mut out = Vec::with_capacity(HEADER_LEN + compressed.len());
     out.extend_from_slice(BLOB_MAGIC);
     out.extend_from_slice(&(uncompressed.len() as u64).to_le_bytes());
-
-    let compressed = zstd::encode_all(uncompressed, clamp_zstd_level(level)).map_err(internal)?;
     out.extend_from_slice(&compressed);
     Ok(out)
 }
 
 // Human: Pick zstd-wrapped storage when smaller than raw; otherwise keep bytes unwrapped for incompressible payloads.
 // Agent: CALLS compress_blob; IF compressed.len < raw.len THEN NOSZ ELSE raw Vec (no header).
-pub fn encode_blob_for_storage(uncompressed: &[u8], level: i32) -> Result<Vec<u8>, StorageError> {
-    let compressed = compress_blob(uncompressed, level)?;
-    if compressed.len() < uncompressed.len() {
+pub fn encode_blob_for_storage(
+    uncompressed: &[u8],
+    level: i32,
+    ctx: CompressionContext<'_>,
+) -> Result<Vec<u8>, StorageError> {
+    if !should_attempt_compression(ctx) {
+        return Ok(uncompressed.to_vec());
+    }
+    let compressed = compress_blob(uncompressed, level, ctx)?;
+    if compressed.len() < uncompressed.len() && is_compressed_blob(&compressed) {
         Ok(compressed)
     } else {
         Ok(uncompressed.to_vec())
@@ -94,7 +194,23 @@ pub fn compress_file_to_storage(
     final_path: &Path,
     logical_size: u64,
     level: i32,
+    ctx: CompressionContext<'_>,
 ) -> Result<(), StorageError> {
+    if !should_attempt_compression(ctx) {
+        std::fs::copy(tmp_path, final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
+        return Ok(());
+    }
+
+    let mut prefix = [0u8; 16];
+    {
+        let mut raw = File::open(tmp_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
+        let read = raw.read(&mut prefix).map_err(|e| internal(anyhow::anyhow!(e)))?;
+        if prefix_looks_incompressible(&prefix[..read]) {
+            std::fs::copy(tmp_path, final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
+            return Ok(());
+        }
+    }
+
     let raw_len = std::fs::metadata(tmp_path)
         .map_err(|e| internal(anyhow::anyhow!(e)))?
         .len();
@@ -109,6 +225,7 @@ pub fn compress_file_to_storage(
             .map_err(|e| internal(anyhow::anyhow!(e)))?;
         let mut encoder =
             zstd::stream::write::Encoder::new(out, clamp_zstd_level(level)).map_err(internal)?;
+        tune_encoder_for_size(&mut encoder, logical_size, level, true)?;
         copy(&mut raw, &mut encoder).map_err(|e| internal(anyhow::anyhow!(e)))?;
         encoder.finish().map_err(|e| internal(anyhow::anyhow!(e)))?;
     }
@@ -161,13 +278,28 @@ pub fn decompress_file_to_temp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::compressibility::DEFAULT_MIN_COMPRESSIBLE_SIZE;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn text_ctx(size: u64) -> CompressionContext<'static> {
+        CompressionContext::new(
+            Some("data/log.txt"),
+            Some("text/plain"),
+            size,
+            DEFAULT_MIN_COMPRESSIBLE_SIZE,
+        )
+    }
 
     #[test]
     fn roundtrip_compresses_and_restores() {
         let original = b"hello world ".repeat(500);
-        let blob = compress_blob(&original, DEFAULT_ZSTD_LEVEL).unwrap();
+        let blob = compress_blob(
+            &original,
+            DEFAULT_ZSTD_LEVEL,
+            text_ctx(original.len() as u64),
+        )
+        .unwrap();
         assert!(is_compressed_blob(&blob));
         assert!(blob.len() < original.len());
         let restored = decompress_blob(&blob, original.len() as u64).unwrap();
@@ -185,9 +317,26 @@ mod tests {
     #[test]
     fn incompressible_payload_stays_raw() {
         let payload = b"x".to_vec();
-        let compressed = compress_blob(&payload, DEFAULT_ZSTD_LEVEL).unwrap();
-        assert!(compressed.len() > payload.len());
-        let stored = encode_blob_for_storage(&payload, DEFAULT_ZSTD_LEVEL).unwrap();
+        let stored = encode_blob_for_storage(
+            &payload,
+            DEFAULT_ZSTD_LEVEL,
+            text_ctx(payload.len() as u64),
+        )
+        .unwrap();
+        assert!(!is_compressed_blob(&stored));
+        assert_eq!(stored, payload);
+    }
+
+    #[test]
+    fn excluded_media_extension_stays_raw() {
+        let payload = b"fake mp3 payload ".repeat(400);
+        let ctx = CompressionContext::new(
+            Some("music/song.mp3"),
+            Some("audio/mpeg"),
+            payload.len() as u64,
+            DEFAULT_MIN_COMPRESSIBLE_SIZE,
+        );
+        let stored = encode_blob_for_storage(&payload, DEFAULT_ZSTD_LEVEL, ctx).unwrap();
         assert!(!is_compressed_blob(&stored));
         assert_eq!(stored, payload);
     }
@@ -198,11 +347,30 @@ mod tests {
         let payload = b"compress me ".repeat(400);
         tmp.write_all(&payload).unwrap();
         let final_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
-        compress_file_to_storage(tmp.path(), &final_path, payload.len() as u64, DEFAULT_ZSTD_LEVEL)
-            .unwrap();
+        compress_file_to_storage(
+            tmp.path(),
+            &final_path,
+            payload.len() as u64,
+            DEFAULT_ZSTD_LEVEL,
+            text_ctx(payload.len() as u64),
+        )
+        .unwrap();
         let on_disk = std::fs::read(&final_path).unwrap();
         assert!(is_compressed_blob(&on_disk));
         let restored = decompress_blob(&on_disk, payload.len() as u64).unwrap();
         assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn tuned_encoder_compresses_large_repetitive_payload() {
+        let payload = b"structured log line ".repeat(8_192);
+        let tuned = compress_blob(
+            &payload,
+            DEFAULT_ZSTD_LEVEL,
+            text_ctx(payload.len() as u64),
+        )
+        .unwrap();
+        assert!(is_compressed_blob(&tuned));
+        assert!(tuned.len() < payload.len());
     }
 }

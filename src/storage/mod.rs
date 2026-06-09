@@ -1,4 +1,5 @@
 pub mod blob_ops;
+pub mod compressibility;
 pub mod compression;
 pub mod engine;
 pub mod streaming;

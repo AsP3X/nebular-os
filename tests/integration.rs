@@ -62,6 +62,7 @@ fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<N
         read_pool_size: 2,
         cors_origins: vec![],
         zstd_level: 3,
+        compress_min_size: 4096,
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -649,6 +650,34 @@ async fn test_storage_compression_transparent() {
 }
 
 #[tokio::test]
+async fn test_storage_skips_incompressible_media() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::is_compressed_blob;
+
+    let (app, token, tmp) = setup_app(None, false).await;
+    let content = "would compress if we tried ".repeat(500);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/track.mp3")
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "audio/mpeg")
+        .body(Body::from(content.clone()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let on_disk = std::fs::read(blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "track.mp3",
+    ))
+    .unwrap();
+    assert!(!is_compressed_blob(&on_disk));
+    assert_eq!(on_disk, content.as_bytes());
+}
+
+#[tokio::test]
 async fn test_expired_presigned_url_rejected() {
     let (app, token, _tmp) = setup_app(Some("test-signing-secret".into()), false).await;
     let secret = "test-signing-secret";
@@ -1181,7 +1210,7 @@ async fn test_recompress_legacy_raw_blob() {
     use nebular_os::storage::compression::is_compressed_blob;
 
     let (storage, tmp) = setup_engine(EngineOptions::default()).await;
-    let logical = b"legacy raw payload ".repeat(200);
+    let logical = b"legacy raw payload ".repeat(300);
     let mut body = std::io::Cursor::new(&logical[..]);
     storage
         .put_object("music", "legacy.bin", None, None, &mut body)

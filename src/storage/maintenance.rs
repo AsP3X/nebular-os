@@ -1,6 +1,7 @@
 use tokio::fs;
 
 use super::blob_path;
+use super::compressibility::CompressionContext;
 use super::compression::{encode_blob_for_storage, is_compressed_blob};
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
@@ -51,8 +52,8 @@ impl StorageEngine {
         limit: usize,
     ) -> Result<RecompressReport, StorageError> {
         let limit = limit.max(1) as i64;
-        let rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT bucket, key, size FROM objects WHERE deleted_at IS NULL ORDER BY updated_at LIMIT ?",
+        let rows: Vec<(String, String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT bucket, key, size, mime_type FROM objects WHERE deleted_at IS NULL ORDER BY updated_at LIMIT ?",
         )
         .bind(limit)
         .fetch_all(self.read_pool())
@@ -60,7 +61,7 @@ impl StorageEngine {
         .map_err(internal)?;
 
         let mut report = RecompressReport::default();
-        for (bucket, key, size) in rows {
+        for (bucket, key, size, mime_type) in rows {
             report.scanned += 1;
             let path = blob_path(self.data_dir(), &bucket, &key);
             let Ok(blob) = fs::read(&path).await else {
@@ -75,7 +76,13 @@ impl StorageEngine {
                 report.skipped += 1;
                 continue;
             }
-            let encoded = encode_blob_for_storage(&blob, self.zstd_level())?;
+            let ctx = CompressionContext::new(
+                Some(key.as_str()),
+                mime_type.as_deref(),
+                size as u64,
+                self.compress_min_size(),
+            );
+            let encoded = encode_blob_for_storage(&blob, self.zstd_level(), ctx)?;
             if encoded.len() >= blob.len() {
                 report.skipped += 1;
                 continue;

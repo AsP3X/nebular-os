@@ -6,6 +6,7 @@ use sqlx::{Pool, Sqlite, SqlitePool};
 use tokio::fs;
 
 use super::blob_ops::link_or_copy_blob;
+use super::compressibility::{CompressionContext, DEFAULT_MIN_COMPRESSIBLE_SIZE};
 use super::compression::{self, DEFAULT_ZSTD_LEVEL};
 use super::error::{internal, StorageError};
 use super::range::parse_content_range;
@@ -63,6 +64,7 @@ pub struct EngineOptions {
     pub recompress_batch_size: usize,
     pub read_pool_size: u32,
     pub zstd_level: i32,
+    pub compress_min_size: usize,
 }
 
 impl Default for EngineOptions {
@@ -77,6 +79,7 @@ impl Default for EngineOptions {
             recompress_batch_size: 100,
             read_pool_size: 4,
             zstd_level: DEFAULT_ZSTD_LEVEL,
+            compress_min_size: DEFAULT_MIN_COMPRESSIBLE_SIZE,
         }
     }
 }
@@ -94,6 +97,7 @@ pub struct StorageEngine {
     multipart_upload_ttl_secs: i64,
     recompress_batch_size: usize,
     zstd_level: i32,
+    compress_min_size: usize,
 }
 
 pub(crate) struct TempFileGuard {
@@ -167,6 +171,7 @@ impl StorageEngine {
             multipart_upload_ttl_secs: opts.multipart_upload_ttl_secs.max(0),
             recompress_batch_size: opts.recompress_batch_size.max(1),
             zstd_level: compression::clamp_zstd_level(opts.zstd_level),
+            compress_min_size: opts.compress_min_size.max(1),
         })
     }
 
@@ -361,6 +366,24 @@ impl StorageEngine {
         self.zstd_level
     }
 
+    pub fn compress_min_size(&self) -> usize {
+        self.compress_min_size
+    }
+
+    pub fn compression_context<'a>(
+        &'a self,
+        object_key: Option<&'a str>,
+        content_type: Option<&'a str>,
+        logical_size: u64,
+    ) -> CompressionContext<'a> {
+        CompressionContext::new(
+            object_key,
+            content_type,
+            logical_size,
+            self.compress_min_size,
+        )
+    }
+
     /// Human: Loads active object metadata when present, without treating a miss as an error.
     /// Agent: SELECT objects WHERE deleted_at IS NULL; RETURNS Option (None = no live row).
     pub async fn try_fetch_active_metadata(
@@ -503,6 +526,7 @@ impl StorageEngine {
             &final_path,
             size,
             self.zstd_level(),
+            self.compression_context(Some(&safe_key), content_type, size),
         )
         .await?;
 
