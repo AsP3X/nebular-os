@@ -57,6 +57,7 @@ pub struct NosConfig {
     pub cors_origins: Vec<String>,
     pub zstd_level: i32,
     pub compress_min_size: usize,
+    pub compress_block_size: usize,
     pub s3_compat: bool,
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
@@ -95,6 +96,7 @@ impl fmt::Debug for NosConfig {
             .field("cors_origins", &self.cors_origins)
             .field("zstd_level", &self.zstd_level)
             .field("compress_min_size", &self.compress_min_size)
+            .field("compress_block_size", &self.compress_block_size)
             .field("s3_compat", &self.s3_compat)
             .field(
                 "bucket_policy",
@@ -220,6 +222,11 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_COMPRESS_MIN_SIZE must be a valid usize"))
                 .transpose()?
                 .unwrap_or(crate::storage::compressibility::DEFAULT_MIN_COMPRESSIBLE_SIZE),
+            compress_block_size: env::var("NOS_COMPRESS_BLOCK_SIZE")
+                .ok()
+                .map(|s| s.parse().context("NOS_COMPRESS_BLOCK_SIZE must be a valid usize"))
+                .transpose()?
+                .unwrap_or(crate::storage::compression::DEFAULT_BLOCK_SIZE),
             s3_compat: env::var("NOS_S3_COMPAT")
                 .ok()
                 .map(|s| parse_bool(&s))

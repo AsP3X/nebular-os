@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
             read_pool_size: cfg.read_pool_size,
             zstd_level: cfg.zstd_level,
             compress_min_size: cfg.compress_min_size,
+            compress_block_size: cfg.compress_block_size,
         },
     )
     .await?;

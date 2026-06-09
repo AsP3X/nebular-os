@@ -74,6 +74,7 @@ fn cluster_test_config(
         cors_origins: vec![],
         zstd_level: 3,
         compress_min_size: 4096,
+        compress_block_size: 64 * 1024,
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,

@@ -188,6 +188,7 @@ impl StorageEngine {
             &final_path,
             total_size,
             self.zstd_level(),
+            self.compress_block_size(),
             self.compression_context(
                 Some(&safe_key),
                 session.content_type.as_deref(),

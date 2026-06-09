@@ -46,7 +46,7 @@ impl StorageEngine {
         Ok(purged)
     }
 
-    /// Scans active objects and rewrites raw on-disk blobs when zstd would shrink them.
+    /// Scans active objects and rewrites raw on-disk blobs when NOSB block compression would shrink them.
     pub async fn recompress_legacy_blobs(
         &self,
         limit: usize,
@@ -82,7 +82,12 @@ impl StorageEngine {
                 size as u64,
                 self.compress_min_size(),
             );
-            let encoded = encode_blob_for_storage(&blob, self.zstd_level(), ctx)?;
+            let encoded = encode_blob_for_storage(
+                &blob,
+                self.zstd_level(),
+                self.compress_block_size(),
+                ctx,
+            )?;
             if encoded.len() >= blob.len() {
                 report.skipped += 1;
                 continue;

@@ -63,6 +63,7 @@ fn test_config(signing_secret: Option<String>, allow_public_read: bool) -> Arc<N
         cors_origins: vec![],
         zstd_level: 3,
         compress_min_size: 4096,
+        compress_block_size: 64 * 1024,
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -105,6 +106,7 @@ async fn setup_app(signing_secret: Option<String>, allow_public_read: bool) -> (
         EngineOptions {
             upload_buffer_size: 64 * 1024,
             read_pool_size: 2,
+            compress_block_size: 128 * 1024,
             ..EngineOptions::default()
         },
     )
@@ -138,6 +140,7 @@ async fn runtime_cluster_config_apply_via_bootstrap() {
         EngineOptions {
             upload_buffer_size: 64 * 1024,
             read_pool_size: 2,
+            compress_block_size: 128 * 1024,
             ..EngineOptions::default()
         },
     )
@@ -650,6 +653,59 @@ async fn test_storage_compression_transparent() {
 }
 
 #[tokio::test]
+async fn test_block_compressed_range_without_full_decode() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::{is_compressed_blob, parse_layout_bytes};
+
+    let (app, token, tmp) = setup_app(None, false).await;
+    let content: String = (0..8)
+        .map(|i| format!("block-{i}-payload-line\n"))
+        .collect::<Vec<_>>()
+        .join("")
+        .repeat(4000);
+    let total = content.len();
+    let range_start = total / 3;
+    let range_end = range_start + 50_000;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/block-range.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(content.clone()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let on_disk = std::fs::read(blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "block-range.bin",
+    ))
+    .unwrap();
+    assert!(is_compressed_blob(&on_disk));
+    let layout = parse_layout_bytes(&on_disk).unwrap();
+    assert!(layout.block_count() > 1);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/block-range.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .header("range", format!("bytes={range_start}-{range_end}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body,
+        &content.as_bytes()[range_start..=range_end]
+    );
+}
+
+#[tokio::test]
 async fn test_storage_skips_incompressible_media() {
     use nebular_os::storage::blob_path;
     use nebular_os::storage::compression::is_compressed_blob;
@@ -1072,6 +1128,7 @@ async fn test_metrics_requires_token_when_configured() {
         EngineOptions {
             upload_buffer_size: 64 * 1024,
             read_pool_size: 2,
+            compress_block_size: 128 * 1024,
             ..EngineOptions::default()
         },
     )

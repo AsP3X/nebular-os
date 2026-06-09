@@ -7,7 +7,7 @@ use tokio::fs;
 
 use super::blob_ops::link_or_copy_blob;
 use super::compressibility::{CompressionContext, DEFAULT_MIN_COMPRESSIBLE_SIZE};
-use super::compression::{self, DEFAULT_ZSTD_LEVEL};
+use super::compression::{self, DEFAULT_BLOCK_SIZE, DEFAULT_ZSTD_LEVEL};
 use super::error::{internal, StorageError};
 use super::range::parse_content_range;
 use super::streaming::{
@@ -65,6 +65,7 @@ pub struct EngineOptions {
     pub read_pool_size: u32,
     pub zstd_level: i32,
     pub compress_min_size: usize,
+    pub compress_block_size: usize,
 }
 
 impl Default for EngineOptions {
@@ -80,6 +81,7 @@ impl Default for EngineOptions {
             read_pool_size: 4,
             zstd_level: DEFAULT_ZSTD_LEVEL,
             compress_min_size: DEFAULT_MIN_COMPRESSIBLE_SIZE,
+            compress_block_size: DEFAULT_BLOCK_SIZE,
         }
     }
 }
@@ -98,6 +100,7 @@ pub struct StorageEngine {
     recompress_batch_size: usize,
     zstd_level: i32,
     compress_min_size: usize,
+    compress_block_size: usize,
 }
 
 pub(crate) struct TempFileGuard {
@@ -172,6 +175,7 @@ impl StorageEngine {
             recompress_batch_size: opts.recompress_batch_size.max(1),
             zstd_level: compression::clamp_zstd_level(opts.zstd_level),
             compress_min_size: opts.compress_min_size.max(1),
+            compress_block_size: opts.compress_block_size.max(4096),
         })
     }
 
@@ -370,6 +374,10 @@ impl StorageEngine {
         self.compress_min_size
     }
 
+    pub fn compress_block_size(&self) -> usize {
+        self.compress_block_size
+    }
+
     pub fn compression_context<'a>(
         &'a self,
         object_key: Option<&'a str>,
@@ -526,6 +534,7 @@ impl StorageEngine {
             &final_path,
             size,
             self.zstd_level(),
+            self.compress_block_size(),
             self.compression_context(Some(&safe_key), content_type, size),
         )
         .await?;
@@ -599,8 +608,8 @@ impl StorageEngine {
         let path = blob_path(&self.data_dir, &meta.bucket, &meta.key);
         let (start, _end, content_length) = Self::resolve_range(range, total_size)?;
 
-        // Human: Stream object bytes from disk, decompressing via spill file or channel when the blob is zstd-wrapped.
-        // Agent: CALLS open_object_body_stream(path, logical_size, range_start, content_length, data_dir); no full-blob RAM buffer.
+        // Human: Stream object bytes from disk, decoding only needed NOSB blocks for range requests.
+        // Agent: CALLS open_object_body_stream(path, logical_size, range_start, content_length, data_dir).
         let stream = open_object_body_stream(
             path.as_path(),
             total_size,

@@ -1,5 +1,4 @@
-use std::io::{Read, Seek};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -11,7 +10,8 @@ use tokio_util::io::ReaderStream;
 
 use super::compressibility::CompressionContext;
 use super::compression::{
-    compress_file_to_storage, decompress_file_to_temp, read_blob_header_size, BLOB_MAGIC, HEADER_LEN,
+    compress_file_to_storage, pump_block_blob_full, pump_block_blob_range, BLOB_MAGIC,
+    FIXED_HEADER_LEN,
 };
 use super::error::{internal, map_io_error, StorageError};
 
@@ -43,13 +43,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // Human: Range fully satisfied — signal EOF without reading more from disk.
-        // Agent: remaining==0 => Ready(Ok(())) with empty buf (HTTP body complete).
         if self.remaining == 0 {
             return Poll::Ready(Ok(()));
         }
-        // Human: Skip bytes before the range start by reading into a throwaway buffer (no copy to client).
-        // Agent: WHILE skip>0 poll inner into 8KiB discard; EOF on inner ends poll early.
         if self.skip > 0 {
             let mut discard = [0u8; 8192];
             while self.skip > 0 {
@@ -68,8 +64,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
                 }
             }
         }
-        // Human: Read only the slice of the range that still fits in this response chunk.
-        // Agent: max=min(remaining, buf.remaining()); sub-read then decrement remaining.
         let max = (self.remaining as usize).min(buf.remaining());
         if max == 0 {
             return Poll::Ready(Ok(()));
@@ -87,20 +81,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
                 Poll::Ready(Ok(()))
             }
             other => other,
-        }
-    }
-}
-
-/// Human: Deletes a spill file when the response body is dropped (range reads on compressed blobs).
-/// Agent: Drop impl remove_file on spill_path; held inside GuardedObjectBodyStream until stream ends.
-pub struct SpillFileGuard {
-    pub path: PathBuf,
-}
-
-impl Drop for SpillFileGuard {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -125,19 +105,15 @@ impl Stream for ObjectBodyStream {
     }
 }
 
-/// Human: Keeps a spill-file guard alive until the client finishes reading the object body.
-/// Agent: WRAPS ObjectBodyStream; Drop order deletes spill after stream exhausted.
+/// Human: Wraps an object body stream for axum GET responses.
+/// Agent: WRAPS ObjectBodyStream; no spill file needed for block-compressed range reads.
 pub struct GuardedObjectBodyStream {
     pub stream: ObjectBodyStream,
-    _spill_guard: Option<SpillFileGuard>,
 }
 
 impl GuardedObjectBodyStream {
     pub fn from_http_stream(stream: ObjectBodyStream) -> Self {
-        Self {
-            stream,
-            _spill_guard: None,
-        }
+        Self { stream }
     }
 }
 
@@ -149,55 +125,38 @@ impl Stream for GuardedObjectBodyStream {
     }
 }
 
-/// Human: Build a streaming body for GET, honoring Range on both raw and zstd-wrapped blobs.
-/// Agent: READS blob_path+logical_size; raw=>LimitedAsyncRead on File; compressed+range=>temp decompress; compressed+full=>channel pump.
+/// Human: Build a streaming body for GET, honoring Range on raw and NOSB block-compressed blobs.
+/// Agent: raw=>LimitedAsyncRead; NOSB+full=>pump_block_blob_full; NOSB+range=>pump_block_blob_range.
 pub async fn open_object_body_stream(
     blob_path: &Path,
     logical_size: u64,
     range_start: u64,
     content_length: u64,
-    data_dir: &str,
+    _data_dir: &str,
 ) -> Result<GuardedObjectBodyStream, StorageError> {
-    let header = fs::read(blob_path)
-        .await
-        .map_err(map_io_error)?;
-    if header.len() < HEADER_LEN || !header.starts_with(BLOB_MAGIC) {
+    // Human: Peek only the fixed header to detect NOSB; never buffer the whole blob here.
+    // Agent: READS first FIXED_HEADER_LEN bytes; raw blobs stream directly from disk.
+    let mut peek = [0u8; FIXED_HEADER_LEN];
+    let mut file = File::open(blob_path).await.map_err(map_io_error)?;
+    let read = file.read(&mut peek).await.map_err(map_io_error)?;
+    if read < FIXED_HEADER_LEN || !peek.starts_with(BLOB_MAGIC) {
+        drop(file);
         let stream = open_raw_file_stream(blob_path, range_start, content_length).await?;
-        return Ok(GuardedObjectBodyStream {
-            stream,
-            _spill_guard: None,
-        });
+        return Ok(GuardedObjectBodyStream { stream });
     }
 
+    let path = blob_path.to_path_buf();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
     if range_start == 0 && content_length == logical_size {
-        let stream = open_full_compressed_stream(blob_path, logical_size).await?;
-        return Ok(GuardedObjectBodyStream {
-            stream,
-            _spill_guard: None,
+        tokio::task::spawn_blocking(move || pump_block_blob_full(path, logical_size, tx));
+    } else {
+        tokio::task::spawn_blocking(move || {
+            pump_block_blob_range(path, logical_size, range_start, content_length, tx)
         });
     }
 
-    let spill = format!(
-        "{}/.tmp/decompress-{}.bin",
-        data_dir,
-        uuid::Uuid::new_v4()
-    );
-    let blob_path_owned = blob_path.to_path_buf();
-    let spill_path = spill.clone();
-    tokio::task::spawn_blocking(move || {
-        decompress_file_to_temp(&blob_path_owned, logical_size, Path::new(&spill_path))
-    })
-    .await
-    .map_err(internal)??;
-
-    let guard = SpillFileGuard {
-        path: PathBuf::from(&spill),
-    };
-    let file = File::open(&spill).await.map_err(map_io_error)?;
-    let limited = LimitedAsyncRead::new(file, range_start, content_length);
     Ok(GuardedObjectBodyStream {
-        stream: ObjectBodyStream::FileLimited(ReaderStream::new(limited)),
-        _spill_guard: Some(guard),
+        stream: ObjectBodyStream::Channel(tokio_stream::wrappers::ReceiverStream::new(rx)),
     })
 }
 
@@ -209,72 +168,6 @@ async fn open_raw_file_stream(
     let file = File::open(blob_path).await.map_err(map_io_error)?;
     let limited = LimitedAsyncRead::new(file, range_start, content_length);
     Ok(ObjectBodyStream::FileLimited(ReaderStream::new(limited)))
-}
-
-async fn open_full_compressed_stream(
-    blob_path: &Path,
-    logical_size: u64,
-) -> Result<ObjectBodyStream, StorageError> {
-    let path = blob_path.to_path_buf();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-    tokio::task::spawn_blocking(move || pump_zstd_decode(path, logical_size, tx));
-    Ok(ObjectBodyStream::Channel(
-        tokio_stream::wrappers::ReceiverStream::new(rx),
-    ))
-}
-
-fn pump_zstd_decode(
-    blob_path: PathBuf,
-    logical_size: u64,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-) {
-    let mut file = match std::fs::File::open(&blob_path) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(e));
-            return;
-        }
-    };
-    let stored = match read_blob_header_size(
-        file.try_clone()
-            .unwrap_or_else(|_| std::fs::File::open(&blob_path).expect("reopen blob")),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
-            return;
-        }
-    };
-    if stored != logical_size {
-        let _ = tx.blocking_send(Err(std::io::Error::other("blob header size mismatch")));
-        return;
-    }
-    if file.seek(std::io::SeekFrom::Start(HEADER_LEN as u64)).is_err() {
-        let _ = tx.blocking_send(Err(std::io::Error::other("seek past header failed")));
-        return;
-    }
-    let mut decoder = match zstd::stream::read::Decoder::new(file) {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(e));
-            return;
-        }
-    };
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match decoder.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
-                    return;
-                }
-            }
-            Err(e) => {
-                let _ = tx.blocking_send(Err(e));
-                return;
-            }
-        }
-    }
 }
 
 /// Human: Stream upload body to a temp file while hashing; no in-memory payload buffer.
@@ -306,6 +199,8 @@ pub async fn stream_body_to_temp(
 /// Human: Hash an on-disk temp file (used after multipart part concatenation).
 /// Agent: READS tmp_path in chunks; RETURNS (size, xxh3 hex etag).
 pub fn hash_temp_file(tmp_path: &Path, buffer_size: usize) -> Result<(u64, String), StorageError> {
+    use std::io::Read;
+
     let total_size = std::fs::metadata(tmp_path)
         .map_err(|e| internal(anyhow::anyhow!(e)))?
         .len();
@@ -322,13 +217,14 @@ pub fn hash_temp_file(tmp_path: &Path, buffer_size: usize) -> Result<(u64, Strin
     Ok((total_size, format!("{:016x}", hasher.digest())))
 }
 
-/// Human: After temp upload, compress-or-store to final blob path without loading the whole object into RAM.
-/// Agent: CALLS compress_file_to_storage; compares on-disk sizes; may copy raw when compression does not shrink.
+/// Human: After temp upload, block-compress-or-store to final blob path without full-RAM buffering.
+/// Agent: CALLS compress_file_to_storage with block_size; may copy raw when NOSB does not shrink.
 pub async fn finalize_temp_to_blob(
     tmp_path: &Path,
     final_path: &Path,
     logical_size: u64,
     zstd_level: i32,
+    block_size: usize,
     ctx: CompressionContext<'_>,
 ) -> Result<(), StorageError> {
     if let Some(parent) = final_path.parent() {
@@ -349,7 +245,7 @@ pub async fn finalize_temp_to_blob(
             logical_size,
             min_size,
         );
-        compress_file_to_storage(&tmp, &fin, logical_size, zstd_level, ctx)
+        compress_file_to_storage(&tmp, &fin, logical_size, zstd_level, block_size, ctx)
     })
     .await
     .map_err(internal)??;
