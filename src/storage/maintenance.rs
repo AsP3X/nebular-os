@@ -2,12 +2,12 @@ use std::path::Path;
 
 use tokio::fs;
 
-use super::{blob_path_variants, first_existing_blob_path};
+use super::blob_path_variants;
 use super::blocks::BlockStore;
+use super::compressibility::CompressionContext;
 use super::compression::{
-    compress_file_to_storage, decompress_blob, detect_blob_format, encode_blob_for_storage,
-    is_compressed_blob, read_stored_dict_id, read_stored_zstd_level, BlobFormat,
-    RuntimeCompressParams,
+    decompress_blob, detect_blob_format, encode_blob_for_storage, is_nosb_blob, is_zstd_blob,
+    read_stored_dict_id, read_stored_zstd_level, BlobFormat,
 };
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
@@ -57,8 +57,8 @@ impl StorageEngine {
         Ok(purged)
     }
 
-    /// Scans active objects and rewrites blobs when stronger compression would shrink them.
-    /// Handles legacy raw blobs, NOSZ v1, and NOS2 (re-encode at background level).
+    /// Scans active objects and rewrites blobs when stronger NOSB compression would shrink them.
+    /// Handles legacy raw blobs, NOSZ/NOS2, and upgrades existing NOSB when level improves.
     pub async fn recompress_blobs(&self, limit: usize) -> Result<RecompressReport, StorageError> {
         let limit = limit.max(1) as i64;
         let rows = self
@@ -78,7 +78,10 @@ impl StorageEngine {
         for (bucket, key, size) in rows {
             report.scanned += 1;
             let variants = blob_path_variants(self.data_dir(), &bucket, &key);
-            let Some(path) = first_existing_blob_path(&variants).await.map_err(internal)? else {
+            let Some(path) = super::first_existing_blob_path(&variants)
+                .await
+                .map_err(internal)?
+            else {
                 report.skipped += 1;
                 continue;
             };
@@ -98,8 +101,18 @@ impl StorageEngine {
                     report.skipped += 1;
                     continue;
                 }
-                let params = RuntimeCompressParams::with_dict(background_level, 0, dict_bytes);
-                let encoded = encode_blob_for_storage(&blob, &params)?;
+                let ctx = CompressionContext::new(
+                    Some(key.as_str()),
+                    None,
+                    size as u64,
+                    self.compress_min_size(),
+                );
+                let encoded = encode_blob_for_storage(
+                    &blob,
+                    background_level,
+                    self.compress_block_size(),
+                    ctx,
+                )?;
                 if encoded.len() >= blob.len() {
                     report.skipped += 1;
                     continue;
@@ -113,7 +126,12 @@ impl StorageEngine {
                 continue;
             }
 
-            if !is_compressed_blob(&blob) {
+            if is_nosb_blob(&blob) {
+                report.skipped += 1;
+                continue;
+            }
+
+            if !is_zstd_blob(&blob) {
                 report.skipped += 1;
                 continue;
             }
@@ -121,8 +139,8 @@ impl StorageEngine {
             let stored_level = read_stored_zstd_level(&blob).unwrap_or(0) as i32;
             let stored_dict = read_stored_dict_id(&blob).unwrap_or(0);
             let dict_loaded = dict.is_some();
-            let upgrading_level = stored_level < background_level
-                || format == BlobFormat::Nosz;
+            let upgrading_level =
+                stored_level < background_level || format == BlobFormat::Nosz;
             let needs_dict = dict_loaded && stored_dict == 0 && format == BlobFormat::Nos2;
             if !upgrading_level && !needs_dict && format == BlobFormat::Nos2 {
                 report.skipped += 1;
@@ -137,44 +155,43 @@ impl StorageEngine {
                 }
             };
 
-            let tmp_path = format!(
-                "{}/.tmp/recompress-logical-{}.tmp",
-                self.data_dir(),
-                uuid::Uuid::new_v4()
-            );
-            fs::write(&tmp_path, &logical).await.map_err(internal)?;
-
             let old_len = blob.len();
-            let part_path = path.with_extension("recompart");
-            let params = RuntimeCompressParams::with_dict(background_level, 0, dict_bytes);
-            let tmp = Path::new(&tmp_path);
-            if compress_file_to_storage(tmp, &part_path, size as u64, &params).is_err() {
-                let _ = fs::remove_file(&tmp_path).await;
+            let ctx = CompressionContext::new(
+                Some(key.as_str()),
+                None,
+                size as u64,
+                self.compress_min_size(),
+            );
+            let encoded = encode_blob_for_storage(
+                &logical,
+                background_level,
+                self.compress_block_size(),
+                ctx,
+            )?;
+            if upgrading_level {
+                if !is_nosb_blob(&encoded) && encoded.len() >= old_len {
+                    report.skipped += 1;
+                    continue;
+                }
+            } else {
+                if encoded.len() > old_len {
+                    report.skipped += 1;
+                    continue;
+                }
+                if !is_nosb_blob(&encoded) {
+                    report.skipped += 1;
+                    continue;
+                }
+            }
+            if !upgrading_level && encoded.len() == old_len {
                 report.skipped += 1;
                 continue;
             }
-            let _ = fs::remove_file(&tmp_path).await;
-
-            let Ok(new_blob) = fs::read(&part_path).await else {
-                let _ = fs::remove_file(&part_path).await;
-                report.skipped += 1;
-                continue;
-            };
-            if new_blob.len() > old_len || !is_compressed_blob(&new_blob) {
-                let _ = fs::remove_file(&part_path).await;
+            if !self.atomic_replace_blob(&path, &encoded).await? {
                 report.skipped += 1;
                 continue;
             }
-            if !upgrading_level && new_blob.len() == old_len {
-                let _ = fs::remove_file(&part_path).await;
-                report.skipped += 1;
-                continue;
-            }
-            if fs::rename(&part_path, &path).await.is_err() {
-                let _ = fs::remove_file(&part_path).await;
-                report.skipped += 1;
-                continue;
-            }
+            let new_blob = encoded;
             report.bytes_saved += (old_len as i64) - (new_blob.len() as i64);
             report.recompressed += 1;
         }
@@ -214,7 +231,11 @@ impl StorageEngine {
                 continue;
             }
             let variants = blob_path_variants(self.data_dir(), &bucket, &key);
-            let Some(path) = first_existing_blob_path(&variants).await.ok().flatten() else {
+            let Some(path) = super::first_existing_blob_path(&variants)
+                .await
+                .ok()
+                .flatten()
+            else {
                 continue;
             };
             let Ok(blob) = fs::read(&path).await else {

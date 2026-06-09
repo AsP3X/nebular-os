@@ -10,7 +10,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use super::compression::{
-    decompress_file_to_temp, read_blob_header_size, BlobFormat, HEADER_LEN, HEADER_LEN_V2,
+    decompress_file_to_temp, pump_block_blob_full, pump_block_blob_range, read_blob_header_size,
+    BlobFormat, FIXED_HEADER_LEN, HEADER_LEN, HEADER_LEN_V2,
 };
 use super::blocks::BlockStore;
 use super::blob_finalize::blob_format_from_header;
@@ -24,8 +25,6 @@ pub struct LimitedAsyncRead<R> {
     remaining: u64,
 }
 
-// Human: Constructor binds the byte window for a Range response (skip logical offset, cap length).
-// Agent: new(inner, skip, limit); remaining=limit; skip consumed in poll_read before user buffer fills.
 impl<R: AsyncRead + Unpin> LimitedAsyncRead<R> {
     pub fn new(inner: R, skip: u64, limit: u64) -> Self {
         Self {
@@ -36,21 +35,15 @@ impl<R: AsyncRead + Unpin> LimitedAsyncRead<R> {
     }
 }
 
-// Human: AsyncRead that seeks past `skip` bytes then returns at most `remaining` bytes to the caller.
-// Agent: poll_read phases: (1) drain skip via discard buffer (2) read min(remaining, buf) into caller.
 impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        // Human: Range fully satisfied — signal EOF without reading more from disk.
-        // Agent: remaining==0 => Ready(Ok(())) with empty buf (HTTP body complete).
         if self.remaining == 0 {
             return Poll::Ready(Ok(()));
         }
-        // Human: Skip bytes before the range start by reading into a throwaway buffer (no copy to client).
-        // Agent: WHILE skip>0 poll inner into 8KiB discard; EOF on inner ends poll early.
         if self.skip > 0 {
             let mut discard = [0u8; 8192];
             while self.skip > 0 {
@@ -69,8 +62,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
                 }
             }
         }
-        // Human: Read only the slice of the range that still fits in this response chunk.
-        // Agent: max=min(remaining, buf.remaining()); sub-read then decrement remaining.
         let max = (self.remaining as usize).min(buf.remaining());
         if max == 0 {
             return Poll::Ready(Ok(()));
@@ -92,8 +83,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for LimitedAsyncRead<R> {
     }
 }
 
-/// Human: Deletes a spill file when the response body is dropped (range reads on compressed blobs).
-/// Agent: Drop impl remove_file on spill_path; held inside GuardedObjectBodyStream until stream ends.
+/// Human: Deletes a spill file when the response body is dropped (range reads on legacy zstd blobs).
 pub struct SpillFileGuard {
     pub path: PathBuf,
 }
@@ -106,8 +96,6 @@ impl Drop for SpillFileGuard {
     }
 }
 
-/// Human: HTTP response body stream that can come from disk or a channel pump.
-/// Agent: ENUM FileLimited|Channel; Stream<Item=Result<Bytes,io::Error>> for axum Body::from_stream.
 pub enum ObjectBodyStream {
     FileLimited(ReaderStream<LimitedAsyncRead<File>>),
     Channel(tokio_stream::wrappers::ReceiverStream<Result<Bytes, std::io::Error>>),
@@ -126,8 +114,6 @@ impl Stream for ObjectBodyStream {
     }
 }
 
-/// Human: Keeps a spill-file guard alive until the client finishes reading the object body.
-/// Agent: WRAPS ObjectBodyStream; Drop order deletes spill after stream exhausted.
 pub struct GuardedObjectBodyStream {
     pub stream: ObjectBodyStream,
     _spill_guard: Option<SpillFileGuard>,
@@ -150,19 +136,18 @@ impl Stream for GuardedObjectBodyStream {
     }
 }
 
-/// Human: Build a streaming body for GET, honoring Range on both raw and zstd-wrapped blobs.
-/// Agent: READS blob_path+logical_size; raw=>LimitedAsyncRead on File; compressed+range=>temp decompress; compressed+full=>channel pump.
+/// Human: Build a streaming body for GET, honoring Range on raw, NOSB, legacy zstd, and dedup blobs.
 pub async fn open_object_body_stream(
     blob_path: &Path,
     logical_size: u64,
     range_start: u64,
     content_length: u64,
-    ctx: &ReadContext,
+    ctx: &super::blob_finalize::ReadContext,
 ) -> Result<GuardedObjectBodyStream, StorageError> {
-    let header = fs::read(blob_path)
-        .await
-        .map_err(map_io_error)?;
-    let format = blob_format_from_header(&header);
+    let mut peek = [0u8; FIXED_HEADER_LEN];
+    let mut file = File::open(blob_path).await.map_err(map_io_error)?;
+    let read = file.read(&mut peek).await.map_err(map_io_error)?;
+    let format = blob_format_from_header(&peek[..read]);
 
     if format == BlobFormat::Nosd {
         return open_dedup_object_stream(
@@ -176,6 +161,7 @@ pub async fn open_object_body_stream(
     }
 
     if format == BlobFormat::Raw {
+        drop(file);
         let stream = open_raw_file_stream(blob_path, range_start, content_length).await?;
         return Ok(GuardedObjectBodyStream {
             stream,
@@ -183,10 +169,26 @@ pub async fn open_object_body_stream(
         });
     }
 
+    if format == BlobFormat::Nosb {
+        let path = blob_path.to_path_buf();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+        if range_start == 0 && content_length == logical_size {
+            tokio::task::spawn_blocking(move || pump_block_blob_full(path, logical_size, tx));
+        } else {
+            tokio::task::spawn_blocking(move || {
+                pump_block_blob_range(path, logical_size, range_start, content_length, tx)
+            });
+        }
+        return Ok(GuardedObjectBodyStream {
+            stream: ObjectBodyStream::Channel(tokio_stream::wrappers::ReceiverStream::new(rx)),
+            _spill_guard: None,
+        });
+    }
+
     let dict = ctx.dict_bytes();
 
     if range_start == 0 && content_length == logical_size {
-        let stream = open_full_compressed_stream(blob_path, logical_size, format, dict).await?;
+        let stream = open_full_zstd_stream(blob_path, logical_size, format, dict).await?;
         return Ok(GuardedObjectBodyStream {
             stream,
             _spill_guard: None,
@@ -228,7 +230,7 @@ async fn open_dedup_object_stream(
     logical_size: u64,
     range_start: u64,
     content_length: u64,
-    ctx: &ReadContext,
+    ctx: &super::blob_finalize::ReadContext,
 ) -> Result<GuardedObjectBodyStream, StorageError> {
     let spill = format!(
         "{}/.tmp/dedup-{}.bin",
@@ -266,7 +268,7 @@ async fn open_raw_file_stream(
     Ok(ObjectBodyStream::FileLimited(ReaderStream::new(limited)))
 }
 
-async fn open_full_compressed_stream(
+async fn open_full_zstd_stream(
     blob_path: &Path,
     logical_size: u64,
     format: BlobFormat,
@@ -361,8 +363,6 @@ fn pump_zstd_decode(
     }
 }
 
-/// Human: Stream upload body to a temp file while hashing; no in-memory payload buffer.
-/// Agent: WRITES tmp_path; RETURNS (logical_size, xxh3 digest hex).
 pub async fn stream_body_to_temp(
     body: &mut (impl AsyncRead + Unpin),
     tmp_path: &Path,
@@ -387,8 +387,6 @@ pub async fn stream_body_to_temp(
     Ok((size, etag))
 }
 
-/// Human: Hash an on-disk temp file (used after multipart part concatenation).
-/// Agent: READS tmp_path in chunks; RETURNS (size, xxh3 hex etag).
 pub fn hash_temp_file(tmp_path: &Path, buffer_size: usize) -> Result<(u64, String), StorageError> {
     let total_size = std::fs::metadata(tmp_path)
         .map_err(|e| internal(anyhow::anyhow!(e)))?

@@ -8,7 +8,8 @@ use tokio::sync::Semaphore;
 
 use super::blob_ops::link_or_copy_blob;
 use super::blocks::BlockStore;
-use super::compression::{self, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_LEVEL_UPLOAD};
+use super::compressibility::DEFAULT_MIN_COMPRESSIBLE_SIZE;
+use super::compression::{self, DEFAULT_BLOCK_SIZE, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_LEVEL_UPLOAD};
 use super::dict_store::DictStore;
 use super::error::{internal, StorageError};
 use super::metadata_backend::MetadataBackendKind;
@@ -99,6 +100,8 @@ pub struct EngineOptions {
     pub max_logical_bytes: i64,
     pub bulk_delete_concurrency: usize,
     pub bulk_delete_batch_limit: u64,
+    pub compress_min_size: usize,
+    pub compress_block_size: usize,
 }
 
 impl Default for EngineOptions {
@@ -126,6 +129,8 @@ impl Default for EngineOptions {
             max_logical_bytes: 0,
             bulk_delete_concurrency: DEFAULT_BULK_DELETE_CONCURRENCY,
             bulk_delete_batch_limit: DEFAULT_BULK_DELETE_BATCH_LIMIT,
+            compress_min_size: DEFAULT_MIN_COMPRESSIBLE_SIZE,
+            compress_block_size: DEFAULT_BLOCK_SIZE,
         }
     }
 }
@@ -158,6 +163,8 @@ pub struct StorageEngine {
     block_store: BlockStore,
     bulk_delete_concurrency: usize,
     bulk_delete_batch_limit: u64,
+    compress_min_size: usize,
+    compress_block_size: usize,
 }
 
 pub(crate) struct TempFileGuard {
@@ -266,6 +273,8 @@ impl StorageEngine {
             block_store: BlockStore::new(data_dir),
             bulk_delete_concurrency: opts.bulk_delete_concurrency.clamp(1, 256),
             bulk_delete_batch_limit: opts.bulk_delete_batch_limit.clamp(1, 10_000),
+            compress_min_size: opts.compress_min_size.max(1),
+            compress_block_size: opts.compress_block_size.max(4096),
         })
     }
 
@@ -398,6 +407,14 @@ impl StorageEngine {
         self.dedup_min_size
     }
 
+    pub fn compress_min_size(&self) -> usize {
+        self.compress_min_size
+    }
+
+    pub fn compress_block_size(&self) -> usize {
+        self.compress_block_size
+    }
+
     pub fn dict_store(&self) -> &DictStore {
         &self.dict_store
     }
@@ -410,7 +427,12 @@ impl StorageEngine {
         &self.system_write
     }
 
-    pub(crate) fn blob_finalize_options(&self, existing: Option<PathBuf>) -> BlobFinalizeOptions {
+    pub(crate) fn blob_finalize_options(
+        &self,
+        existing: Option<PathBuf>,
+        object_key: &str,
+        content_type: Option<&str>,
+    ) -> BlobFinalizeOptions {
         let dict = if self.zstd_dict_enabled {
             self.dict_store.global_dict()
         } else {
@@ -423,6 +445,10 @@ impl StorageEngine {
             dedup_enabled: self.dedup_enabled,
             dedup_block_size: self.dedup_block_size,
             dedup_min_size: self.dedup_min_size,
+            compress_min_size: self.compress_min_size,
+            compress_block_size: self.compress_block_size,
+            object_key: Some(object_key.to_string()),
+            content_type: content_type.map(str::to_string),
             data_dir: self.data_dir.clone(),
             system_pool: self.system_write.clone(),
             existing_blob: existing,
@@ -573,7 +599,7 @@ impl StorageEngine {
             PathBuf::from(&tmp_path).as_path(),
             &final_path,
             size,
-            self.blob_finalize_options(existing.clone()),
+            self.blob_finalize_options(existing.clone(), safe_key, content_type),
         )
         .await?;
 

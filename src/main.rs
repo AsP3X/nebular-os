@@ -48,6 +48,8 @@ async fn main() -> Result<()> {
         max_logical_bytes: cfg.max_logical_bytes,
         bulk_delete_concurrency: cfg.bulk_delete_concurrency,
         bulk_delete_batch_limit: cfg.bulk_delete_batch_limit,
+        compress_min_size: cfg.compress_min_size,
+        compress_block_size: cfg.compress_block_size,
     };
 
     let storage = storage::engine::StorageEngine::with_full_options(

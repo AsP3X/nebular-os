@@ -2,6 +2,7 @@ pub mod blob_finalize;
 pub mod blob_paths;
 pub mod blob_ops;
 pub mod blocks;
+pub mod compressibility;
 pub mod compression;
 pub mod dict_store;
 pub mod engine;

@@ -5,10 +5,11 @@ use sqlx::Pool;
 use sqlx::Sqlite;
 
 use super::blocks::BlockStore;
+use super::compressibility::CompressionContext;
 use super::compression::{
     compress_file_to_storage, detect_blob_format, is_dedup_manifest, is_compressed_blob,
-    read_stored_dict_id, read_stored_zstd_level, BlobFormat, RuntimeCompressParams, BLOB_MAGIC,
-    BLOB_MAGIC_V2, DEDUP_MAGIC, HEADER_LEN, HEADER_LEN_V2,
+    read_stored_dict_id, read_stored_zstd_level, BlobFormat, BLOB_MAGIC, BLOB_MAGIC_V2,
+    DEDUP_MAGIC, HEADER_LEN, HEADER_LEN_V2,
 };
 use super::error::{internal, map_io_error, StorageError};
 
@@ -19,22 +20,16 @@ pub struct BlobFinalizeOptions {
     pub dedup_enabled: bool,
     pub dedup_block_size: usize,
     pub dedup_min_size: u64,
+    pub compress_min_size: usize,
+    pub compress_block_size: usize,
+    pub object_key: Option<String>,
+    pub content_type: Option<String>,
     pub data_dir: String,
     pub system_pool: Pool<Sqlite>,
     pub existing_blob: Option<PathBuf>,
 }
 
-impl BlobFinalizeOptions {
-    pub fn compress_params(&self) -> RuntimeCompressParams<'_> {
-        RuntimeCompressParams::with_dict(
-            self.level,
-            self.dict_id,
-            self.dict.as_deref().map(|v| v.as_slice()),
-        )
-    }
-}
-
-/// Human: After temp upload, compress-or-store (or dedup) to final blob path without loading the whole object into RAM.
+/// Human: After temp upload, block-compress-or-store (or dedup) to final blob path without loading the whole object into RAM.
 pub async fn finalize_temp_to_blob(
     tmp_path: &Path,
     final_path: &Path,
@@ -75,28 +70,21 @@ pub async fn finalize_temp_to_blob(
     }
 
     let level = opts.level;
-    let dict_id = opts.dict_id;
-    let dict = opts.dict.clone();
-    let params = RuntimeCompressParams::with_dict(
-        level,
-        dict_id,
-        dict.as_deref().map(|v| v.as_slice()),
-    );
-    let params = (
-        params.level,
-        params.dict_id,
-        dict,
-    );
+    let block_size = opts.compress_block_size;
+    let min_size = opts.compress_min_size;
+    let object_key = opts.object_key.clone();
+    let content_type = opts.content_type.clone();
     tokio::task::spawn_blocking(move || {
-        let compress = RuntimeCompressParams::with_dict(
-            params.0,
-            params.1,
-            params.2.as_deref().map(|v| v.as_slice()),
+        let ctx = CompressionContext::new(
+            object_key.as_deref(),
+            content_type.as_deref(),
+            logical_size,
+            min_size,
         );
-        compress_file_to_storage(&tmp, &fin, logical_size, &compress)
+        compress_file_to_storage(&tmp, &fin, logical_size, level, block_size, ctx)
     })
-        .await
-        .map_err(internal)??;
+    .await
+    .map_err(internal)??;
     Ok(())
 }
 
@@ -136,7 +124,10 @@ pub fn blob_format_from_header(header: &[u8]) -> BlobFormat {
 }
 
 pub fn magic_matches_compressed(header: &[u8]) -> bool {
-    header.starts_with(BLOB_MAGIC) || header.starts_with(BLOB_MAGIC_V2) || header.starts_with(DEDUP_MAGIC)
+    header.starts_with(super::compression::NOSB_MAGIC)
+        || header.starts_with(BLOB_MAGIC)
+        || header.starts_with(BLOB_MAGIC_V2)
+        || header.starts_with(DEDUP_MAGIC)
 }
 
 pub fn stored_level_from_header(header: &[u8]) -> Option<u8> {

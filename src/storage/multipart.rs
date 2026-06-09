@@ -174,7 +174,11 @@ impl StorageEngine {
             PathBuf::from(&tmp_path).as_path(),
             &final_path,
             total_size,
-            self.blob_finalize_options(existing),
+            self.blob_finalize_options(
+                existing,
+                &safe_key,
+                session.content_type.as_deref(),
+            ),
         )
         .await?;
 

@@ -51,13 +51,15 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_MULTIPART_PART_SIZE` | Max bytes per multipart part (default `8388608`) |
 | `NOS_READ_POOL_SIZE` | SQLite read pool connections (default `4`) |
 | `NOS_ZSTD_LEVEL` | Background / maintenance zstd level 1–22 (default `22`; lower = faster recompression passes) |
-| `NOS_ZSTD_LEVEL_UPLOAD` | Fast upload zstd level 1–22 (default `3`) |
+| `NOS_ZSTD_LEVEL_UPLOAD` | Fast upload zstd level 1–22 for NOSB block writes (default `3`) |
 | `NOS_ZSTD_DICT_ENABLED` | Train and use a global zstd dictionary (default `false`) |
 | `NOS_ZSTD_DICT_MAX_BYTES` | Max trained dictionary size in bytes (default `112640`) |
 | `NOS_ZSTD_DICT_TRAIN_BATCH` | Sample count for dictionary training (default `32`) |
 | `NOS_DEDUP_ENABLED` | Block-level deduplication for large objects (default `false`) |
 | `NOS_DEDUP_BLOCK_SIZE` | Dedup chunk size in bytes (default `262144`) |
 | `NOS_DEDUP_MIN_SIZE` | Minimum logical object size to use dedup (default `1048576`) |
+| `NOS_COMPRESS_MIN_SIZE` | Minimum object size in bytes before attempting NOSB compression (default `4096`) |
+| `NOS_COMPRESS_BLOCK_SIZE` | Uncompressed block size for NOSB blob layout (default `1048576`; min `4096`) |
 | `NOS_S3_COMPAT` | Enable S3-style XML list/errors and `x-amz-copy-source` (default `false`) |
 | `NOS_BUCKET_POLICY` | JSON map of `sub` → allowed bucket names; empty = no extra restriction |
 | `NOS_S3_ACCESS_KEY` / `NOS_S3_SECRET_KEY` | Optional access-key auth via `Authorization: NOS <key>:<sig>` |
@@ -97,6 +99,18 @@ Replication is **asynchronous** (`NOS_REPLICATION_ASYNC=true` by default). A suc
 ### Split-brain and dual writes
 
 There is no distributed lock. Two clients writing the same `bucket/key` on different nodes can diverge; last writer wins per node metadata. Use **assigned** mode plus client routing (e.g. Ownly) to steer writes, or **readonly** replicas for read scaling. Symmetric `NOS_CLUSTER_PEERS` lists are recommended; the server logs a warning if `NOS_NODE_ID` is missing from the local peer list.
+
+### Blob storage format (NOSB)
+
+Compressible objects are stored in a **block-compressed** layout (`NOSB` magic):
+
+- Fixed header: logical size, block size, block count
+- Per-block index for seek/range without decoding the whole file
+- Each block is independently zstd-compressed or stored raw, whichever is smaller
+
+Incompressible types (e.g. `video/*`, `.mp3`, `.zip`) and objects below `NOS_COMPRESS_MIN_SIZE` stay as raw bytes with no header. If block compression does not shrink the payload, the raw file is kept.
+
+**Migration:** Older `NOSZ` whole-object blobs are not readable after this format change. Re-upload objects or run `NOS_RECOMPRESS_ON_STARTUP` / periodic recompression to rewrite remaining raw blobs into `NOSB` (already-compressed legacy blobs must be re-ingested from source).
 
 ## HTTP API
 

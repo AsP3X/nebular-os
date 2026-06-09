@@ -117,6 +117,8 @@ async fn postgres_app() -> Option<(axum::Router, String, TempDir, testcontainers
         dedup_enabled: false,
         dedup_block_size: 256 * 1024,
         dedup_min_size: 1024 * 1024,
+        compress_min_size: 4096,
+        compress_block_size: 64 * 1024,
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,

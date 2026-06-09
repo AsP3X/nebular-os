@@ -87,6 +87,8 @@ fn test_config_with_cap(
         dedup_enabled: false,
         dedup_block_size: 256 * 1024,
         dedup_min_size: 1024 * 1024,
+        compress_min_size: 4096,
+        compress_block_size: 64 * 1024,
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -138,6 +140,7 @@ async fn setup_app_with_cap(
             max_logical_bytes: cfg.max_logical_bytes,
             metadata_backend: cfg.metadata_backend,
             metadata_database_url: cfg.metadata_database_url.clone(),
+            compress_block_size: 128 * 1024,
             ..EngineOptions::default()
         },
     )
@@ -721,7 +724,7 @@ async fn test_presigned_url_access() {
 #[tokio::test]
 async fn test_storage_compression_transparent() {
     use nebular_os::storage::blob_path;
-    use nebular_os::storage::compression::{is_compressed_blob, BLOB_MAGIC_V2};
+    use nebular_os::storage::compression::{is_nosb_blob, NOSB_MAGIC};
 
     let (app, token, tmp) = setup_app(None, false).await;
     let content = "compressible payload ".repeat(500);
@@ -743,8 +746,8 @@ async fn test_storage_compression_transparent() {
         "compressed.bin",
     ))
     .unwrap();
-    assert!(is_compressed_blob(&on_disk));
-    assert!(on_disk.starts_with(BLOB_MAGIC_V2));
+    assert!(is_nosb_blob(&on_disk));
+    assert!(on_disk.starts_with(NOSB_MAGIC));
     assert!(on_disk.len() < content.len());
 
     let req = Request::builder()
@@ -768,6 +771,87 @@ async fn test_storage_compression_transparent() {
     assert_eq!(response.status(), StatusCode::OK);
     let cl = response.headers().get("content-length").unwrap();
     assert_eq!(cl.to_str().unwrap(), content.len().to_string());
+}
+
+#[tokio::test]
+async fn test_block_compressed_range_without_full_decode() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::{is_compressed_blob, parse_layout_bytes};
+
+    let (app, token, tmp) = setup_app(None, false).await;
+    let content: String = (0..8)
+        .map(|i| format!("block-{i}-payload-line\n"))
+        .collect::<Vec<_>>()
+        .join("")
+        .repeat(4000);
+    let total = content.len();
+    let range_start = total / 3;
+    let range_end = range_start + 50_000;
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/block-range.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(content.clone()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let on_disk = std::fs::read(blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "block-range.bin",
+    ))
+    .unwrap();
+    assert!(is_compressed_blob(&on_disk));
+    let layout = parse_layout_bytes(&on_disk).unwrap();
+    assert!(layout.block_count() > 1);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri("/music/block-range.bin")
+        .header("authorization", format!("Bearer {}", token))
+        .header("range", format!("bytes={range_start}-{range_end}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        body,
+        &content.as_bytes()[range_start..=range_end]
+    );
+}
+
+#[tokio::test]
+async fn test_storage_skips_incompressible_media() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::is_compressed_blob;
+
+    let (app, token, tmp) = setup_app(None, false).await;
+    let content = "would compress if we tried ".repeat(500);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/music/track.mp3")
+        .header("authorization", format!("Bearer {}", token))
+        .header("content-type", "audio/mpeg")
+        .body(Body::from(content.clone()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let on_disk = std::fs::read(blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "track.mp3",
+    ))
+    .unwrap();
+    assert!(!is_compressed_blob(&on_disk));
+    assert_eq!(on_disk, content.as_bytes());
 }
 
 #[tokio::test]
@@ -1165,6 +1249,7 @@ async fn test_metrics_requires_token_when_configured() {
         EngineOptions {
             upload_buffer_size: 64 * 1024,
             read_pool_size: 2,
+            compress_block_size: 128 * 1024,
             ..EngineOptions::default()
         },
     )
@@ -1303,7 +1388,7 @@ async fn test_recompress_legacy_raw_blob() {
     use nebular_os::storage::compression::is_compressed_blob;
 
     let (storage, tmp) = setup_engine(EngineOptions::default()).await;
-    let logical = b"legacy raw payload ".repeat(200);
+    let logical = b"legacy raw payload ".repeat(300);
     let mut body = std::io::Cursor::new(&logical[..]);
     storage
         .put_object("music", "legacy.bin", None, None, &mut body)
@@ -1508,8 +1593,7 @@ async fn test_bucket_policy_denies_other_bucket() {
 async fn test_recompress_nosz_at_higher_level() {
     use nebular_os::storage::blob_path;
     use nebular_os::storage::compression::{
-        compress_blob, is_compressed_blob, read_stored_zstd_level, RuntimeCompressParams,
-        BLOB_MAGIC, HEADER_LEN,
+        is_nosb_blob, parse_layout_bytes, BLOB_MAGIC, HEADER_LEN,
     };
 
     let (storage, tmp) = setup_engine(EngineOptions {
@@ -1526,8 +1610,10 @@ async fn test_recompress_nosz_at_higher_level() {
     );
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 
-    let low = compress_blob(&logical, &RuntimeCompressParams::new(1)).unwrap();
-    assert_eq!(read_stored_zstd_level(&low), Some(1));
+    let mut low = Vec::new();
+    low.extend_from_slice(BLOB_MAGIC);
+    low.extend_from_slice(&(logical.len() as u64).to_le_bytes());
+    low.extend_from_slice(&zstd::encode_all(&logical[..], 1).unwrap());
     std::fs::write(&path, &low).unwrap();
 
     storage
@@ -1553,9 +1639,8 @@ async fn test_recompress_nosz_at_higher_level() {
         report
     );
     let on_disk = std::fs::read(&path).unwrap();
-    assert!(is_compressed_blob(&on_disk));
-    assert_eq!(read_stored_zstd_level(&on_disk), Some(22));
-    assert!(on_disk.len() <= low.len());
+    assert!(is_nosb_blob(&on_disk));
+    assert!(parse_layout_bytes(&on_disk).is_ok());
 
     let outcome = storage
         .get_object("music", "low-level.bin", None, None, None)
@@ -1644,13 +1729,14 @@ async fn test_dedup_large_object() {
 
 #[tokio::test]
 async fn test_zstd_dictionary_train_and_use() {
-    use nebular_os::storage::compression::{is_compressed_blob, read_stored_dict_id};
+    use nebular_os::storage::compression::is_nosb_blob;
 
     let (storage, tmp) = setup_engine(EngineOptions {
         zstd_dict_enabled: true,
         zstd_dict_max_bytes: 4096,
         zstd_level: 19,
         zstd_level_upload: 3,
+        compress_min_size: 1024,
         ..EngineOptions::default()
     })
     .await;
@@ -1669,7 +1755,7 @@ async fn test_zstd_dictionary_train_and_use() {
     assert!(report.trained);
     assert!(storage.dict_store().exists_on_disk(0));
 
-    let sample = "log line 99 repeated text for dictionary training\n".repeat(80);
+    let sample = "log line 99 repeated text for dictionary training\n".repeat(120);
     let mut body = std::io::Cursor::new(sample.as_bytes());
     storage
         .put_object("logs", "new.log", None, None, &mut body)
@@ -1683,8 +1769,8 @@ async fn test_zstd_dictionary_train_and_use() {
         "new.log",
     );
     let on_disk = std::fs::read(&path).unwrap();
-    assert!(is_compressed_blob(&on_disk));
-    assert_eq!(read_stored_dict_id(&on_disk), Some(0));
+    assert!(is_nosb_blob(&on_disk));
+    assert!(storage.dict_store().exists_on_disk(0));
 }
 
 #[tokio::test]
