@@ -705,6 +705,31 @@ impl ObjectMetaStore {
         self.hard_delete_object(bucket, key).await
     }
 
+    /// Human: Refresh stored relative blob path after on-disk layout migration (Postgres metadata mode).
+    /// Agent: UPDATE nos_objects.blob_path; NO-OP for SQLite where paths are derived from keys.
+    pub async fn update_blob_path(
+        &self,
+        bucket: &str,
+        key: &str,
+        blob_path: &str,
+    ) -> Result<(), StorageError> {
+        match &self.inner {
+            ObjectMetaInner::Sqlite { .. } => {}
+            ObjectMetaInner::Postgres { write, .. } => {
+                sqlx::query(
+                    "UPDATE nos_objects SET blob_path = $1, updated_at = now() WHERE bucket = $2 AND object_key = $3",
+                )
+                .bind(blob_path)
+                .bind(bucket)
+                .bind(key)
+                .execute(write)
+                .await
+                .map_err(internal)?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_soft_deleted_before(
         &self,
         cutoff_ts: i64,
@@ -750,6 +775,49 @@ impl ObjectMetaStore {
                 sqlx::query_as(
                     "SELECT bucket, object_key AS key, size_bytes AS size FROM nos_objects WHERE deleted_at IS NULL ORDER BY updated_at LIMIT $1",
                 )
+                .bind(limit)
+                .fetch_all(read)
+                .await
+                .map_err(internal)
+            }
+        }
+    }
+
+    /// Human: Paginated active objects for layout/format migration batches.
+    /// Agent: ORDER BY key; READS start_after as exclusive cursor; RETURNS (bucket, key, size).
+    pub async fn list_migration_page(
+        &self,
+        limit: i64,
+        start_after: Option<&str>,
+    ) -> Result<Vec<(String, String, i64)>, StorageError> {
+        match &self.inner {
+            ObjectMetaInner::Sqlite { read, .. } => {
+                if let Some(after) = start_after {
+                    sqlx::query_as(
+                        "SELECT bucket, key, size FROM objects WHERE deleted_at IS NULL AND key > ? ORDER BY key LIMIT ?",
+                    )
+                    .bind(after)
+                    .bind(limit)
+                    .fetch_all(read)
+                    .await
+                    .map_err(internal)
+                } else {
+                    sqlx::query_as(
+                        "SELECT bucket, key, size FROM objects WHERE deleted_at IS NULL ORDER BY key LIMIT ?",
+                    )
+                    .bind(limit)
+                    .fetch_all(read)
+                    .await
+                    .map_err(internal)
+                }
+            }
+            ObjectMetaInner::Postgres { read, .. } => {
+                sqlx::query_as(
+                    "SELECT bucket, object_key AS key, size_bytes AS size FROM nos_objects \
+                     WHERE deleted_at IS NULL AND ($1::text IS NULL OR object_key > $1) \
+                     ORDER BY object_key LIMIT $2",
+                )
+                .bind(start_after)
                 .bind(limit)
                 .fetch_all(read)
                 .await

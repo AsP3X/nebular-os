@@ -2,7 +2,8 @@ use std::path::Path;
 
 use tokio::fs;
 
-use super::blob_path_variants;
+use super::blob_ops::link_or_copy_blob;
+use super::{blob_path, blob_path_variants, blob_rel_path};
 use super::blocks::BlockStore;
 use super::compressibility::CompressionContext;
 use super::compression::{
@@ -19,6 +20,16 @@ pub struct RecompressReport {
     pub recompressed: u64,
     pub skipped: u64,
     pub bytes_saved: i64,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct MigrateBlobsReport {
+    pub scanned: u64,
+    pub migrated: u64,
+    pub skipped: u64,
+    pub failed: u64,
+    pub next_start_after: Option<String>,
+    pub is_truncated: bool,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -289,6 +300,136 @@ impl StorageEngine {
                 recompressed = report.recompressed,
                 bytes_saved = report.bytes_saved,
                 "storage::recompress_blobs completed"
+            );
+        }
+        Ok(report)
+    }
+
+    /// Human: Move legacy nested blob paths to flat encoded filenames and upgrade old compression formats.
+    /// Agent: READS list_migration_page; WRITES blob_path(); REMOVES legacy path; UPDATES Postgres blob_path.
+    pub async fn migrate_blobs(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> Result<MigrateBlobsReport, StorageError> {
+        let limit = limit.max(1) as i64;
+        let rows = self
+            .object_meta()
+            .list_migration_page(limit + 1, start_after)
+            .await?;
+
+        let mut report = MigrateBlobsReport::default();
+        let truncated = rows.len() > limit as usize;
+        let page: Vec<_> = rows.into_iter().take(limit as usize).collect();
+        if let Some((_, last_key, _)) = page.last() {
+            report.next_start_after = Some(last_key.clone());
+        }
+        report.is_truncated = truncated;
+
+        let background_level = self.zstd_level();
+        let dict = if self.zstd_dict_enabled() {
+            self.dict_store().global_dict()
+        } else {
+            None
+        };
+        let dict_bytes = dict.as_deref().map(|v| v.as_slice());
+        let dict_loaded = dict.is_some();
+        let target_dict_id = if dict_loaded { 0 } else { 0 };
+
+        for (bucket, key, size) in page {
+            report.scanned += 1;
+            let variants = blob_path_variants(self.data_dir(), &bucket, &key);
+            let Some(current) = super::first_existing_blob_path(&variants)
+                .await
+                .map_err(internal)?
+            else {
+                report.skipped += 1;
+                continue;
+            };
+            let target = blob_path(self.data_dir(), &bucket, &key);
+            let needs_relocate = current != target;
+
+            let Ok(blob) = fs::read(&current).await else {
+                report.failed += 1;
+                continue;
+            };
+
+            let format = detect_blob_format(&blob);
+            let migrating_legacy = is_legacy_format(format);
+            let upgrading_indexed = self.indexed_needs_upgrade(
+                &blob,
+                format,
+                background_level,
+                dict_loaded,
+                target_dict_id,
+            );
+            // Human: Raw blobs already on the encoded path are valid — only re-encode when relocating or upgrading.
+            // Agent: AVOIDS re-migrating small raw files every batch; Raw+legacy path still upgrades on first pass.
+            let needs_reencode = migrating_legacy
+                || upgrading_indexed
+                || (format == BlobFormat::Raw && needs_relocate);
+
+            if !needs_relocate && !needs_reencode {
+                report.skipped += 1;
+                continue;
+            }
+
+            let write_ok = if needs_reencode {
+                let logical = match self.decode_for_maintenance(&blob, format, size, dict_bytes) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        report.failed += 1;
+                        continue;
+                    }
+                };
+                let ctx = CompressionContext::new(
+                    Some(key.as_str()),
+                    None,
+                    size as u64,
+                    self.compress_min_size(),
+                    self.compress_exclude_extensions(),
+                );
+                let encode_opts = self.maintenance_encode_opts(target_dict_id, dict_bytes);
+                let encoded = encode_blob_for_storage(
+                    &logical,
+                    background_level,
+                    self.block_size(),
+                    ctx,
+                    encode_opts,
+                )?;
+                self.atomic_replace_blob(&target, &encoded).await?
+            } else {
+                link_or_copy_blob(&current, &target).await?;
+                true
+            };
+
+            if !write_ok {
+                report.failed += 1;
+                continue;
+            }
+
+            if current != target && current.exists() {
+                BlockStore::release_blob(self.system_write_pool(), self.data_dir(), &current)
+                    .await?;
+                let _ = fs::remove_file(&current).await;
+            }
+            if !self.metadata_mode().is_blob_only() {
+                let rel = blob_rel_path(&bucket, &key);
+                let _ = self
+                    .object_meta()
+                    .update_blob_path(&bucket, &key, &rel)
+                    .await;
+            }
+            report.migrated += 1;
+        }
+
+        if report.migrated > 0 {
+            tracing::info!(
+                scanned = report.scanned,
+                migrated = report.migrated,
+                skipped = report.skipped,
+                failed = report.failed,
+                "storage::migrate_blobs completed"
             );
         }
         Ok(report)

@@ -93,6 +93,10 @@ pub async fn create_app(
             axum::routing::post(maintenance::verify_blobs),
         )
         .route(
+            "/_nos/maintenance/migrate_blobs",
+            axum::routing::post(maintenance::migrate_blobs),
+        )
+        .route(
             "/_nos/maintenance/replication_status",
             get(maintenance::replication_status),
         )
