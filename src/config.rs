@@ -75,11 +75,16 @@ pub struct NosConfig {
     pub zstd_dict_max_bytes: usize,
     pub zstd_dict_train_batch: usize,
     pub dedup_enabled: bool,
+    /// Unified block size default (NOS_BLOCK_SIZE); compress/dedup-specific env vars override.
+    pub block_size: usize,
     pub dedup_block_size: usize,
     pub dedup_min_size: u64,
     pub compress_min_size: usize,
     pub compress_block_size: usize,
     pub compress_exclude_extensions: Vec<String>,
+    pub block_cache_entries: usize,
+    pub verify_interval_secs: u64,
+    pub verify_batch_size: usize,
     pub s3_compat: bool,
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
@@ -127,8 +132,11 @@ impl fmt::Debug for NosConfig {
             .field("zstd_level_upload", &self.zstd_level_upload)
             .field("zstd_dict_enabled", &self.zstd_dict_enabled)
             .field("dedup_enabled", &self.dedup_enabled)
+            .field("block_size", &self.block_size)
             .field("compress_min_size", &self.compress_min_size)
             .field("compress_block_size", &self.compress_block_size)
+            .field("block_cache_entries", &self.block_cache_entries)
+            .field("verify_interval_secs", &self.verify_interval_secs)
             .field("compress_exclude_extensions", &self.compress_exclude_extensions)
             .field("s3_compat", &self.s3_compat)
             .field(
@@ -339,11 +347,25 @@ impl NosConfig {
                 .ok()
                 .map(|s| parse_bool(&s))
                 .unwrap_or(false),
+            block_size: {
+                let default = crate::storage::compression::DEFAULT_BLOCK_SIZE;
+                env::var("NOS_BLOCK_SIZE")
+                    .ok()
+                    .map(|s| s.parse().context("NOS_BLOCK_SIZE must be a valid usize"))
+                    .transpose()?
+                    .unwrap_or(default)
+            },
             dedup_block_size: env::var("NOS_DEDUP_BLOCK_SIZE")
                 .ok()
                 .map(|s| s.parse().context("NOS_DEDUP_BLOCK_SIZE must be a valid usize"))
                 .transpose()?
-                .unwrap_or(256 * 1024),
+                .unwrap_or({
+                    let default = crate::storage::compression::DEFAULT_BLOCK_SIZE;
+                    env::var("NOS_BLOCK_SIZE")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(default)
+                }),
             dedup_min_size: env::var("NOS_DEDUP_MIN_SIZE")
                 .ok()
                 .map(|s| s.parse().context("NOS_DEDUP_MIN_SIZE must be a valid u64"))
@@ -358,7 +380,28 @@ impl NosConfig {
                 .ok()
                 .map(|s| s.parse().context("NOS_COMPRESS_BLOCK_SIZE must be a valid usize"))
                 .transpose()?
-                .unwrap_or(crate::storage::compression::DEFAULT_BLOCK_SIZE),
+                .unwrap_or({
+                    let default = crate::storage::compression::DEFAULT_BLOCK_SIZE;
+                    env::var("NOS_BLOCK_SIZE")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(default)
+                }),
+            block_cache_entries: env::var("NOS_BLOCK_CACHE_ENTRIES")
+                .ok()
+                .map(|s| s.parse().context("NOS_BLOCK_CACHE_ENTRIES must be a valid usize"))
+                .transpose()?
+                .unwrap_or(256),
+            verify_interval_secs: env::var("NOS_VERIFY_INTERVAL_SECS")
+                .ok()
+                .map(|s| s.parse().context("NOS_VERIFY_INTERVAL_SECS must be a valid u64"))
+                .transpose()?
+                .unwrap_or(0),
+            verify_batch_size: env::var("NOS_VERIFY_BATCH_SIZE")
+                .ok()
+                .map(|s| s.parse().context("NOS_VERIFY_BATCH_SIZE must be a valid usize"))
+                .transpose()?
+                .unwrap_or(100),
             compress_exclude_extensions: env::var("NOS_COMPRESS_EXCLUDE_EXTENSIONS")
                 .ok()
                 .map(|s| crate::storage::compressibility::parse_exclude_extensions(&s))

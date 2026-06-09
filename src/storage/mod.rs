@@ -1,6 +1,7 @@
 pub mod blob_finalize;
 pub mod blob_paths;
 pub mod blob_ops;
+pub mod block_cache;
 pub mod blocks;
 pub mod compressibility;
 pub mod compression;
@@ -19,7 +20,7 @@ pub mod reconcile;
 pub mod types;
 
 pub use engine::{GetObjectOutcome, StorageEngine};
-pub use maintenance::{DictTrainReport, RecompressReport};
+pub use maintenance::{DictTrainReport, RecompressReport, VerifyBlobsReport};
 
 pub fn sanitize_bucket(bucket: &str) -> anyhow::Result<String> {
     if bucket.is_empty() {

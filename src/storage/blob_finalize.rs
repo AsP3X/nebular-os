@@ -4,6 +4,7 @@ use std::sync::Arc;
 use sqlx::Pool;
 use sqlx::Sqlite;
 
+use super::block_cache::BlockDecodeCache;
 use super::blocks::BlockStore;
 use super::compressibility::CompressionContext;
 use super::compression::{
@@ -103,6 +104,7 @@ pub async fn finalize_temp_to_blob(
 pub struct ReadContext {
     pub data_dir: String,
     pub dict: Option<Arc<Vec<u8>>>,
+    pub block_cache: Option<BlockDecodeCache>,
 }
 
 impl ReadContext {

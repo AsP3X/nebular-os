@@ -88,6 +88,10 @@ pub async fn create_app(
             "/_nos/maintenance/gc_orphans",
             axum::routing::post(maintenance::gc_orphans),
         )
+        .route(
+            "/_nos/maintenance/verify_blobs",
+            axum::routing::post(maintenance::verify_blobs),
+        )
         .merge(multipart_routes)
         .route("/{bucket}/_batch_delete", axum::routing::post(batch::batch_delete))
         .route(

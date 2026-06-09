@@ -4,6 +4,7 @@ use std::path::Path;
 use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_64;
 
+use super::super::block_cache::BlockDecodeCache;
 use super::super::blocks::BlockStore;
 use super::super::error::{internal, StorageError};
 use super::format::{
@@ -38,15 +39,7 @@ fn load_dedup_block(
     expected_checksum: Option<u64>,
 ) -> Result<Vec<u8>, StorageError> {
     let store = BlockStore::new(data_dir);
-    let path = store.block_path(hash);
-    let data = std::fs::read(&path).map_err(|e| {
-        internal(anyhow::anyhow!("missing dedup block {hash:016x}: {e}"))
-    })?;
-    if data.len() as u64 != expected_len {
-        return Err(internal(anyhow::anyhow!(
-            "dedup block size mismatch for {hash:016x}"
-        )));
-    }
+    let data = store.read_logical_block(hash, expected_len as usize)?;
     verify_checksum(&data, expected_checksum)?;
     Ok(data)
 }
@@ -104,12 +97,26 @@ fn decode_block_payload(
 fn read_block_payload_bytes(
     blob: &[u8],
     layout: &BlobLayout,
+    block_idx: usize,
     file_offset: u64,
     expected_len: u64,
     dict: Option<&[u8]>,
     data_dir: Option<&str>,
+    cache: Option<&BlockDecodeCache>,
+    cache_key: Option<&str>,
 ) -> Result<Vec<u8>, StorageError> {
-    decode_block_payload(layout, blob, file_offset, expected_len, dict, data_dir)
+    if let (Some(cache), Some(key)) = (cache, cache_key) {
+        if let Some(hit) = cache.get(key, block_idx) {
+            if hit.len() as u64 == expected_len {
+                return Ok((*hit).clone());
+            }
+        }
+    }
+    let decoded = decode_block_payload(layout, blob, file_offset, expected_len, dict, data_dir)?;
+    if let (Some(cache), Some(key)) = (cache, cache_key) {
+        cache.insert(key, block_idx, decoded.clone());
+    }
+    Ok(decoded)
 }
 
 fn decompress_indexed_blob(
@@ -130,10 +137,52 @@ fn decompress_indexed_blob(
     for (idx, _entry) in layout.index.iter().enumerate() {
         let block_len = layout.logical_len(idx);
         let offset = layout.file_offset_for_block(idx);
-        let block = read_block_payload_bytes(blob, &layout, offset, block_len, dict, data_dir)?;
+        let block = read_block_payload_bytes(
+            blob,
+            &layout,
+            idx,
+            offset,
+            block_len,
+            dict,
+            data_dir,
+            None,
+            None,
+        )?;
         out.extend_from_slice(&block);
     }
     Ok(out)
+}
+
+/// Verify per-block checksums on an indexed blob without materializing the full object.
+pub fn verify_indexed_blob(
+    blob: &[u8],
+    expected_size: u64,
+    dict: Option<&[u8]>,
+    data_dir: Option<&str>,
+) -> Result<(), StorageError> {
+    let layout = parse_layout_bytes(blob)?;
+    if layout.logical_size != expected_size {
+        return Err(internal(anyhow::anyhow!(
+            "blob header size mismatch: header={} metadata={expected_size}",
+            layout.logical_size
+        )));
+    }
+    for (idx, _entry) in layout.index.iter().enumerate() {
+        let block_len = layout.logical_len(idx);
+        let offset = layout.file_offset_for_block(idx);
+        read_block_payload_bytes(
+            blob,
+            &layout,
+            idx,
+            offset,
+            block_len,
+            dict,
+            data_dir,
+            None,
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 pub fn decompress_blob(
@@ -182,6 +231,7 @@ pub fn decompress_file_to_temp(
 pub struct IndexedReadContext {
     pub dict: Option<Vec<u8>>,
     pub data_dir: String,
+    pub block_cache: Option<BlockDecodeCache>,
 }
 
 pub fn pump_block_blob_full(
@@ -214,20 +264,25 @@ pub fn pump_block_blob_full(
         }
     };
 
+    let cache_key = blob_path.to_string_lossy().into_owned();
+    let data_dir = if ctx.data_dir.is_empty() {
+        None
+    } else {
+        Some(ctx.data_dir.as_str())
+    };
     for (idx, _entry) in layout.index.iter().enumerate() {
         let block_len = layout.logical_len(idx);
         let offset = layout.file_offset_for_block(idx);
         let block = match read_block_payload_bytes(
             &blob,
             &layout,
+            idx,
             offset,
             block_len,
             ctx.dict.as_deref(),
-            if ctx.data_dir.is_empty() {
-                None
-            } else {
-                Some(ctx.data_dir.as_str())
-            },
+            data_dir,
+            ctx.block_cache.as_ref(),
+            Some(cache_key.as_str()),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -274,6 +329,12 @@ pub fn pump_block_blob_range(
     let mut logical_pos = range_start;
     let mut block_idx = layout.block_for_offset(range_start);
 
+    let cache_key = blob_path.to_string_lossy().into_owned();
+    let data_dir = if ctx.data_dir.is_empty() {
+        None
+    } else {
+        Some(ctx.data_dir.as_str())
+    };
     while remaining > 0 && block_idx < layout.block_count() {
         let block_start = layout.logical_start(block_idx);
         let block_len = layout.logical_len(block_idx);
@@ -281,14 +342,13 @@ pub fn pump_block_blob_range(
         let block = match read_block_payload_bytes(
             &blob,
             &layout,
+            block_idx,
             offset,
             block_len,
             ctx.dict.as_deref(),
-            if ctx.data_dir.is_empty() {
-                None
-            } else {
-                Some(ctx.data_dir.as_str())
-            },
+            data_dir,
+            ctx.block_cache.as_ref(),
+            Some(cache_key.as_str()),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -363,6 +423,7 @@ mod tests {
             IndexedReadContext {
                 dict: None,
                 data_dir: String::new(),
+                block_cache: None,
             },
             tx,
         );

@@ -85,11 +85,15 @@ fn test_config_with_cap(
         zstd_dict_max_bytes: 112_640,
         zstd_dict_train_batch: 32,
         dedup_enabled: false,
+        block_size: 64 * 1024,
         dedup_block_size: 256 * 1024,
         dedup_min_size: 1024 * 1024,
         compress_min_size: 4096,
         compress_block_size: 64 * 1024,
         compress_exclude_extensions: vec![],
+        block_cache_entries: 0,
+        verify_interval_secs: 0,
+        verify_batch_size: 100,
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -1855,4 +1859,74 @@ async fn test_nested_keys_use_flat_blob_paths() {
 
     let path = blob_path(&data_dir.to_string_lossy(), "media", main_key);
     assert_eq!(path, encoded_main);
+}
+
+#[tokio::test]
+async fn test_recompress_nosi_upgrades_upload_level() {
+    use nebular_os::storage::blob_path;
+    use nebular_os::storage::compression::{
+        read_blob_stored_zstd_level, read_indexed_zstd_level, BlobFormat, detect_blob_format,
+        is_indexed_blob,
+    };
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        zstd_level: 22,
+        zstd_level_upload: 3,
+        ..EngineOptions::default()
+    })
+    .await;
+
+    let payload = b"nosi upgrade payload ".repeat(400);
+    let mut body = std::io::Cursor::new(&payload[..]);
+    storage
+        .put_object("music", "upload-level.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    let path = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "upload-level.bin",
+    );
+    let before = std::fs::read(&path).unwrap();
+    assert!(is_indexed_blob(&before));
+    assert_eq!(detect_blob_format(&before), BlobFormat::Nosi);
+    assert_eq!(read_indexed_zstd_level(&before), Some(3));
+
+    let report = storage.recompress_blobs(10).await.unwrap();
+    assert!(report.recompressed >= 1, "expected NOSI upgrade: {:?}", report);
+
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(read_blob_stored_zstd_level(&after), Some(22));
+}
+
+#[tokio::test]
+async fn test_verify_blob_integrity_passes_and_detects_corruption() {
+    use nebular_os::storage::blob_path;
+
+    let (storage, tmp) = setup_engine(EngineOptions::default()).await;
+    let payload = b"integrity scrub target ".repeat(200);
+    let mut body = std::io::Cursor::new(&payload[..]);
+    storage
+        .put_object("music", "scrub.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    let report = storage.verify_blob_integrity(10).await.unwrap();
+    assert!(report.verified >= 1, "expected verified blob: {:?}", report);
+    assert_eq!(report.corrupted, 0);
+
+    let path = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "scrub.bin",
+    );
+    let mut corrupt = std::fs::read(&path).unwrap();
+    if let Some(byte) = corrupt.last_mut() {
+        *byte ^= 0xFF;
+    }
+    std::fs::write(&path, &corrupt).unwrap();
+
+    let bad = storage.verify_blob_integrity(10).await.unwrap();
+    assert!(bad.corrupted >= 1, "expected corruption detected: {:?}", bad);
 }

@@ -88,15 +88,12 @@ fn compress_block(
     }
 }
 
-fn store_dedup_chunk(store: &BlockStore, chunk: &[u8]) -> Result<(u8, Vec<u8>, u64), StorageError> {
-    let hash = BlockStore::hash_block(chunk);
-    let path = store.block_path(hash);
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        }
-        std::fs::write(&path, chunk).map_err(|e| internal(anyhow::anyhow!(e)))?;
-    }
+fn store_dedup_chunk(
+    store: &BlockStore,
+    chunk: &[u8],
+    zstd_level: i32,
+) -> Result<(u8, Vec<u8>, u64), StorageError> {
+    let hash = store.write_logical_block(chunk, zstd_level)?;
     let mut payload = Vec::with_capacity(12);
     payload.extend_from_slice(&hash.to_le_bytes());
     payload.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
@@ -111,7 +108,7 @@ fn encode_logical_block(
 ) -> Result<(u8, Vec<u8>, u64), StorageError> {
     let checksum = xxh3_64(chunk);
     if let Some(store) = dedup_store {
-        return store_dedup_chunk(store, chunk);
+        return store_dedup_chunk(store, chunk, level);
     }
     let (block_type, payload) = compress_block(chunk, level, dict)?;
     Ok((block_type, payload, checksum))
@@ -203,7 +200,9 @@ pub fn encode_blob_for_storage(
     let logical_size = uncompressed.len() as u64;
     let (index, staging, flags) =
         encode_blocks_from_reader(uncompressed, logical_size, block_size, level, opts)?;
-    let header_len = super::format::FIXED_HEADER_LEN_V1 + index.len() * super::format::INDEX_ENTRY_LEN;
+    let level_byte = clamp_zstd_level(level) as u8;
+    let header_len =
+        super::format::FIXED_HEADER_LEN_V1_LEVEL + index.len() * super::format::INDEX_ENTRY_LEN;
     let total_len = header_len + staging.len();
     if opts.dedup_store.is_none() && total_len >= uncompressed.len() {
         return Ok(uncompressed.to_vec());
@@ -217,6 +216,7 @@ pub fn encode_blob_for_storage(
         &index,
         opts.dict_id,
         flags,
+        level_byte,
     )?;
     out.extend_from_slice(&staging);
     Ok(out)
@@ -257,7 +257,9 @@ pub fn compress_file_to_storage(
     let source = File::open(tmp_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
     let (index, staging, flags) =
         encode_blocks_from_reader(source, logical_size, block_size, level, opts)?;
-    let header_len = super::format::FIXED_HEADER_LEN_V1 + index.len() * super::format::INDEX_ENTRY_LEN;
+    let level_byte = clamp_zstd_level(level) as u8;
+    let header_len =
+        super::format::FIXED_HEADER_LEN_V1_LEVEL + index.len() * super::format::INDEX_ENTRY_LEN;
     let total_len = header_len + staging.len();
 
     if opts.dedup_store.is_none() && total_len as u64 >= raw_len {
@@ -274,6 +276,7 @@ pub fn compress_file_to_storage(
             &index,
             opts.dict_id,
             flags,
+            level_byte,
         )?;
         out.write_all(&staging)
             .map_err(|e| internal(anyhow::anyhow!(e)))?;

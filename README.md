@@ -41,9 +41,11 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_SOFT_DELETE_TTL_SECS` | Seconds before purging soft-deleted metadata; `0` hard-deletes immediately (default `86400`) |
 | `NOS_SOFT_DELETE_DROP_BLOB` | Remove blob file on soft-delete while keeping tombstone until TTL (default `false`) |
 | `NOS_MULTIPART_UPLOAD_TTL_SECS` | Purge abandoned multipart sessions after this many seconds (default `86400`; `0` disables) |
-| `NOS_RECOMPRESS_ON_STARTUP` | Re-compress raw and upgradeable NOSZ/NOS2 blobs at boot (default `false`) |
-| `NOS_RECOMPRESS_INTERVAL_SECS` | Periodic blob recompression interval; `0` disables (default `0`) |
+| `NOS_RECOMPRESS_ON_STARTUP` | Re-compress raw blobs, migrate legacy formats, and upgrade NOSI at boot (default `false`) |
+| `NOS_RECOMPRESS_INTERVAL_SECS` | Periodic blob recompression / migration interval; `0` disables (default `0`) |
 | `NOS_RECOMPRESS_BATCH_SIZE` | Max objects scanned per recompression pass (default `100`) |
+| `NOS_VERIFY_INTERVAL_SECS` | Periodic integrity scrub interval; `0` disables (default `0`) |
+| `NOS_VERIFY_BATCH_SIZE` | Max objects verified per integrity pass (default `100`) |
 | `NOS_METRICS_TOKEN` | Bearer token required for `/metrics` when set |
 | `NOS_RATE_LIMIT_RPS` | Per-IP request limit; `0` disables (default `0`) |
 | `NOS_RATE_LIMIT_BURST` | Burst size for rate limiting (default `50`) |
@@ -51,15 +53,17 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_MULTIPART_PART_SIZE` | Max bytes per multipart part (default `8388608`) |
 | `NOS_READ_POOL_SIZE` | SQLite read pool connections (default `4`) |
 | `NOS_ZSTD_LEVEL` | Background / maintenance zstd level 1–22 (default `22`; lower = faster recompression passes) |
-| `NOS_ZSTD_LEVEL_UPLOAD` | Fast upload zstd level 1–22 for NOSB block writes (default `3`) |
+| `NOS_ZSTD_LEVEL_UPLOAD` | Fast upload zstd level 1–22 for NOSI block writes (default `3`) |
 | `NOS_ZSTD_DICT_ENABLED` | Train and use a global zstd dictionary (default `false`) |
 | `NOS_ZSTD_DICT_MAX_BYTES` | Max trained dictionary size in bytes (default `112640`) |
 | `NOS_ZSTD_DICT_TRAIN_BATCH` | Sample count for dictionary training (default `32`) |
 | `NOS_DEDUP_ENABLED` | Block-level deduplication for large objects (default `false`) |
-| `NOS_DEDUP_BLOCK_SIZE` | Dedup chunk size in bytes (default `262144`) |
+| `NOS_BLOCK_SIZE` | Unified logical block size for compression and dedup (default `1048576`; min `4096`) |
+| `NOS_DEDUP_BLOCK_SIZE` | Dedup chunk size override (defaults to `NOS_BLOCK_SIZE`) |
 | `NOS_DEDUP_MIN_SIZE` | Minimum logical object size to use dedup (default `1048576`) |
-| `NOS_COMPRESS_MIN_SIZE` | Minimum object size in bytes before attempting NOSB compression (default `4096`) |
-| `NOS_COMPRESS_BLOCK_SIZE` | Uncompressed block size for NOSI/NOSB blob layout (default `1048576`; min `4096`) |
+| `NOS_COMPRESS_MIN_SIZE` | Minimum object size in bytes before attempting NOSI compression (default `4096`) |
+| `NOS_COMPRESS_BLOCK_SIZE` | Compression block size override (defaults to `NOS_BLOCK_SIZE`) |
+| `NOS_BLOCK_CACHE_ENTRIES` | LRU decoded-block cache for range GET on NOSI; `0` disables (default `256`) |
 | `NOS_COMPRESS_EXCLUDE_EXTENSIONS` | Comma-separated extra file extensions to skip compression (e.g. `sqlite,bak`) |
 | `NOS_S3_COMPAT` | Enable S3-style XML list/errors and `x-amz-copy-source` (default `false`) |
 | `NOS_BUCKET_POLICY` | JSON map of `sub` → allowed bucket names; empty = no extra restriction |
@@ -101,17 +105,20 @@ Replication is **asynchronous** (`NOS_REPLICATION_ASYNC=true` by default). A suc
 
 There is no distributed lock. Two clients writing the same `bucket/key` on different nodes can diverge; last writer wins per node metadata. Use **assigned** mode plus client routing (e.g. Ownly) to steer writes, or **readonly** replicas for read scaling. Symmetric `NOS_CLUSTER_PEERS` lists are recommended; the server logs a warning if `NOS_NODE_ID` is missing from the local peer list.
 
-### Blob storage format (NOSB)
+### Blob storage format (NOSI)
 
-Compressible objects are stored in a **block-compressed** layout (`NOSB` magic):
+New writes use the **indexed block** layout (`NOSI` magic):
 
-- Fixed header: logical size, block size, block count
-- Per-block index for seek/range without decoding the whole file
-- Each block is independently zstd-compressed or stored raw, whichever is smaller
+- Fixed header: logical size, block size, block count, optional dict id, stored zstd level
+- Per-block index for seek/range without decoding the whole object
+- Per-block xxh3 checksums; optional dedup refs into content-addressed `.blocks/` (NOSK-compressed when smaller)
+- Each inline block is independently zstd-compressed or stored raw, whichever is smaller
 
 Incompressible types (e.g. `video/*`, `.mp3`, `.zip`) and objects below `NOS_COMPRESS_MIN_SIZE` stay as raw bytes with no header. If block compression does not shrink the payload, the raw file is kept.
 
-**Migration:** Older `NOSZ` whole-object blobs are not readable after this format change. Re-upload objects or run `NOS_RECOMPRESS_ON_STARTUP` / periodic recompression to rewrite remaining raw blobs into `NOSB` (already-compressed legacy blobs must be re-ingested from source).
+**Legacy formats** (`NOSB`, `NOSZ`, `NOS2`, `NOSD`) remain readable. Background recompression (`NOS_RECOMPRESS_*`) migrates them to `NOSI` and upgrades upload-level blobs to `NOS_ZSTD_LEVEL` / trained dictionary when enabled.
+
+**Integrity:** `POST /_nos/maintenance/verify_blobs` (admin JWT) or `NOS_VERIFY_INTERVAL_SECS` walks objects and verifies block checksums without client GET traffic.
 
 ## HTTP API
 

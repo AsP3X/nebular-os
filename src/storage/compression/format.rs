@@ -25,9 +25,10 @@ pub const FIXED_HEADER_LEN: usize = 20;
 pub const BLOCK_HEADER_LEN: usize = 8;
 
 // Human: Indexed blobs v1 — NOSI magic, dict_id, per-block checksums, optional dedup refs.
-// Agent: NOSI_MAGIC="NOSI"; FIXED_HEADER_LEN_V1=24; BLOCK_HEADER_LEN_V1=16.
+// Agent: NOSI_MAGIC="NOSI"; legacy fixed header 24 bytes; NOSI_FLAG_HAS_LEVEL extends to 25.
 pub const NOSI_MAGIC: &[u8; 4] = b"NOSI";
 pub const FIXED_HEADER_LEN_V1: usize = 24;
+pub const FIXED_HEADER_LEN_V1_LEVEL: usize = 25;
 pub const BLOCK_HEADER_LEN_V1: usize = 16;
 
 pub const BLOCK_COMPRESSED: u8 = 0;
@@ -35,6 +36,7 @@ pub const BLOCK_STORED: u8 = 1;
 pub const BLOCK_DEDUP_REF: u8 = 2;
 
 pub const NOSI_FLAG_DEDUP: u16 = 1;
+pub const NOSI_FLAG_HAS_LEVEL: u16 = 0x8000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlobFormat {
@@ -114,15 +116,30 @@ pub struct BlobLayout {
     pub block_size: u32,
     pub dict_id: u16,
     pub flags: u16,
+    pub zstd_level: u8,
     pub index: Vec<IndexEntry>,
     pub data_offset: u64,
+}
+
+fn nosi_header_info(data: &[u8], flags: u16) -> (usize, u8) {
+    if (flags & NOSI_FLAG_HAS_LEVEL) != 0 && data.len() >= FIXED_HEADER_LEN_V1_LEVEL {
+        (FIXED_HEADER_LEN_V1_LEVEL, data[24])
+    } else {
+        (FIXED_HEADER_LEN_V1, 0)
+    }
 }
 
 impl BlobLayout {
     pub fn fixed_header_len(&self) -> usize {
         match self.format {
             IndexedFormat::V0 => FIXED_HEADER_LEN,
-            IndexedFormat::V1 => FIXED_HEADER_LEN_V1,
+            IndexedFormat::V1 => {
+                if self.zstd_level > 0 || (self.flags & NOSI_FLAG_HAS_LEVEL) != 0 {
+                    FIXED_HEADER_LEN_V1_LEVEL
+                } else {
+                    FIXED_HEADER_LEN_V1
+                }
+            }
         }
     }
 
@@ -196,6 +213,24 @@ pub fn read_indexed_dict_id(data: &[u8]) -> Option<u16> {
     None
 }
 
+pub fn read_indexed_zstd_level(data: &[u8]) -> Option<u8> {
+    if detect_blob_format(data) != BlobFormat::Nosi || data.len() < FIXED_HEADER_LEN_V1 {
+        return None;
+    }
+    let flags = u16::from_le_bytes([data[22], data[23]]);
+    let (_, level) = nosi_header_info(data, flags);
+    if (flags & NOSI_FLAG_HAS_LEVEL) != 0 && level > 0 {
+        Some(level)
+    } else {
+        None
+    }
+}
+
+/// Stored zstd level from NOS2 or rev-1 NOSI headers.
+pub fn read_blob_stored_zstd_level(data: &[u8]) -> Option<u8> {
+    read_indexed_zstd_level(data).or_else(|| super::legacy::read_stored_zstd_level(data))
+}
+
 /// Returns true when `data` begins with a Nebular compressed blob header (NOSB/NOSI, NOSZ, or NOS2).
 pub fn is_compressed_blob(data: &[u8]) -> bool {
     matches!(
@@ -257,14 +292,16 @@ pub fn parse_layout_bytes(data: &[u8]) -> Result<BlobLayout, StorageError> {
             let block_size = u32::from_le_bytes(data[12..16].try_into().unwrap());
             let dict_id = u16::from_le_bytes([data[20], data[21]]);
             let flags = u16::from_le_bytes([data[22], data[23]]);
-            let index = parse_index(data, FIXED_HEADER_LEN_V1, logical_size)?;
-            let needed = FIXED_HEADER_LEN_V1 + index.len() * INDEX_ENTRY_LEN;
+            let (fixed_len, zstd_level) = nosi_header_info(data, flags);
+            let index = parse_index(data, fixed_len, logical_size)?;
+            let needed = fixed_len + index.len() * INDEX_ENTRY_LEN;
             Ok(BlobLayout {
                 format: IndexedFormat::V1,
                 logical_size,
                 block_size,
                 dict_id,
                 flags,
+                zstd_level,
                 index,
                 data_offset: needed as u64,
             })
@@ -283,6 +320,7 @@ pub fn parse_layout_bytes(data: &[u8]) -> Result<BlobLayout, StorageError> {
                 block_size,
                 dict_id: 0,
                 flags: 0,
+                zstd_level: 0,
                 index,
                 data_offset: needed as u64,
             })
@@ -292,12 +330,21 @@ pub fn parse_layout_bytes(data: &[u8]) -> Result<BlobLayout, StorageError> {
 }
 
 pub fn read_blob_layout(mut file: File) -> Result<BlobLayout, StorageError> {
-    let mut peek = [0u8; FIXED_HEADER_LEN_V1];
-    file.read_exact(&mut peek)
+    let mut peek = [0u8; FIXED_HEADER_LEN_V1_LEVEL];
+    file.read_exact(&mut peek[..FIXED_HEADER_LEN_V1])
         .map_err(|e| internal(anyhow::anyhow!(e)))?;
     let format = detect_blob_format(&peek);
     let fixed_len = match format {
-        BlobFormat::Nosi => FIXED_HEADER_LEN_V1,
+        BlobFormat::Nosi => {
+            let flags = u16::from_le_bytes([peek[22], peek[23]]);
+            if (flags & NOSI_FLAG_HAS_LEVEL) != 0 {
+                file.read_exact(&mut peek[FIXED_HEADER_LEN_V1..FIXED_HEADER_LEN_V1_LEVEL])
+                    .map_err(|e| internal(anyhow::anyhow!(e)))?;
+                FIXED_HEADER_LEN_V1_LEVEL
+            } else {
+                FIXED_HEADER_LEN_V1
+            }
+        }
         BlobFormat::Nosb => FIXED_HEADER_LEN,
         _ => return Err(internal(anyhow::anyhow!("not an indexed blob"))),
     };
@@ -386,6 +433,7 @@ pub fn write_blob_header_v1<W: std::io::Write>(
     index: &[IndexEntry],
     dict_id: u16,
     flags: u16,
+    zstd_level: u8,
 ) -> Result<(), StorageError> {
     writer
         .write_all(NOSI_MAGIC)
@@ -402,8 +450,12 @@ pub fn write_blob_header_v1<W: std::io::Write>(
     writer
         .write_all(&dict_id.to_le_bytes())
         .map_err(|e| internal(anyhow::anyhow!(e)))?;
+    let flags_out = flags | NOSI_FLAG_HAS_LEVEL;
     writer
-        .write_all(&flags.to_le_bytes())
+        .write_all(&flags_out.to_le_bytes())
+        .map_err(|e| internal(anyhow::anyhow!(e)))?;
+    writer
+        .write_all(&[zstd_level])
         .map_err(|e| internal(anyhow::anyhow!(e)))?;
     for entry in index {
         writer
@@ -416,6 +468,7 @@ pub fn write_blob_header_v1<W: std::io::Write>(
     Ok(())
 }
 
+#[cfg(test)]
 #[cfg(test)]
 pub fn write_block_header_v0(writer: &mut Vec<u8>, block_type: u8, payload_len: u32) -> Result<(), StorageError> {
     let mut header = [0u8; BLOCK_HEADER_LEN];
@@ -545,10 +598,12 @@ mod tests {
             logical_end: 64,
         }];
         let mut buf = Vec::new();
-        write_blob_header_v1(&mut buf, 64, 4096, &index, 3, NOSI_FLAG_DEDUP).unwrap();
+        write_blob_header_v1(&mut buf, 64, 4096, &index, 3, NOSI_FLAG_DEDUP, 22).unwrap();
         let layout = parse_layout_bytes(&buf).unwrap();
         assert_eq!(layout.format, IndexedFormat::V1);
         assert_eq!(layout.dict_id, 3);
+        assert_eq!(layout.zstd_level, 22);
+        assert_ne!(layout.flags & NOSI_FLAG_HAS_LEVEL, 0);
         assert!(layout.uses_dedup_blocks());
     }
 }

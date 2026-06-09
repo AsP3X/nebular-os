@@ -88,3 +88,33 @@ pub async fn gc_orphans(
         }
     }
 }
+
+#[derive(Debug, Deserialize)]
+pub struct VerifyBlobsQuery {
+    pub limit: Option<u64>,
+}
+
+/// Human: Proactively verify blob block checksums without client GET traffic.
+/// Agent: POST /_nos/maintenance/verify_blobs; admin JWT; optional limit (default engine batch size).
+pub async fn verify_blobs(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<VerifyBlobsQuery>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let claims = req.extensions().get::<Claims>();
+    if let Err(resp) = require_admin(claims) {
+        return resp.into_response();
+    }
+
+    let limit = query
+        .limit
+        .unwrap_or(state.engine().verify_batch_size() as u64)
+        .min(10_000) as usize;
+    match state.engine().verify_blob_integrity(limit).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            let (status, json) = crate::routes::errors::map_storage_error(e);
+            (status, json).into_response()
+        }
+    }
+}

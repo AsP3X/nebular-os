@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{copy, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sqlx::Pool;
@@ -7,9 +7,14 @@ use sqlx::Sqlite;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::compression::{
-    collect_dedup_refs, parse_dedup_manifest, DEDUP_ENTRY_LEN, DEDUP_HEADER_LEN, DEDUP_MAGIC,
+    clamp_zstd_level, collect_dedup_refs, parse_dedup_manifest, DEDUP_ENTRY_LEN, DEDUP_HEADER_LEN,
+    DEDUP_MAGIC,
 };
 use super::error::{internal, StorageError};
+
+/// Human: Optional zstd wrapper on `.blocks/` payloads (logical bytes hashed; NOSK on disk).
+pub const BLOCK_CHUNK_MAGIC: &[u8; 4] = b"NOSK";
+pub const BLOCK_CHUNK_HEADER_LEN: usize = 8;
 
 /// Human: Content-addressed block files under `.blocks/` with SQLite refcounts.
 /// Agent: WRITES NOSD manifest blobs; INCREMENT/DECREMENT dedup_blocks on share/release.
@@ -37,6 +42,66 @@ impl BlockStore {
         xxh3_64(data)
     }
 
+    /// Store logical chunk under content hash; compresses when smaller than raw.
+    pub fn write_logical_block(
+        &self,
+        chunk: &[u8],
+        zstd_level: i32,
+    ) -> Result<u64, StorageError> {
+        let hash = Self::hash_block(chunk);
+        let path = self.block_path(hash);
+        if path.exists() {
+            return Ok(hash);
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| internal(anyhow::anyhow!(e)))?;
+        }
+        let level = clamp_zstd_level(zstd_level);
+        let on_disk = if chunk.len() >= 64 {
+            match zstd::encode_all(chunk, level) {
+                Ok(compressed) if compressed.len() < chunk.len() => {
+                    let mut out = Vec::with_capacity(BLOCK_CHUNK_HEADER_LEN + compressed.len());
+                    out.extend_from_slice(BLOCK_CHUNK_MAGIC);
+                    out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+                    out.extend_from_slice(&compressed);
+                    out
+                }
+                _ => chunk.to_vec(),
+            }
+        } else {
+            chunk.to_vec()
+        };
+        std::fs::write(&path, &on_disk).map_err(|e| internal(anyhow::anyhow!(e)))?;
+        Ok(hash)
+    }
+
+    /// Read logical bytes for a content-addressed block (raw or NOSK-wrapped).
+    pub fn read_logical_block(&self, hash: u64, expected_len: usize) -> Result<Vec<u8>, StorageError> {
+        let path = self.block_path(hash);
+        let data = std::fs::read(&path).map_err(|e| {
+            internal(anyhow::anyhow!("missing dedup block {hash:016x}: {e}"))
+        })?;
+        if data.len() >= BLOCK_CHUNK_HEADER_LEN && data.starts_with(BLOCK_CHUNK_MAGIC) {
+            let logical_len =
+                u32::from_le_bytes(data[4..8].try_into().map_err(|_| {
+                    internal(anyhow::anyhow!("invalid block chunk header"))
+                })?) as usize;
+            if logical_len != expected_len {
+                return Err(internal(anyhow::anyhow!(
+                    "dedup block logical size mismatch for {hash:016x}"
+                )));
+            }
+            let payload = &data[BLOCK_CHUNK_HEADER_LEN..];
+            return zstd::decode_all(payload).map_err(internal);
+        }
+        if data.len() != expected_len {
+            return Err(internal(anyhow::anyhow!(
+                "dedup block size mismatch for {hash:016x}"
+            )));
+        }
+        Ok(data)
+    }
+
     /// Chunk `tmp_path` into blocks, write manifest to `final_path`.
     pub fn write_dedup_from_file(
         &self,
@@ -62,14 +127,8 @@ impl BlockStore {
                 break;
             }
             let chunk = &buf[..n];
+            self.write_logical_block(chunk, super::compression::DEFAULT_ZSTD_LEVEL)?;
             let hash = Self::hash_block(chunk);
-            let path = self.block_path(hash);
-            if !path.exists() {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| internal(anyhow::anyhow!(e)))?;
-                }
-                std::fs::write(&path, chunk).map_err(|e| internal(anyhow::anyhow!(e)))?;
-            }
             entries.push((hash, n as u32));
         }
 
@@ -101,17 +160,9 @@ impl BlockStore {
         }
         let mut out = File::create(out_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
         for (hash, size) in entries {
-            let path = self.block_path(hash);
-            let mut block = File::open(&path).map_err(|e| {
-                internal(anyhow::anyhow!("missing dedup block {hash:016x}: {e}"))
-            })?;
-            copy(&mut block, &mut out).map_err(|e| internal(anyhow::anyhow!(e)))?;
-            let meta = std::fs::metadata(&path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-            if meta.len() != size as u64 {
-                return Err(internal(anyhow::anyhow!(
-                    "dedup block size mismatch for {hash:016x}"
-                )));
-            }
+            let chunk = self.read_logical_block(hash, size as usize)?;
+            std::io::Write::write_all(&mut out, &chunk)
+                .map_err(|e| internal(anyhow::anyhow!(e)))?;
         }
         let written = std::fs::metadata(out_path)
             .map_err(|e| internal(anyhow::anyhow!(e)))?

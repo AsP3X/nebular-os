@@ -51,6 +51,8 @@ async fn main() -> Result<()> {
         compress_min_size: cfg.compress_min_size,
         compress_block_size: cfg.compress_block_size,
         compress_exclude_extensions: cfg.compress_exclude_extensions.clone(),
+        block_cache_entries: cfg.block_cache_entries,
+        verify_batch_size: cfg.verify_batch_size,
     };
 
     let storage = storage::engine::StorageEngine::with_full_options(
@@ -140,8 +142,9 @@ fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::N
     let purge_soft = cfg.soft_delete_ttl_secs > 0;
     let purge_multipart = cfg.multipart_upload_ttl_secs > 0;
     let recompress = cfg.recompress_interval_secs > 0;
+    let verify = cfg.verify_interval_secs > 0;
     let orphan_gc = cfg.orphan_gc_interval_secs > 0;
-    if !purge_soft && !purge_multipart && !recompress && !orphan_gc {
+    if !purge_soft && !purge_multipart && !recompress && !verify && !orphan_gc {
         return;
     }
 
@@ -183,6 +186,18 @@ fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::N
                         Ok(_) => {}
                         Err(e) => tracing::error!(error = %e, "Dictionary training failed"),
                     }
+                }
+            }
+            if verify {
+                match storage.verify_blob_integrity(cfg.verify_batch_size).await {
+                    Ok(report) if report.corrupted > 0 => {
+                        tracing::warn!(?report, "Periodic blob integrity verification found issues")
+                    }
+                    Ok(report) if report.verified > 0 => {
+                        tracing::debug!(?report, "Periodic blob integrity verification finished")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!(error = %e, "Blob integrity verification failed"),
                 }
             }
             if let Some(t) = orphan_ticker.as_mut() {

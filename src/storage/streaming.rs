@@ -174,6 +174,7 @@ pub async fn open_object_body_stream(
         let read_ctx = IndexedReadContext {
             dict: ctx.dict.as_ref().map(|d| d.to_vec()),
             data_dir: ctx.data_dir.clone(),
+            block_cache: ctx.block_cache.clone(),
         };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
         if range_start == 0 && content_length == logical_size {

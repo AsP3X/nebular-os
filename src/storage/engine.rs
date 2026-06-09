@@ -7,6 +7,7 @@ use tokio::fs;
 use tokio::sync::Semaphore;
 
 use super::blob_ops::link_or_copy_blob;
+use super::block_cache::BlockDecodeCache;
 use super::blocks::BlockStore;
 use super::compressibility::DEFAULT_MIN_COMPRESSIBLE_SIZE;
 use super::compression::{self, DEFAULT_BLOCK_SIZE, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_LEVEL_UPLOAD};
@@ -103,6 +104,8 @@ pub struct EngineOptions {
     pub compress_min_size: usize,
     pub compress_block_size: usize,
     pub compress_exclude_extensions: Vec<String>,
+    pub block_cache_entries: usize,
+    pub verify_batch_size: usize,
 }
 
 impl Default for EngineOptions {
@@ -133,6 +136,8 @@ impl Default for EngineOptions {
             compress_min_size: DEFAULT_MIN_COMPRESSIBLE_SIZE,
             compress_block_size: DEFAULT_BLOCK_SIZE,
             compress_exclude_extensions: Vec::new(),
+            block_cache_entries: 256,
+            verify_batch_size: 100,
         }
     }
 }
@@ -168,6 +173,8 @@ pub struct StorageEngine {
     compress_min_size: usize,
     compress_block_size: usize,
     compress_exclude_extensions: Arc<Vec<String>>,
+    block_decode_cache: Option<BlockDecodeCache>,
+    verify_batch_size: usize,
 }
 
 pub(crate) struct TempFileGuard {
@@ -279,6 +286,8 @@ impl StorageEngine {
             compress_min_size: opts.compress_min_size.max(1),
             compress_block_size: opts.compress_block_size.max(4096),
             compress_exclude_extensions: Arc::new(opts.compress_exclude_extensions),
+            block_decode_cache: BlockDecodeCache::new(opts.block_cache_entries),
+            verify_batch_size: opts.verify_batch_size.max(1),
         })
     }
 
@@ -419,6 +428,19 @@ impl StorageEngine {
         self.compress_block_size
     }
 
+    /// Unified block size for compression and dedup (compress_block_size after config resolution).
+    pub fn block_size(&self) -> usize {
+        self.compress_block_size
+    }
+
+    pub fn verify_batch_size(&self) -> usize {
+        self.verify_batch_size
+    }
+
+    pub fn block_decode_cache(&self) -> Option<&BlockDecodeCache> {
+        self.block_decode_cache.as_ref()
+    }
+
     pub fn compress_exclude_extensions(&self) -> &[String] {
         &self.compress_exclude_extensions
     }
@@ -472,6 +494,7 @@ impl StorageEngine {
             } else {
                 None
             },
+            block_cache: self.block_decode_cache.clone(),
         }
     }
 

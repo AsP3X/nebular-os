@@ -6,8 +6,9 @@ use super::blob_path_variants;
 use super::blocks::BlockStore;
 use super::compressibility::CompressionContext;
 use super::compression::{
-    decompress_blob, detect_blob_format, encode_blob_for_storage, is_indexed_blob, is_zstd_blob,
-    read_stored_dict_id, read_stored_zstd_level, BlobFormat, EncodeOptions,
+    decompress_blob, detect_blob_format, encode_blob_for_storage, is_indexed_blob,
+    is_zstd_blob, parse_dedup_manifest, parse_layout_bytes, read_blob_stored_zstd_level,
+    read_indexed_dict_id, verify_indexed_blob, BlobFormat, EncodeOptions, IndexedFormat,
 };
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
@@ -24,6 +25,21 @@ pub struct RecompressReport {
 pub struct DictTrainReport {
     pub samples: u64,
     pub trained: bool,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct VerifyBlobsReport {
+    pub scanned: u64,
+    pub verified: u64,
+    pub corrupted: u64,
+    pub skipped: u64,
+}
+
+fn is_legacy_format(format: BlobFormat) -> bool {
+    matches!(
+        format,
+        BlobFormat::Nosd | BlobFormat::Nosb | BlobFormat::Nosz | BlobFormat::Nos2
+    )
 }
 
 impl StorageEngine {
@@ -57,8 +73,101 @@ impl StorageEngine {
         Ok(purged)
     }
 
-    /// Scans active objects and rewrites blobs when stronger NOSB compression would shrink them.
-    /// Handles legacy raw blobs, NOSZ/NOS2, and upgrades existing NOSB when level improves.
+    fn maintenance_encode_opts<'a>(
+        &'a self,
+        dict_id: u16,
+        dict_bytes: Option<&'a [u8]>,
+    ) -> EncodeOptions<'a> {
+        EncodeOptions {
+            dict_id,
+            dict: dict_bytes,
+            dedup_store: if self.dedup_enabled() {
+                Some(self.block_store())
+            } else {
+                None
+            },
+        }
+    }
+
+    fn decode_for_maintenance(
+        &self,
+        blob: &[u8],
+        format: BlobFormat,
+        size: i64,
+        dict_bytes: Option<&[u8]>,
+    ) -> Result<Vec<u8>, StorageError> {
+        match format {
+            BlobFormat::Raw => {
+                if blob.len() as i64 != size {
+                    return Err(internal(anyhow::anyhow!("raw blob size mismatch")));
+                }
+                Ok(blob.to_vec())
+            }
+            BlobFormat::Nosd => {
+                let entries = parse_dedup_manifest(blob, size as u64)?;
+                let store = self.block_store();
+                let mut out = Vec::with_capacity(size as usize);
+                for (hash, chunk_size) in entries {
+                    let chunk = store.read_logical_block(hash, chunk_size as usize)?;
+                    out.extend_from_slice(&chunk);
+                }
+                if out.len() as i64 != size {
+                    return Err(internal(anyhow::anyhow!("dedup assemble size mismatch")));
+                }
+                Ok(out)
+            }
+            _ => decompress_blob(blob, size as u64, dict_bytes, Some(self.data_dir())),
+        }
+    }
+
+    fn indexed_needs_upgrade(
+        &self,
+        blob: &[u8],
+        format: BlobFormat,
+        background_level: i32,
+        dict_loaded: bool,
+        target_dict_id: u16,
+    ) -> bool {
+        if format == BlobFormat::Nosb {
+            return true;
+        }
+        if format != BlobFormat::Nosi {
+            return false;
+        }
+        let layout = match parse_layout_bytes(blob) {
+            Ok(l) => l,
+            Err(_) => return true,
+        };
+        if layout.format == IndexedFormat::V0 {
+            return true;
+        }
+        let stored_level = layout.zstd_level as i32;
+        if stored_level == 0 || stored_level < background_level {
+            return true;
+        }
+        if dict_loaded && layout.dict_id == 0 && target_dict_id > 0 {
+            return true;
+        }
+        false
+    }
+
+    fn should_replace_encoded(
+        &self,
+        old_len: usize,
+        encoded: &[u8],
+        upgrading_level: bool,
+        migrating_legacy: bool,
+    ) -> bool {
+        if !is_indexed_blob(encoded) {
+            return false;
+        }
+        if migrating_legacy || upgrading_level {
+            return true;
+        }
+        encoded.len() < old_len
+    }
+
+    /// Scans active objects and rewrites blobs when stronger compression or NOSI migration helps.
     pub async fn recompress_blobs(&self, limit: usize) -> Result<RecompressReport, StorageError> {
         let limit = limit.max(1) as i64;
         let rows = self
@@ -73,6 +182,8 @@ impl StorageEngine {
             None
         };
         let dict_bytes = dict.as_deref().map(|v| v.as_slice());
+        let dict_loaded = dict.is_some();
+        let target_dict_id = if dict_loaded { 0 } else { 0 };
 
         let mut report = RecompressReport::default();
         for (bucket, key, size) in rows {
@@ -91,70 +202,45 @@ impl StorageEngine {
             };
 
             let format = detect_blob_format(&blob);
-            if format == BlobFormat::Nosd {
-                report.skipped += 1;
-                continue;
-            }
-
             if format == BlobFormat::Raw {
                 if blob.len() as i64 != size {
                     report.skipped += 1;
                     continue;
                 }
-                let ctx = CompressionContext::new(
-                    Some(key.as_str()),
-                    None,
-                    size as u64,
-                    self.compress_min_size(),
-                    self.compress_exclude_extensions(),
-                );
-                let encode_opts = EncodeOptions {
-                    dict_id: 0,
-                    dict: dict_bytes,
-                    dedup_store: None,
-                };
-                let encoded = encode_blob_for_storage(
-                    &blob,
-                    background_level,
-                    self.compress_block_size(),
-                    ctx,
-                    encode_opts,
-                )?;
-                if encoded.len() >= blob.len() {
+            }
+
+            let migrating_legacy = is_legacy_format(format);
+            let upgrading_indexed = self.indexed_needs_upgrade(
+                &blob,
+                format,
+                background_level,
+                dict_loaded,
+                target_dict_id,
+            );
+
+            if format == BlobFormat::Nosi && !upgrading_indexed {
+                report.skipped += 1;
+                continue;
+            }
+
+            if is_zstd_blob(&blob) && !migrating_legacy {
+                let stored_level = read_blob_stored_zstd_level(&blob).unwrap_or(0) as i32;
+                let stored_dict = read_indexed_dict_id(&blob)
+                    .or_else(|| super::compression::read_stored_dict_id(&blob))
+                    .unwrap_or(0);
+                let upgrading_level =
+                    stored_level < background_level || format == BlobFormat::Nosz;
+                let needs_dict = dict_loaded && stored_dict == 0 && format == BlobFormat::Nos2;
+                if !upgrading_level && !needs_dict {
                     report.skipped += 1;
                     continue;
                 }
-                if !self.atomic_replace_blob(&path, &encoded).await? {
-                    report.skipped += 1;
-                    continue;
-                }
-                report.bytes_saved += (blob.len() as i64) - (encoded.len() as i64);
-                report.recompressed += 1;
-                continue;
-            }
-
-            if is_indexed_blob(&blob) {
+            } else if !migrating_legacy && format != BlobFormat::Raw && !upgrading_indexed {
                 report.skipped += 1;
                 continue;
             }
 
-            if !is_zstd_blob(&blob) {
-                report.skipped += 1;
-                continue;
-            }
-
-            let stored_level = read_stored_zstd_level(&blob).unwrap_or(0) as i32;
-            let stored_dict = read_stored_dict_id(&blob).unwrap_or(0);
-            let dict_loaded = dict.is_some();
-            let upgrading_level =
-                stored_level < background_level || format == BlobFormat::Nosz;
-            let needs_dict = dict_loaded && stored_dict == 0 && format == BlobFormat::Nos2;
-            if !upgrading_level && !needs_dict && format == BlobFormat::Nos2 {
-                report.skipped += 1;
-                continue;
-            }
-
-            let logical = match decompress_blob(&blob, size as u64, dict_bytes, None) {
+            let logical = match self.decode_for_maintenance(&blob, format, size, dict_bytes) {
                 Ok(v) => v,
                 Err(_) => {
                     report.skipped += 1;
@@ -162,7 +248,6 @@ impl StorageEngine {
                 }
             };
 
-            let old_len = blob.len();
             let ctx = CompressionContext::new(
                 Some(key.as_str()),
                 None,
@@ -170,43 +255,30 @@ impl StorageEngine {
                 self.compress_min_size(),
                 self.compress_exclude_extensions(),
             );
-            let encode_opts = EncodeOptions {
-                dict_id: 0,
-                dict: dict_bytes,
-                dedup_store: None,
-            };
+            let encode_opts = self.maintenance_encode_opts(target_dict_id, dict_bytes);
             let encoded = encode_blob_for_storage(
                 &logical,
                 background_level,
-                self.compress_block_size(),
+                self.block_size(),
                 ctx,
                 encode_opts,
             )?;
-            if upgrading_level {
-                if !is_indexed_blob(&encoded) && encoded.len() >= old_len {
-                    report.skipped += 1;
-                    continue;
-                }
-            } else {
-                if encoded.len() > old_len {
-                    report.skipped += 1;
-                    continue;
-                }
-                if !is_indexed_blob(&encoded) {
-                    report.skipped += 1;
-                    continue;
-                }
-            }
-            if !upgrading_level && encoded.len() == old_len {
+
+            let old_len = blob.len();
+            let upgrading_level = migrating_legacy
+                || upgrading_indexed
+                || (read_blob_stored_zstd_level(&blob).unwrap_or(0) as i32) < background_level;
+
+            if !self.should_replace_encoded(old_len, &encoded, upgrading_level, migrating_legacy) {
                 report.skipped += 1;
                 continue;
             }
+
             if !self.atomic_replace_blob(&path, &encoded).await? {
                 report.skipped += 1;
                 continue;
             }
-            let new_blob = encoded;
-            report.bytes_saved += (old_len as i64) - (new_blob.len() as i64);
+            report.bytes_saved += (old_len as i64) - (encoded.len() as i64);
             report.recompressed += 1;
         }
 
@@ -227,6 +299,73 @@ impl StorageEngine {
         limit: usize,
     ) -> Result<RecompressReport, StorageError> {
         self.recompress_blobs(limit).await
+    }
+
+    /// Walk indexed blobs and verify block checksums without a client GET.
+    pub async fn verify_blob_integrity(&self, limit: usize) -> Result<VerifyBlobsReport, StorageError> {
+        let limit = limit.max(1) as i64;
+        let rows = self
+            .object_meta()
+            .list_recompress_candidates(limit)
+            .await?;
+
+        let dict = if self.zstd_dict_enabled() {
+            self.dict_store().global_dict()
+        } else {
+            None
+        };
+        let dict_bytes = dict.as_deref().map(|v| v.as_slice());
+
+        let mut report = VerifyBlobsReport::default();
+        for (bucket, key, size) in rows {
+            report.scanned += 1;
+            let variants = blob_path_variants(self.data_dir(), &bucket, &key);
+            let Some(path) = super::first_existing_blob_path(&variants)
+                .await
+                .map_err(internal)?
+            else {
+                report.skipped += 1;
+                continue;
+            };
+            let Ok(blob) = fs::read(&path).await else {
+                report.skipped += 1;
+                continue;
+            };
+
+            let format = detect_blob_format(&blob);
+            let ok = match format {
+                BlobFormat::Raw => blob.len() as i64 == size,
+                BlobFormat::Nosd => {
+                    self.decode_for_maintenance(&blob, format, size, dict_bytes).is_ok()
+                }
+                BlobFormat::Nosb | BlobFormat::Nosi => verify_indexed_blob(
+                    &blob,
+                    size as u64,
+                    dict_bytes,
+                    Some(self.data_dir()),
+                )
+                .is_ok(),
+                BlobFormat::Nosz | BlobFormat::Nos2 => {
+                    decompress_blob(&blob, size as u64, dict_bytes, None).is_ok()
+                }
+            };
+
+            if ok {
+                report.verified += 1;
+            } else {
+                report.corrupted += 1;
+                tracing::warn!(bucket = %bucket, key = %key, "blob integrity verification failed");
+            }
+        }
+
+        if report.corrupted > 0 {
+            tracing::warn!(
+                scanned = report.scanned,
+                corrupted = report.corrupted,
+                "storage::verify_blob_integrity found corruption"
+            );
+        }
+        Ok(report)
     }
 
     /// Sample recent objects and train a global zstd dictionary when enabled.
@@ -256,19 +395,9 @@ impl StorageEngine {
                 continue;
             };
             let format = detect_blob_format(&blob);
-            if format == BlobFormat::Nosd {
-                continue;
-            }
-            let logical = if format == BlobFormat::Raw {
-                if blob.len() as i64 != size {
-                    continue;
-                }
-                blob
-            } else {
-                match decompress_blob(&blob, size as u64, None, None) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                }
+            let logical = match self.decode_for_maintenance(&blob, format, size, None) {
+                Ok(v) => v,
+                Err(_) => continue,
             };
             if logical.len() >= 64 {
                 samples.push(logical);
