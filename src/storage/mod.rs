@@ -20,7 +20,7 @@ pub mod reconcile;
 pub mod types;
 
 pub use engine::{GetObjectOutcome, StorageEngine};
-pub use maintenance::{DictTrainReport, RecompressReport, VerifyBlobsReport};
+pub use maintenance::{DictTrainReport, MigrateBlobsReport, RecompressReport, VerifyBlobsReport};
 
 pub fn sanitize_bucket(bucket: &str) -> anyhow::Result<String> {
     if bucket.is_empty() {

@@ -1930,3 +1930,274 @@ async fn test_verify_blob_integrity_passes_and_detects_corruption() {
     let bad = storage.verify_blob_integrity(10).await.unwrap();
     assert!(bad.corrupted >= 1, "expected corruption detected: {:?}", bad);
 }
+
+// Human: Read full object bytes through the storage engine (decompresses indexed blobs).
+// Agent: CALLS get_object; RETURNS logical payload for checksum comparisons in migration tests.
+async fn engine_get_bytes(storage: &StorageEngine, bucket: &str, key: &str) -> Vec<u8> {
+    let outcome = storage
+        .get_object(bucket, key, None, None, None)
+        .await
+        .unwrap();
+    match outcome {
+        nebular_os::storage::GetObjectOutcome::Content { stream, .. } => {
+            axum::body::to_bytes(axum::body::Body::from_stream(stream.stream), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec()
+        }
+        _ => panic!("expected content"),
+    }
+}
+
+// Human: Simulate pre-0.1.4 on-disk layout by moving a fresh PUT blob onto the legacy nested path.
+// Agent: WRITES metadata via put_object; RENAMES encoded blob file to blob_path_legacy location.
+async fn install_legacy_nested_blob(
+    storage: &StorageEngine,
+    data_dir: &std::path::Path,
+    bucket: &str,
+    key: &str,
+    bytes: &[u8],
+) {
+    use nebular_os::storage::{blob_path, blob_path_legacy};
+
+    let mut body = std::io::Cursor::new(bytes);
+    storage
+        .put_object(bucket, key, Some("application/octet-stream"), None, &mut body)
+        .await
+        .unwrap();
+
+    let base = data_dir.to_string_lossy();
+    let encoded = blob_path(base.as_ref(), bucket, key);
+    let legacy = blob_path_legacy(base.as_ref(), bucket, key);
+    if let Some(parent) = legacy.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::rename(&encoded, &legacy).unwrap_or_else(|_| {
+        std::fs::copy(&encoded, &legacy).unwrap();
+        std::fs::remove_file(&encoded).unwrap();
+    });
+    assert!(legacy.is_file(), "legacy blob must exist at {legacy:?}");
+    assert!(!encoded.exists(), "encoded path must be absent before migration");
+}
+
+#[tokio::test]
+async fn test_migrate_blobs_legacy_nested_layout_preserves_content() {
+    use nebular_os::storage::{blob_path, blob_path_legacy, encode_blob_filename};
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        zstd_level: 22,
+        zstd_level_upload: 3,
+        ..EngineOptions::default()
+    })
+    .await;
+    let data_dir = tmp.path().join("blobs");
+    let bucket = "media";
+    let main_key = "users/tenant/files/e972685e-a486-4626-a7dc-5256b4be54dc";
+    let sidecar_key = "users/tenant/files/e972685e-a486-4626-a7dc-5256b4be54dc/grid-thumbnail.jpg";
+    // Human: Payloads above compress_min_size (4096) so migration exercises NOSI re-encode, not tiny raw blobs.
+    let main_bytes = b"original image bytes for migration validation ".repeat(120);
+    let sidecar_bytes = b"thumbnail bytes for migration validation ".repeat(120);
+
+    install_legacy_nested_blob(&storage, &data_dir, bucket, main_key, &main_bytes).await;
+    install_legacy_nested_blob(&storage, &data_dir, bucket, sidecar_key, &sidecar_bytes).await;
+
+    assert_eq!(engine_get_bytes(&storage, bucket, main_key).await, main_bytes);
+    assert_eq!(
+        engine_get_bytes(&storage, bucket, sidecar_key).await,
+        sidecar_bytes
+    );
+
+    let report = storage.migrate_blobs(50, None).await.unwrap();
+    assert!(
+        report.migrated >= 2,
+        "expected both legacy objects migrated, got {:?}",
+        report
+    );
+    assert_eq!(report.failed, 0);
+
+    assert_eq!(engine_get_bytes(&storage, bucket, main_key).await, main_bytes);
+    assert_eq!(
+        engine_get_bytes(&storage, bucket, sidecar_key).await,
+        sidecar_bytes
+    );
+
+    let base = data_dir.to_string_lossy();
+    for key in [main_key, sidecar_key] {
+        let encoded = blob_path(base.as_ref(), bucket, key);
+        let legacy = blob_path_legacy(base.as_ref(), bucket, key);
+        assert!(encoded.is_file(), "encoded blob missing for {key}");
+        assert!(!legacy.exists(), "legacy blob must be removed for {key}");
+        assert!(
+            encoded.ends_with(encode_blob_filename(key).as_str()) || encoded.file_name().is_some(),
+            "encoded path must use flat filename for {key}"
+        );
+    }
+
+    let again = storage.migrate_blobs(50, None).await.unwrap();
+    assert_eq!(again.migrated, 0, "second pass must skip migrated blobs: {:?}", again);
+    assert!(again.skipped >= 2, "already-migrated rows should be skipped: {:?}", again);
+
+    // Human: Idempotent passes must not change bytes users download via GET.
+    assert_eq!(engine_get_bytes(&storage, bucket, main_key).await, main_bytes);
+    assert_eq!(
+        engine_get_bytes(&storage, bucket, sidecar_key).await,
+        sidecar_bytes
+    );
+}
+
+#[tokio::test]
+async fn test_migrate_blobs_legacy_raw_blob_preserves_content() {
+    use nebular_os::storage::{blob_path, blob_path_legacy};
+    use nebular_os::storage::compression::is_indexed_blob;
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        zstd_level: 22,
+        ..EngineOptions::default()
+    })
+    .await;
+    let data_dir = tmp.path().join("blobs");
+    let bucket = "music";
+    let key = "users/tenant/files/legacy-raw.bin";
+    let logical = b"legacy raw payload for migration ".repeat(200);
+
+    install_legacy_nested_blob(&storage, &data_dir, bucket, key, &logical).await;
+
+    let base = data_dir.to_string_lossy();
+    let legacy = blob_path_legacy(base.as_ref(), bucket, key);
+    std::fs::write(&legacy, &logical).unwrap();
+    assert!(!is_indexed_blob(&std::fs::read(&legacy).unwrap()));
+
+    assert_eq!(engine_get_bytes(&storage, bucket, key).await, logical);
+
+    let report = storage.migrate_blobs(10, None).await.unwrap();
+    assert_eq!(report.migrated, 1, "{report:?}");
+    assert_eq!(report.failed, 0);
+
+    let encoded = blob_path(base.as_ref(), bucket, key);
+    assert!(encoded.is_file());
+    assert!(!legacy.exists());
+    assert!(is_indexed_blob(&std::fs::read(&encoded).unwrap()));
+
+    assert_eq!(engine_get_bytes(&storage, bucket, key).await, logical);
+}
+
+#[tokio::test]
+async fn test_migrate_blobs_http_endpoint_preserves_content() {
+    use nebular_os::storage::{blob_path, blob_path_legacy};
+
+    let (app, token, tmp) = setup_app(None, false).await;
+    let data_dir = tmp.path().join("blobs");
+    let bucket = "media";
+    let key = "users/tenant/files/http-migrate-test.dat";
+    let payload = b"http migration payload checksumming".to_vec();
+
+    install_legacy_nested_blob_via_http(&app, &token, &data_dir, bucket, key, &payload).await;
+
+    let before = http_get_bytes(&app, &token, bucket, key).await;
+    assert_eq!(before, payload);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/_nos/maintenance/migrate_blobs?limit=10")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let report: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(report["migrated"].as_u64().unwrap_or(0) >= 1);
+
+    let after = http_get_bytes(&app, &token, bucket, key).await;
+    assert_eq!(after, payload);
+
+    let base = data_dir.to_string_lossy();
+    let encoded = blob_path(base.as_ref(), bucket, key);
+    let legacy = blob_path_legacy(base.as_ref(), bucket, key);
+    assert!(encoded.is_file());
+    assert!(!legacy.exists());
+}
+
+// Human: PUT then move blob to legacy nested path using the app router's data directory.
+// Agent: HTTP PUT + filesystem rename; PREPARES migrate_blobs HTTP integration test fixtures.
+async fn install_legacy_nested_blob_via_http(
+    app: &axum::Router,
+    token: &str,
+    data_dir: &std::path::Path,
+    bucket: &str,
+    key: &str,
+    bytes: &[u8],
+) {
+    use nebular_os::storage::{blob_path, blob_path_legacy};
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/{bucket}/{key}"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/octet-stream")
+        .body(Body::from(bytes.to_vec()))
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let base = data_dir.to_string_lossy();
+    let encoded = blob_path(base.as_ref(), bucket, key);
+    let legacy = blob_path_legacy(base.as_ref(), bucket, key);
+    if let Some(parent) = legacy.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::rename(&encoded, &legacy).unwrap_or_else(|_| {
+        std::fs::copy(&encoded, &legacy).unwrap();
+        std::fs::remove_file(&encoded).unwrap();
+    });
+}
+
+#[tokio::test]
+async fn test_ownly_style_rewrite_preserves_legacy_nested_content() {
+    use nebular_os::storage::{blob_path, blob_path_legacy};
+
+    let (storage, tmp) = setup_engine(EngineOptions::default()).await;
+    let data_dir = tmp.path().join("blobs");
+    let bucket = "media";
+    let key = "users/tenant/files/rewrite-fallback-test.dat";
+    let payload = b"ownly rewrite fallback path payload ".repeat(150);
+
+    install_legacy_nested_blob(&storage, &data_dir, bucket, key, &payload).await;
+    assert_eq!(engine_get_bytes(&storage, bucket, key).await, payload);
+
+    // Human: Mirrors Ownly NebulaStorage::rewrite_object_stream — GET logical bytes then PUT same key.
+    // Agent: VALIDATES admin client-side migration fallback; WRITES encoded path; REMOVES legacy layout.
+    let logical = engine_get_bytes(&storage, bucket, key).await;
+    let mut body = std::io::Cursor::new(logical.as_slice());
+    storage
+        .put_object(bucket, key, Some("application/octet-stream"), None, &mut body)
+        .await
+        .unwrap();
+
+    assert_eq!(engine_get_bytes(&storage, bucket, key).await, payload);
+
+    let base = data_dir.to_string_lossy();
+    let encoded = blob_path(base.as_ref(), bucket, key);
+    let legacy = blob_path_legacy(base.as_ref(), bucket, key);
+    assert!(encoded.is_file());
+    assert!(!legacy.exists());
+}
+
+async fn http_get_bytes(app: &axum::Router, token: &str, bucket: &str, key: &str) -> Vec<u8> {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/{bucket}/{key}"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec()
+}
