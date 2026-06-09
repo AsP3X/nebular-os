@@ -27,13 +27,15 @@ pub async fn apply_replication_event_bytes(
                 .await?;
         }
         ReplicationOp::Put => {
+            let content_type = event.content_type.as_deref();
+            let custom_meta = event.custom_meta.as_deref();
             if let Some(bytes) = blob {
                 engine
                     .put_object(
                         &event.bucket,
                         &event.key,
-                        None,
-                        None,
+                        content_type,
+                        custom_meta,
                         std::io::Cursor::new(bytes),
                     )
                     .await?;
@@ -45,7 +47,13 @@ pub async fn apply_replication_event_bytes(
                     .ok_or(StorageError::NotFound)?;
                 let file = BufReader::new(File::open(&path).await.map_err(internal)?);
                 engine
-                    .put_object(&event.bucket, &event.key, None, None, file)
+                    .put_object(
+                        &event.bucket,
+                        &event.key,
+                        content_type,
+                        custom_meta,
+                        file,
+                    )
                     .await?;
             }
         }

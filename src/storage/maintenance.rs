@@ -32,6 +32,7 @@ pub struct VerifyBlobsReport {
     pub scanned: u64,
     pub verified: u64,
     pub corrupted: u64,
+    pub recovered: u64,
     pub skipped: u64,
 }
 
@@ -89,7 +90,7 @@ impl StorageEngine {
         }
     }
 
-    fn decode_for_maintenance(
+    pub(crate) fn decode_for_maintenance(
         &self,
         blob: &[u8],
         format: BlobFormat,

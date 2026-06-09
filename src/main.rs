@@ -119,10 +119,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    spawn_storage_maintenance(storage.clone(), cfg.clone());
-
     let metrics = NosMetrics::new();
     let backend = cluster::build_backend(storage.clone(), &cfg.cluster, metrics.clone())?;
+    spawn_storage_maintenance(storage.clone(), backend.clone(), cfg.clone());
+
     let app = server::create_app(backend, storage, cfg.clone(), metrics).await?;
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
@@ -138,7 +138,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::NosConfig>) {
+fn spawn_storage_maintenance(
+    storage: storage::StorageEngine,
+    backend: cluster::StorageBackend,
+    cfg: Arc<config::NosConfig>,
+) {
     let purge_soft = cfg.soft_delete_ttl_secs > 0;
     let purge_multipart = cfg.multipart_upload_ttl_secs > 0;
     let recompress = cfg.recompress_interval_secs > 0;
@@ -189,7 +193,7 @@ fn spawn_storage_maintenance(storage: storage::StorageEngine, cfg: Arc<config::N
                 }
             }
             if verify {
-                match storage.verify_blob_integrity(cfg.verify_batch_size).await {
+                match backend.verify_blob_integrity(cfg.verify_batch_size).await {
                     Ok(report) if report.corrupted > 0 => {
                         tracing::warn!(?report, "Periodic blob integrity verification found issues")
                     }

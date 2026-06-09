@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::State,
+    extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -197,6 +197,27 @@ pub async fn assignment_resolve(
         }),
     )
         .into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct BackfillQuery {
+    pub limit: Option<u64>,
+}
+
+/// Human: Enqueue replication events for existing objects not yet pushed to peers.
+/// Agent: POST /_cluster/replication/backfill; Bearer cluster token; optional limit (default 100).
+pub async fn replication_backfill(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<BackfillQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(100).min(10_000) as usize;
+    match state.backend().backfill_replication(limit).await {
+        Ok(report) => (StatusCode::OK, Json(report)).into_response(),
+        Err(e) => {
+            let (status, json) = crate::routes::errors::map_storage_error(e);
+            (status, json).into_response()
+        }
+    }
 }
 
 pub async fn cluster_capabilities(State(state): State<Arc<AppState>>) -> impl IntoResponse {

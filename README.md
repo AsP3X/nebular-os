@@ -90,6 +90,11 @@ Unset `NOS_CLUSTER_MODE` for standalone (default). See [docs/plans/cluster-modes
 | `NOS_ASSIGNMENT_FORWARD` | When `true`, proxy PUT/copy/multipart writes to the assigned peer instead of `409` |
 | `NOS_REPLICATION_ASYNC` | Must be `true` (default); `false` is rejected at startup (quorum deferred) |
 | `NOS_REPLICATION_READ_REPAIR` | When `true`, fetch missing blobs from peers on GET |
+| `NOS_REPLICATION_HEAL_ON_READ` | When `true` with read repair, persist peer bytes locally on GET miss (heal-on-read) |
+| `NOS_REPLICATION_PREFIXES` | Comma-separated key prefixes to replicate (empty = all keys) |
+| `NOS_REPLICATION_EXCLUDE_PREFIXES` | Comma-separated prefixes to skip (wins over include) |
+| `NOS_REPLICATION_MAX_ATTEMPTS` | Push attempts before dead-letter (`20` default) |
+| `NOS_REPLICATION_PEER_CONCURRENCY` | Max parallel peer pushes per worker tick (`4` default) |
 | `NOS_CLUSTER_BOOTSTRAP_TOKEN` | Operator token for `GET`/`PUT /_cluster/config` before cluster is configured (optional) |
 | `x-nd-storage-class` | Optional client header (ignored in standalone) |
 
@@ -99,7 +104,9 @@ Peer list format: `node-b=http://host:9000;class-a,class-b;group=replication-gro
 
 ### Replication lag and consistency
 
-Replication is **asynchronous** (`NOS_REPLICATION_ASYNC=true` by default). A successful PUT on the origin node does not guarantee immediate visibility on peers; monitor `replication_lag_events` on `GET /health` or `replication_pending_events` on `GET /metrics`. Failed pushes retry with exponential backoff (see `replication_log.next_retry_at`).
+Replication is **asynchronous** (`NOS_REPLICATION_ASYNC=true` by default). A successful PUT on the origin node does not guarantee immediate visibility on peers; monitor `replication_lag_events` on `GET /health` or `replication_pending_events` on `GET /metrics`. Failed pushes retry with exponential backoff (see `replication_log.next_retry_at`). Use `GET /_nos/maintenance/replication_status` (admin JWT) for pending, failed, and dead-letter counts. `POST /_cluster/replication/backfill` (cluster token) enqueues existing objects that match prefix rules. Replication events carry `content_type` and `custom_meta` so peers apply the same metadata as the origin.
+
+**Read repair and heal:** With `NOS_REPLICATION_READ_REPAIR=true`, a GET on a peer that lacks the object streams from another peer without persisting. With `NOS_REPLICATION_HEAL_ON_READ=true`, the peer writes the fetched bytes locally first (heal-on-read). Periodic `POST /_nos/maintenance/verify_blobs` can attempt peer recovery when checksum verification fails and `NOS_REPLICATION_FACTOR` > 1.
 
 ### Split-brain and dual writes
 

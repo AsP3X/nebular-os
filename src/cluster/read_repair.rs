@@ -7,6 +7,7 @@ use futures_util::StreamExt;
 use reqwest::StatusCode;
 
 use crate::cluster::peer::PeerRegistry;
+use crate::cluster::replication_recover::custom_meta_json_from_headers;
 use crate::storage::engine::GetObjectOutcome;
 use crate::storage::error::StorageError;
 use crate::storage::streaming::{GuardedObjectBodyStream, ObjectBodyStream};
@@ -82,6 +83,7 @@ pub async fn fetch_from_peers(
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
+        let custom_meta = custom_meta_json_from_headers(resp.headers());
         let total_size = resp
             .headers()
             .get(header::CONTENT_RANGE)
@@ -104,10 +106,18 @@ pub async fn fetch_from_peers(
             etag,
             created_at: epoch,
             updated_at: epoch,
-            custom_meta: None,
+            custom_meta,
             deleted_at: None,
-            storage_class: None,
-            origin_node: None,
+            storage_class: resp
+                .headers()
+                .get(axum::http::HeaderName::from_static("x-nd-storage-class"))
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+            origin_node: resp
+                .headers()
+                .get(axum::http::HeaderName::from_static("x-nd-origin-node"))
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
         };
 
         if status == StatusCode::NOT_MODIFIED {

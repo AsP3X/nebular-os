@@ -40,6 +40,23 @@ pub struct ClusterConfigSnapshot {
     pub assignment_rules: Option<serde_json::Value>,
     #[serde(default)]
     pub assignment_forward: bool,
+    #[serde(default)]
+    pub replication_heal_on_read: bool,
+    #[serde(default)]
+    pub replication_prefixes: Vec<String>,
+    #[serde(default)]
+    pub replication_exclude_prefixes: Vec<String>,
+    #[serde(default = "default_replication_max_attempts")]
+    pub replication_max_attempts: u32,
+    #[serde(default = "default_replication_peer_concurrency")]
+    pub replication_peer_concurrency: u32,
+}
+
+fn default_replication_max_attempts() -> u32 {
+    20
+}
+fn default_replication_peer_concurrency() -> u32 {
+    4
 }
 
 fn default_replication_group() -> String {
@@ -121,7 +138,12 @@ impl ClusterConfigSnapshot {
             replication_factor: self.replication_factor,
             replication_pending_events: 0,
             replication_read_repair: self.replication_read_repair,
+            replication_heal_on_read: self.replication_heal_on_read,
             replication_async: self.replication_async,
+            replication_prefixes: self.replication_prefixes.clone(),
+            replication_exclude_prefixes: self.replication_exclude_prefixes.clone(),
+            replication_max_attempts: self.replication_max_attempts,
+            replication_peer_concurrency: self.replication_peer_concurrency,
             default_storage_class: self.default_storage_class,
             assignment_rules_raw,
             assignment_forward: self.assignment_forward,
@@ -172,7 +194,12 @@ impl ClusterConfigSnapshot {
             replication_role: cfg.replication_role.clone(),
             replication_factor: cfg.replication_factor,
             replication_read_repair: cfg.replication_read_repair,
+            replication_heal_on_read: cfg.replication_heal_on_read,
             replication_async: cfg.replication_async,
+            replication_prefixes: cfg.replication_prefixes.clone(),
+            replication_exclude_prefixes: cfg.replication_exclude_prefixes.clone(),
+            replication_max_attempts: cfg.replication_max_attempts,
+            replication_peer_concurrency: cfg.replication_peer_concurrency,
             default_storage_class: cfg.default_storage_class.clone(),
             assignment_rules,
             assignment_forward: cfg.assignment_forward,

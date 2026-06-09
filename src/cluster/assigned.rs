@@ -5,9 +5,7 @@ use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
 use crate::storage::types::{DeletePrefixFailure, DeletePrefixOutcome, ListCountResult, ListResult, ObjectMetadata};
 
-use super::assignment::{
-    replication_group_for_write, AssignmentResolution, AssignmentRules, WriteContext,
-};
+use super::assignment::{AssignmentResolution, AssignmentRules, WriteContext};
 use super::forward;
 use super::config::ClusterConfig;
 use super::peer::PeerRegistry;
@@ -67,6 +65,37 @@ impl AssignedBackend {
         match &self.inner {
             AssignedInner::Standalone(_) => Ok(0),
             AssignedInner::Replicated(b) => b.pending_replication_events().await,
+        }
+    }
+
+    pub async fn replication_status(
+        &self,
+    ) -> Result<super::replicated::ReplicationStatusReport, StorageError> {
+        match &self.inner {
+            AssignedInner::Standalone(_) => {
+                Ok(super::replicated::ReplicationStatusReport::default())
+            }
+            AssignedInner::Replicated(b) => b.replication_status().await,
+        }
+    }
+
+    pub async fn backfill_replication(
+        &self,
+        limit: usize,
+    ) -> Result<super::replicated::BackfillReport, StorageError> {
+        match &self.inner {
+            AssignedInner::Standalone(_) => Ok(super::replicated::BackfillReport::default()),
+            AssignedInner::Replicated(b) => b.backfill_replication(limit).await,
+        }
+    }
+
+    pub async fn verify_blob_integrity_with_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<crate::storage::maintenance::VerifyBlobsReport, StorageError> {
+        match &self.inner {
+            AssignedInner::Standalone(b) => b.engine().verify_blob_integrity(limit).await,
+            AssignedInner::Replicated(b) => b.verify_blob_integrity_with_recovery(limit).await,
         }
     }
 
@@ -173,9 +202,7 @@ impl AssignedBackend {
                 let meta = b
                     .put_object_local(bucket, key, content_type, custom_meta, body)
                     .await?;
-                let group = replication_group_for_write(ctx, &self.cluster);
-                b.replication_log()
-                    .enqueue_put(&meta, &resolution.storage_class, &group)
+                b.enqueue_replicated_put(&meta, &resolution.storage_class, ctx)
                     .await?;
                 meta
             }
@@ -237,9 +264,7 @@ impl AssignedBackend {
                         if_none_match,
                     )
                     .await?;
-                let group = replication_group_for_write(ctx, &self.cluster);
-                b.replication_log()
-                    .enqueue_put(&meta, &resolution.storage_class, &group)
+                b.enqueue_replicated_put(&meta, &resolution.storage_class, ctx)
                     .await?;
                 meta
             }
@@ -575,9 +600,7 @@ impl AssignedBackend {
                 let meta = b
                     .complete_multipart_local(bucket, key, upload_id, custom_meta)
                     .await?;
-                let group = replication_group_for_write(ctx, &self.cluster);
-                b.replication_log()
-                    .enqueue_put(&meta, &resolution.storage_class, &group)
+                b.enqueue_replicated_put(&meta, &resolution.storage_class, ctx)
                     .await?;
                 meta
             }

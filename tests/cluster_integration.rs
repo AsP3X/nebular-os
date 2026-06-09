@@ -115,7 +115,12 @@ fn cluster_test_config(
             replication_factor,
             replication_pending_events: 0,
             replication_read_repair: false,
+            replication_heal_on_read: false,
             replication_async: true,
+            replication_prefixes: Vec::new(),
+            replication_exclude_prefixes: Vec::new(),
+            replication_max_attempts: 20,
+            replication_peer_concurrency: 4,
             default_storage_class: "default".into(),
             assignment_rules_raw: None,
             assignment_forward: false,
@@ -217,6 +222,8 @@ async fn cluster_idempotent_replay() {
         payload_path: None,
         storage_class: "default".into(),
         replication_group: "default".into(),
+        content_type: Some("text/plain".into()),
+        custom_meta: Some(r#"{"tag":"v1"}"#.into()),
         created_at: 1,
     };
 
@@ -229,6 +236,14 @@ async fn cluster_idempotent_replay() {
 
     let count = engine.object_count().await.unwrap();
     assert_eq!(count, 1);
+
+    let meta = engine
+        .head_object("music", "idempotent.bin", None, None)
+        .await
+        .unwrap()
+        .expect("object metadata");
+    assert_eq!(meta.mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(meta.custom_meta.as_deref(), Some(r#"{"tag":"v1"}"#));
 }
 
 #[tokio::test]
@@ -310,6 +325,7 @@ async fn cluster_replicate_eventually() {
             &cfg_a.cluster,
             CLUSTER_TOKEN,
             &metrics,
+            None,
         )
         .await
         .unwrap();
@@ -461,6 +477,7 @@ async fn replicated_assigned_replicates_class_to_peer() {
             &cfg_hot.cluster,
             CLUSTER_TOKEN,
             &metrics,
+            None,
         )
         .await
         .unwrap();
@@ -646,6 +663,7 @@ async fn replication_retry_after_failed_push() {
         &cfg_a.cluster,
         CLUSTER_TOKEN,
         &metrics,
+        None,
     )
     .await
     .unwrap();
@@ -677,6 +695,7 @@ async fn replication_retry_after_failed_push() {
             &cfg_a.cluster,
             CLUSTER_TOKEN,
             &metrics,
+            None,
         )
         .await
         .unwrap();
@@ -741,6 +760,7 @@ async fn replication_group_mismatch_skips_peer() {
         &cfg_a.cluster,
         CLUSTER_TOKEN,
         &metrics,
+        None,
     )
     .await
     .unwrap();
@@ -817,4 +837,294 @@ async fn runtime_cluster_config_apply_via_bootstrap() {
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(json["cluster_mode"], "replicated");
     assert_eq!(json["node_id"], "node-a");
+}
+
+#[tokio::test]
+async fn replication_metadata_e2e() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let cfg_b = cluster_test_config("node-b", "node-a=http://127.0.0.1:1", "member", 2);
+    let (backend_b, engine_b, _) = engine_and_backend(&cfg_b, &tmp_b).await;
+    let app_b = app_with_metrics(backend_b, engine_b, cfg_b.clone()).await;
+    let app_b_client = app_b.clone();
+    tokio::spawn(async move {
+        axum::serve(listener_b, app_b.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let peers = format!("node-b=http://{}", addr_b);
+    let cfg_a = cluster_test_config("node-a", &peers, "member", 2);
+    let (backend_a, engine_a, _) = engine_and_backend(&cfg_a, &tmp_a).await;
+    let app_a = app_with_metrics(backend_a.clone(), engine_a.clone(), cfg_a.clone()).await;
+    let token = make_token();
+
+    let put = Request::builder()
+        .method("PUT")
+        .uri("/music/meta-e2e.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("x-nd-custom-meta-tag", "replicated")
+        .body(Body::from(r#"{"ok":true}"#))
+        .unwrap();
+    assert_eq!(
+        app_a.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let replicated = match &backend_a {
+        nebular_os::cluster::StorageBackend::Replicated(r) => r.clone(),
+        _ => panic!("expected replicated"),
+    };
+    let peers = nebular_os::cluster::peer::PeerRegistry::from_peers_raw(&peers).unwrap();
+    let client = reqwest::Client::new();
+    for _ in 0..20 {
+        let metrics = NosMetrics::new();
+        drain_once(
+            &client,
+            replicated.replication_log(),
+            &peers,
+            &cfg_a.cluster,
+            CLUSTER_TOKEN,
+            &metrics,
+            None,
+        )
+        .await
+        .unwrap();
+        let head = Request::builder()
+            .method("HEAD")
+            .uri("/music/meta-e2e.bin")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_b_client.clone().oneshot(head).await.unwrap();
+        if resp.status() == StatusCode::OK {
+            assert_eq!(
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/json")
+            );
+            assert_eq!(
+                resp.headers()
+                    .get("x-nd-custom-meta-tag")
+                    .and_then(|v| v.to_str().ok()),
+                Some("replicated")
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("metadata did not replicate to peer");
+}
+
+#[tokio::test]
+async fn replication_prefix_skips_excluded_key() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+
+    let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+
+    let cfg_b = cluster_test_config("node-b", "node-a=http://127.0.0.1:1", "member", 2);
+    let (backend_b, engine_b, _) = engine_and_backend(&cfg_b, &tmp_b).await;
+    let app_b = app_with_metrics(backend_b, engine_b, cfg_b.clone()).await;
+    let app_b_client = app_b.clone();
+    tokio::spawn(async move {
+        axum::serve(listener_b, app_b.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let peers = format!("node-b=http://{}", addr_b);
+    let base_a = cluster_test_config("node-a", &peers, "member", 2);
+    let cfg_a = Arc::new(NosConfig {
+        cluster: ClusterConfig {
+            replication_exclude_prefixes: vec!["skip/".into()],
+            ..base_a.cluster.clone()
+        },
+        ..(*base_a).clone()
+    });
+    let (backend_a, engine_a, _) = engine_and_backend(&cfg_a, &tmp_a).await;
+    let app_a = app_with_metrics(backend_a.clone(), engine_a.clone(), cfg_a.clone()).await;
+    let token = make_token();
+
+    let put_skip = Request::builder()
+        .method("PUT")
+        .uri("/music/skip/excluded.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("skip-me"))
+        .unwrap();
+    assert_eq!(
+        app_a.clone().oneshot(put_skip).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let replicated = match &backend_a {
+        nebular_os::cluster::StorageBackend::Replicated(r) => r.clone(),
+        _ => panic!("expected replicated"),
+    };
+    let peer_reg = nebular_os::cluster::peer::PeerRegistry::from_peers_raw(&peers).unwrap();
+    let client = reqwest::Client::new();
+    let metrics = NosMetrics::new();
+    for _ in 0..10 {
+        drain_once(
+            &client,
+            replicated.replication_log(),
+            &peer_reg,
+            &cfg_a.cluster,
+            CLUSTER_TOKEN,
+            &metrics,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
+    let get_skip = Request::builder()
+        .method("GET")
+        .uri("/music/skip/excluded.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app_b_client.clone().oneshot(get_skip).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+
+    let put_ok = Request::builder()
+        .method("PUT")
+        .uri("/music/ok/included.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("include-me"))
+        .unwrap();
+    assert_eq!(
+        app_a.oneshot(put_ok).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    for _ in 0..20 {
+        drain_once(
+            &client,
+            replicated.replication_log(),
+            &peer_reg,
+            &cfg_a.cluster,
+            CLUSTER_TOKEN,
+            &metrics,
+            None,
+        )
+        .await
+        .unwrap();
+        let get_ok = Request::builder()
+            .method("GET")
+            .uri("/music/ok/included.bin")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app_b_client.clone().oneshot(get_ok).await.unwrap();
+        if resp.status() == StatusCode::OK {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(body.as_ref(), b"include-me");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("non-excluded key did not replicate");
+}
+
+#[tokio::test]
+async fn heal_on_read_persists_object() {
+    let tmp_a = TempDir::new().unwrap();
+    let tmp_b = TempDir::new().unwrap();
+
+    let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+
+    let cfg_a = cluster_test_config("node-a", "node-b=http://127.0.0.1:1", "member", 1);
+    let (backend_a, engine_a, _) = engine_and_backend(&cfg_a, &tmp_a).await;
+    let app_a = app_with_metrics(backend_a, engine_a, cfg_a).await;
+    tokio::spawn(async move {
+        axum::serve(listener_a, app_a.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let peers_b = format!("node-a=http://{}", addr_a);
+    let base_b = cluster_test_config("node-b", &peers_b, "member", 1);
+    let cfg_b = Arc::new(NosConfig {
+        cluster: ClusterConfig {
+            replication_read_repair: true,
+            replication_heal_on_read: true,
+            ..base_b.cluster.clone()
+        },
+        ..(*base_b).clone()
+    });
+    let (backend_b, engine_b, _) = engine_and_backend(&cfg_b, &tmp_b).await;
+    let app_b = app_with_metrics(backend_b, engine_b.clone(), cfg_b.clone()).await;
+    let token = make_token();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .put(format!("http://{}/music/heal.bin", addr_a))
+        .header("authorization", format!("Bearer {token}"))
+        .body("heal-bytes")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let get = Request::builder()
+        .method("GET")
+        .uri("/music/heal.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app_b.oneshot(get).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    engine_b
+        .head_object("music", "heal.bin", None, None)
+        .await
+        .expect("heal-on-read should persist object locally")
+        .expect("heal-on-read should persist object locally");
+}
+
+#[tokio::test]
+async fn replication_status_reports_pending() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = cluster_test_config("node-a", "node-b=http://127.0.0.1:1", "member", 2);
+    let (backend, engine, _) = engine_and_backend(&cfg, &tmp).await;
+    let app = app_with_metrics(backend, engine, cfg).await;
+    let token = make_token();
+
+    let put = Request::builder()
+        .method("PUT")
+        .uri("/music/status-pending.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("pending"))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(put).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    let status_req = Request::builder()
+        .method("GET")
+        .uri("/_nos/maintenance/replication_status")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(status_req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["pending"].as_u64().unwrap_or(0) >= 1);
 }

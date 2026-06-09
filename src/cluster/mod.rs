@@ -7,6 +7,8 @@ pub mod config_api;
 pub mod forward;
 pub mod peer;
 pub mod read_repair;
+pub mod replication_recover;
+pub mod replication_rules;
 pub mod reload;
 pub mod replicate;
 pub mod replicated;

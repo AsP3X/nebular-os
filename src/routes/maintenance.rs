@@ -110,7 +110,27 @@ pub async fn verify_blobs(
         .limit
         .unwrap_or(state.engine().verify_batch_size() as u64)
         .min(10_000) as usize;
-    match state.engine().verify_blob_integrity(limit).await {
+    match state.backend().verify_blob_integrity(limit).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            let (status, json) = crate::routes::errors::map_storage_error(e);
+            (status, json).into_response()
+        }
+    }
+}
+
+/// Human: Replication queue depth and dead-letter counts for cluster operators.
+/// Agent: GET /_nos/maintenance/replication_status; admin JWT; zeroed in standalone mode.
+pub async fn replication_status(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let claims = req.extensions().get::<Claims>();
+    if let Err(resp) = require_admin(claims) {
+        return resp.into_response();
+    }
+
+    match state.backend().replication_status().await {
         Ok(report) => Json(report).into_response(),
         Err(e) => {
             let (status, json) = crate::routes::errors::map_storage_error(e);

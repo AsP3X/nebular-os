@@ -1245,6 +1245,12 @@ pub(crate) async fn init_system_sqlite_schema(pool: &Pool<Sqlite>) -> Result<(),
     let _ = sqlx::query("ALTER TABLE replication_log ADD COLUMN next_retry_at INTEGER")
         .execute(pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE replication_log ADD COLUMN content_type TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE replication_log ADD COLUMN custom_meta TEXT")
+        .execute(pool)
+        .await;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS cluster_runtime_config (

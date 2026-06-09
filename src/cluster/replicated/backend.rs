@@ -10,8 +10,11 @@ use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
 use crate::storage::types::{DeletePrefixOutcome, ListCountResult, ListResult, ObjectMetadata};
 
-use super::log::ReplicationLog;
+use super::log::{BackfillReport, ReplicationLog, ReplicationStatusReport};
 use super::worker::spawn_replication_worker;
+use crate::cluster::replication_recover;
+use crate::cluster::replication_rules;
+use crate::storage::maintenance::VerifyBlobsReport;
 
 use crate::cluster::standalone::StandaloneBackend as InnerBackend;
 
@@ -69,6 +72,126 @@ impl ReplicatedBackend {
         ctx.and_then(|c| c.storage_class_header.clone())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| self.cluster.default_storage_class.clone())
+    }
+
+    pub async fn enqueue_replicated_put(
+        &self,
+        meta: &ObjectMetadata,
+        storage_class: &str,
+        write_ctx: Option<&WriteContext>,
+    ) -> Result<(), StorageError> {
+        if !replication_rules::should_replicate_key(&self.cluster, &meta.bucket, &meta.key) {
+            return Ok(());
+        }
+        let group = self.replication_group(write_ctx);
+        self.log.enqueue_put(meta, storage_class, &group).await?;
+        Ok(())
+    }
+
+    async fn maybe_enqueue_put(
+        &self,
+        meta: &ObjectMetadata,
+        write_ctx: Option<&WriteContext>,
+    ) -> Result<(), StorageError> {
+        let class = self.storage_class_for_write(write_ctx);
+        self.enqueue_replicated_put(meta, &class, write_ctx).await
+    }
+
+    async fn maybe_enqueue_delete(
+        &self,
+        bucket: &str,
+        key: &str,
+        storage_class: &str,
+        write_ctx: Option<&WriteContext>,
+    ) -> Result<(), StorageError> {
+        if !replication_rules::should_replicate_key(&self.cluster, bucket, key) {
+            return Ok(());
+        }
+        let group = self.replication_group(write_ctx);
+        self.log
+            .enqueue_delete(bucket, key, storage_class, &group)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn replication_status(&self) -> Result<ReplicationStatusReport, StorageError> {
+        self.log.status_report().await
+    }
+
+    pub async fn backfill_replication(&self, limit: usize) -> Result<BackfillReport, StorageError> {
+        let limit = limit.max(1) as i64;
+        let rows = self
+            .inner
+            .engine()
+            .object_meta()
+            .list_recompress_candidates(limit)
+            .await?;
+        let mut report = BackfillReport::default();
+        for (bucket, key, _) in rows {
+            report.scanned += 1;
+            if !replication_rules::should_replicate_key(&self.cluster, &bucket, &key) {
+                report.skipped += 1;
+                continue;
+            }
+            let meta = match self.inner.engine().head_object(&bucket, &key, None, None).await? {
+                Some(m) => m,
+                None => {
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+            let class = meta
+                .storage_class
+                .as_deref()
+                .unwrap_or("default");
+            self.log
+                .enqueue_put(&meta, class, &self.cluster.replication_group)
+                .await?;
+            report.enqueued += 1;
+        }
+        Ok(report)
+    }
+
+    pub async fn verify_blob_integrity_with_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<VerifyBlobsReport, StorageError> {
+        let mut report = self.inner.engine().verify_blob_integrity(limit).await?;
+        if self.cluster.replication_factor <= 1 || report.corrupted == 0 {
+            return Ok(report);
+        }
+        let token = self
+            .cluster
+            .cluster_token
+            .as_deref()
+            .unwrap_or_default();
+        let client = reqwest::Client::new();
+        let rows = self
+            .inner
+            .engine()
+            .object_meta()
+            .list_recompress_candidates(limit.max(1) as i64)
+            .await?;
+        for (bucket, key, _) in rows {
+            if report.recovered >= report.corrupted {
+                break;
+            }
+            if replication_recover::heal_object_from_peers(
+                &client,
+                &self.peers,
+                &self.cluster.node_id,
+                token,
+                self.inner.engine(),
+                &bucket,
+                &key,
+            )
+            .await?
+            {
+                report.recovered += 1;
+                report.corrupted = report.corrupted.saturating_sub(1);
+            }
+        }
+        Ok(report)
     }
 
     pub fn engine(&self) -> &StorageEngine {
@@ -135,9 +258,7 @@ impl ReplicatedBackend {
         let meta = self
             .put_object_local(bucket, key, content_type, custom_meta, body)
             .await?;
-        let class = self.storage_class_for_write(write_ctx);
-        let group = self.replication_group(write_ctx);
-        self.log.enqueue_put(&meta, &class, &group).await?;
+        self.maybe_enqueue_put(&meta, write_ctx).await?;
         Ok(meta)
     }
 
@@ -184,9 +305,7 @@ impl ReplicatedBackend {
                 if_none_match,
             )
             .await?;
-        let class = self.storage_class_for_write(write_ctx);
-        let group = self.replication_group(write_ctx);
-        self.log.enqueue_put(&meta, &class, &group).await?;
+        self.maybe_enqueue_put(&meta, write_ctx).await?;
         Ok(meta)
     }
 
@@ -217,6 +336,29 @@ impl ReplicatedBackend {
                     .as_deref()
                     .unwrap_or_default();
                 let client = reqwest::Client::new();
+                if self.cluster.replication_heal_on_read
+                    && replication_recover::heal_object_from_peers(
+                        &client,
+                        &self.peers,
+                        &self.cluster.node_id,
+                        token,
+                        self.inner.engine(),
+                        bucket,
+                        key,
+                    )
+                    .await?
+                {
+                    return self
+                        .inner
+                        .get_object(
+                            bucket,
+                            key,
+                            range_header,
+                            if_none_match,
+                            if_modified_since,
+                        )
+                        .await;
+                }
                 read_repair::fetch_from_peers(
                     &client,
                     &self.peers,
@@ -260,10 +402,8 @@ impl ReplicatedBackend {
             .active_storage_class(bucket, key)
             .await?
             .unwrap_or_else(|| "default".into());
-        let group = self.replication_group(write_ctx);
         self.inner.delete_object(bucket, key, if_match).await?;
-        self.log
-            .enqueue_delete(bucket, key, &storage_class, &group)
+        self.maybe_enqueue_delete(bucket, key, &storage_class, write_ctx)
             .await?;
         Ok(())
     }
@@ -277,15 +417,13 @@ impl ReplicatedBackend {
         write_ctx: Option<&WriteContext>,
     ) -> Result<DeletePrefixOutcome, StorageError> {
         self.ensure_writable()?;
-        let group = self.replication_group(write_ctx);
         let outcome = self
             .inner
             .delete_objects_by_prefix(bucket, prefix, limit, start_after)
             .await?;
         for obj in &outcome.deleted_objects {
             let storage_class = obj.storage_class.as_deref().unwrap_or("default");
-            self.log
-                .enqueue_delete(bucket, &obj.key, storage_class, &group)
+            self.maybe_enqueue_delete(bucket, &obj.key, storage_class, write_ctx)
                 .await?;
         }
         Ok(outcome)
@@ -298,12 +436,10 @@ impl ReplicatedBackend {
         write_ctx: Option<&WriteContext>,
     ) -> Result<DeletePrefixOutcome, StorageError> {
         self.ensure_writable()?;
-        let group = self.replication_group(write_ctx);
         let outcome = self.inner.delete_objects_batch(bucket, keys).await?;
         for obj in &outcome.deleted_objects {
             let storage_class = obj.storage_class.as_deref().unwrap_or("default");
-            self.log
-                .enqueue_delete(bucket, &obj.key, storage_class, &group)
+            self.maybe_enqueue_delete(bucket, &obj.key, storage_class, write_ctx)
                 .await?;
         }
         Ok(outcome)
@@ -390,9 +526,7 @@ impl ReplicatedBackend {
         let meta = self
             .complete_multipart_local(bucket, key, upload_id, custom_meta)
             .await?;
-        let class = self.storage_class_for_write(write_ctx);
-        let group = self.replication_group(write_ctx);
-        self.log.enqueue_put(&meta, &class, &group).await?;
+        self.maybe_enqueue_put(&meta, write_ctx).await?;
         Ok(meta)
     }
 

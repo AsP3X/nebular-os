@@ -9,8 +9,9 @@ use crate::storage::types::{DeletePrefixOutcome, ListCountResult, ListResult, Ob
 use super::assigned::{AssignedBackend, AssignedInner};
 use super::assignment::WriteContext;
 use crate::observability::NosMetrics;
-use super::replicated::ReplicatedBackend;
+use super::replicated::{BackfillReport, ReplicatedBackend, ReplicationStatusReport};
 use super::standalone::StandaloneBackend;
+use crate::storage::maintenance::VerifyBlobsReport;
 
 /// Human: Single entry point for route handlers — standalone, replicated, or assigned placement.
 /// Agent: StorageBackend enum; build_backend selects variant from ClusterMode.
@@ -406,6 +407,33 @@ impl StorageBackend {
             Self::Standalone(b) => b.multipart_part_size(),
             Self::Replicated(b) => b.multipart_part_size(),
             Self::Assigned(b) => b.multipart_part_size(),
+        }
+    }
+
+    pub async fn verify_blob_integrity(
+        &self,
+        limit: usize,
+    ) -> Result<VerifyBlobsReport, StorageError> {
+        match self {
+            Self::Standalone(b) => b.engine().verify_blob_integrity(limit).await,
+            Self::Replicated(b) => b.verify_blob_integrity_with_recovery(limit).await,
+            Self::Assigned(b) => b.verify_blob_integrity_with_recovery(limit).await,
+        }
+    }
+
+    pub async fn replication_status(&self) -> Result<ReplicationStatusReport, StorageError> {
+        match self {
+            Self::Standalone(_) => Ok(ReplicationStatusReport::default()),
+            Self::Replicated(b) => b.replication_status().await,
+            Self::Assigned(b) => b.replication_status().await,
+        }
+    }
+
+    pub async fn backfill_replication(&self, limit: usize) -> Result<BackfillReport, StorageError> {
+        match self {
+            Self::Standalone(_) => Ok(BackfillReport::default()),
+            Self::Replicated(b) => b.backfill_replication(limit).await,
+            Self::Assigned(b) => b.backfill_replication(limit).await,
         }
     }
 }

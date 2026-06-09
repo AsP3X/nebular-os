@@ -92,6 +92,10 @@ pub async fn create_app(
             "/_nos/maintenance/verify_blobs",
             axum::routing::post(maintenance::verify_blobs),
         )
+        .route(
+            "/_nos/maintenance/replication_status",
+            get(maintenance::replication_status),
+        )
         .merge(multipart_routes)
         .route("/{bucket}/_batch_delete", axum::routing::post(batch::batch_delete))
         .route(
@@ -140,6 +144,10 @@ pub async fn create_app(
                     .put(crate::cluster::config_api::put_cluster_config),
             )
             .route("/_cluster/replicate", post(replicate::replicate))
+            .route(
+                "/_cluster/replication/backfill",
+                axum::routing::post(cluster_routes::replication_backfill),
+            )
             .route(
                 "/_cluster/assignment/resolve",
                 post(cluster_routes::assignment_resolve),

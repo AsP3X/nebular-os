@@ -2,6 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 static WORKER_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Human: Invalidate background replication loops after PUT /_cluster/config hot reload.
@@ -32,6 +34,9 @@ pub fn spawn_replication_worker(
         return;
     }
 
+    let peer_sem = Arc::new(Semaphore::new(
+        cluster.replication_peer_concurrency.max(1) as usize,
+    ));
     tokio::spawn(async move {
         let client = reqwest::Client::new();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -42,7 +47,17 @@ pub fn spawn_replication_worker(
                 break;
             }
             ticker.tick().await;
-            if let Err(e) = drain_once(&client, &log, &peers, &cluster, &token, &metrics).await {
+            if let Err(e) = drain_once(
+                &client,
+                &log,
+                &peers,
+                &cluster,
+                &token,
+                &metrics,
+                Some(peer_sem.clone()),
+            )
+            .await
+            {
                 tracing::error!(error = %e, "replication worker tick failed");
             }
         }
@@ -58,6 +73,7 @@ pub async fn drain_once(
     cluster: &ClusterConfig,
     token: &str,
     metrics: &NosMetrics,
+    peer_sem: Option<Arc<Semaphore>>,
 ) -> Result<(), StorageError> {
     let pending = log.list_pending(32).await?;
     let needed_peer_successes = cluster.replication_factor.saturating_sub(1);
@@ -77,6 +93,11 @@ pub async fn drain_once(
                 continue;
             }
             attempts += 1;
+            let _permit = if let Some(sem) = peer_sem.as_ref() {
+                Some(sem.acquire().await.map_err(internal)?)
+            } else {
+                None
+            };
             match push_event(client, log, &peer.url, token, &event).await {
                 Ok(()) => {
                     successes += 1;
@@ -105,9 +126,11 @@ pub async fn drain_once(
                 replication_group = %event.replication_group,
                 "no cluster peers match replication class and group"
             );
-            log.mark_failed(&event.event_id).await?;
+            log.mark_failed(&event.event_id, cluster.replication_max_attempts)
+                .await?;
         } else if successes == 0 {
-            log.mark_failed(&event.event_id).await?;
+            log.mark_failed(&event.event_id, cluster.replication_max_attempts)
+                .await?;
         }
     }
 

@@ -52,7 +52,12 @@ pub struct ClusterConfig {
     pub replication_factor: u32,
     pub replication_pending_events: u64,
     pub replication_read_repair: bool,
+    pub replication_heal_on_read: bool,
     pub replication_async: bool,
+    pub replication_prefixes: Vec<String>,
+    pub replication_exclude_prefixes: Vec<String>,
+    pub replication_max_attempts: u32,
+    pub replication_peer_concurrency: u32,
     pub default_storage_class: String,
     pub assignment_rules_raw: Option<String>,
     pub assignment_forward: bool,
@@ -76,7 +81,12 @@ impl ClusterConfig {
             replication_factor: 1,
             replication_pending_events: 0,
             replication_read_repair: false,
+            replication_heal_on_read: false,
             replication_async: true,
+            replication_prefixes: Vec::new(),
+            replication_exclude_prefixes: Vec::new(),
+            replication_max_attempts: 20,
+            replication_peer_concurrency: 4,
             default_storage_class: "default".into(),
             assignment_rules_raw: None,
             assignment_forward: false,
@@ -183,6 +193,48 @@ impl ClusterConfig {
             .ok()
             .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
             .unwrap_or(false);
+        let replication_heal_on_read = env::var("NOS_REPLICATION_HEAL_ON_READ")
+            .ok()
+            .map(|s| s.eq_ignore_ascii_case("true") || s == "1")
+            .unwrap_or(false);
+        let replication_prefixes = env::var("NOS_REPLICATION_PREFIXES")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let replication_exclude_prefixes = env::var("NOS_REPLICATION_EXCLUDE_PREFIXES")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let replication_max_attempts = env::var("NOS_REPLICATION_MAX_ATTEMPTS")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<u32>()
+                    .context("NOS_REPLICATION_MAX_ATTEMPTS must be a valid u32")
+            })
+            .transpose()?
+            .unwrap_or(20);
+        let replication_peer_concurrency = env::var("NOS_REPLICATION_PEER_CONCURRENCY")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<u32>()
+                    .context("NOS_REPLICATION_PEER_CONCURRENCY must be a valid u32")
+            })
+            .transpose()?
+            .unwrap_or(4);
         let replication_async = env::var("NOS_REPLICATION_ASYNC")
             .ok()
             .map(|s| !(s == "0" || s.eq_ignore_ascii_case("false")))
@@ -210,7 +262,12 @@ impl ClusterConfig {
             replication_factor,
             replication_pending_events: 0,
             replication_read_repair,
+            replication_heal_on_read,
             replication_async,
+            replication_prefixes,
+            replication_exclude_prefixes,
+            replication_max_attempts,
+            replication_peer_concurrency,
             default_storage_class,
             assignment_rules_raw,
             assignment_forward,
