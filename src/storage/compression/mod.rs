@@ -5,23 +5,24 @@ mod legacy;
 
 pub use decode::{
     decompress_blob, decompress_file_to_temp, pump_block_blob_full, pump_block_blob_range,
+    IndexedReadContext,
 };
 pub use encode::{
     clamp_zstd_level, compress_blob, compress_file_to_storage, default_block_size,
-    encode_blob_for_storage, DEFAULT_ZSTD_LEVEL,
+    encode_blob_for_storage, EncodeOptions, DEFAULT_ZSTD_LEVEL,
 };
 pub use format::{
-    detect_blob_format, is_compressed_blob, is_dedup_manifest, is_nosb_blob, is_zstd_blob,
-    parse_layout_bytes, read_blob_header_size, read_blob_layout, read_blob_logical_size,
-    BlobFormat, BlobLayout, BLOB_MAGIC, BLOB_MAGIC_V2, DEDUP_MAGIC, DEDUP_ENTRY_LEN,
-    DEDUP_HEADER_LEN, FIXED_HEADER_LEN, HEADER_LEN, HEADER_LEN_V2, NOSB_MAGIC,
-    DEFAULT_BLOCK_SIZE,
+    collect_dedup_refs, detect_blob_format, is_compressed_blob, is_dedup_manifest,
+    is_indexed_blob, is_nosb_blob, is_zstd_blob, parse_layout_bytes, read_blob_header_size,
+    read_blob_layout, read_blob_logical_size, read_indexed_dict_id, BlobFormat, BlobLayout,
+    IndexedFormat, BLOB_MAGIC, BLOB_MAGIC_V2, DEDUP_MAGIC, DEDUP_ENTRY_LEN, DEDUP_HEADER_LEN,
+    BLOCK_DEDUP_REF, FIXED_HEADER_LEN, FIXED_HEADER_LEN_V1, HEADER_LEN, HEADER_LEN_V2,
+    NOSB_MAGIC, NOSI_MAGIC, DEFAULT_BLOCK_SIZE,
 };
 pub use legacy::{
     parse_dedup_manifest, read_stored_dict_id, read_stored_zstd_level, zstd_payload_offset,
 };
 
-/// Human: Default fast upload level when tiered compression is enabled.
 pub const DEFAULT_ZSTD_LEVEL_UPLOAD: i32 = 3;
 
 #[derive(Debug, Clone, Copy)]
@@ -61,6 +62,7 @@ mod tests {
             Some("text/plain"),
             size,
             DEFAULT_MIN_COMPRESSIBLE_SIZE,
+            &[],
         )
     }
 
@@ -72,11 +74,13 @@ mod tests {
             DEFAULT_ZSTD_LEVEL,
             64 * 1024,
             text_ctx(original.len() as u64),
+            EncodeOptions::default(),
         )
         .unwrap();
-        assert!(is_nosb_blob(&blob));
+        assert!(is_indexed_blob(&blob));
+        assert_eq!(detect_blob_format(&blob), BlobFormat::Nosi);
         assert!(blob.len() < original.len());
-        let restored = decompress_blob(&blob, original.len() as u64, None).unwrap();
+        let restored = decompress_blob(&blob, original.len() as u64, None, None).unwrap();
         assert_eq!(restored, original);
     }
 
@@ -88,14 +92,14 @@ mod tests {
         blob.extend_from_slice(&(original.len() as u64).to_le_bytes());
         blob.extend_from_slice(&zstd::encode_all(&original[..], DEFAULT_ZSTD_LEVEL).unwrap());
         assert_eq!(detect_blob_format(&blob), BlobFormat::Nosz);
-        let restored = decompress_blob(&blob, original.len() as u64, None).unwrap();
+        let restored = decompress_blob(&blob, original.len() as u64, None, None).unwrap();
         assert_eq!(restored, original);
     }
 
     #[test]
     fn raw_blob_passes_through_decoder() {
         let raw = b"legacy uncompressed payload";
-        let restored = decompress_blob(raw, raw.len() as u64, None).unwrap();
+        let restored = decompress_blob(raw, raw.len() as u64, None, None).unwrap();
         assert_eq!(restored, raw);
         assert!(!is_compressed_blob(raw));
     }
@@ -108,6 +112,7 @@ mod tests {
             DEFAULT_ZSTD_LEVEL,
             DEFAULT_BLOCK_SIZE,
             text_ctx(payload.len() as u64),
+            EncodeOptions::default(),
         )
         .unwrap();
         assert!(!is_compressed_blob(&stored));
@@ -122,9 +127,16 @@ mod tests {
             Some("audio/mpeg"),
             payload.len() as u64,
             DEFAULT_MIN_COMPRESSIBLE_SIZE,
+            &[],
         );
-        let stored = encode_blob_for_storage(&payload, DEFAULT_ZSTD_LEVEL, DEFAULT_BLOCK_SIZE, ctx)
-            .unwrap();
+        let stored = encode_blob_for_storage(
+            &payload,
+            DEFAULT_ZSTD_LEVEL,
+            DEFAULT_BLOCK_SIZE,
+            ctx,
+            EncodeOptions::default(),
+        )
+        .unwrap();
         assert!(!is_compressed_blob(&stored));
         assert_eq!(stored, payload);
     }
@@ -137,6 +149,7 @@ mod tests {
             3,
             64 * 1024,
             text_ctx(payload.len() as u64),
+            EncodeOptions::default(),
         )
         .unwrap();
         let layout = parse_layout_bytes(&blob).unwrap();

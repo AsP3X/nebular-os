@@ -59,7 +59,8 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_DEDUP_BLOCK_SIZE` | Dedup chunk size in bytes (default `262144`) |
 | `NOS_DEDUP_MIN_SIZE` | Minimum logical object size to use dedup (default `1048576`) |
 | `NOS_COMPRESS_MIN_SIZE` | Minimum object size in bytes before attempting NOSB compression (default `4096`) |
-| `NOS_COMPRESS_BLOCK_SIZE` | Uncompressed block size for NOSB blob layout (default `1048576`; min `4096`) |
+| `NOS_COMPRESS_BLOCK_SIZE` | Uncompressed block size for NOSI/NOSB blob layout (default `1048576`; min `4096`) |
+| `NOS_COMPRESS_EXCLUDE_EXTENSIONS` | Comma-separated extra file extensions to skip compression (e.g. `sqlite,bak`) |
 | `NOS_S3_COMPAT` | Enable S3-style XML list/errors and `x-amz-copy-source` (default `false`) |
 | `NOS_BUCKET_POLICY` | JSON map of `sub` → allowed bucket names; empty = no extra restriction |
 | `NOS_S3_ACCESS_KEY` / `NOS_S3_SECRET_KEY` | Optional access-key auth via `Authorization: NOS <key>:<sig>` |

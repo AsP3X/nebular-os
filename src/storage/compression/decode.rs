@@ -1,41 +1,91 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use bytes::Bytes;
+use xxhash_rust::xxh3::xxh3_64;
 
+use super::super::blocks::BlockStore;
 use super::super::error::{internal, StorageError};
 use super::format::{
-    parse_layout_bytes, read_blob_layout, BLOCK_COMPRESSED, BLOCK_HEADER_LEN,
-    BLOCK_STORED,
+    parse_block_header_at, parse_layout_bytes, read_blob_layout, BlobLayout, BLOCK_COMPRESSED,
+    BLOCK_DEDUP_REF, BLOCK_STORED,
 };
 
-// Human: Decode a block payload from a byte slice at the given file offset.
-// Agent: READS 8-byte header at offset; DECODES zstd or copies stored bytes; VERIFY len.
-fn read_block_payload_bytes(
+fn decode_compressed_payload(payload: &[u8], dict: Option<&[u8]>) -> Result<Vec<u8>, StorageError> {
+    if let Some(d) = dict.filter(|d| !d.is_empty()) {
+        let mut dec = zstd::bulk::Decompressor::with_dictionary(d).map_err(internal)?;
+        let cap = payload.len().saturating_mul(4).max(4096);
+        dec.decompress(payload, cap).map_err(internal)
+    } else {
+        zstd::decode_all(payload).map_err(internal)
+    }
+}
+
+fn verify_checksum(decoded: &[u8], expected: Option<u64>) -> Result<(), StorageError> {
+    if let Some(expected) = expected {
+        let actual = xxh3_64(decoded);
+        if actual != expected {
+            return Err(internal(anyhow::anyhow!("block checksum mismatch")));
+        }
+    }
+    Ok(())
+}
+
+fn load_dedup_block(
+    data_dir: &str,
+    hash: u64,
+    expected_len: u64,
+    expected_checksum: Option<u64>,
+) -> Result<Vec<u8>, StorageError> {
+    let store = BlockStore::new(data_dir);
+    let path = store.block_path(hash);
+    let data = std::fs::read(&path).map_err(|e| {
+        internal(anyhow::anyhow!("missing dedup block {hash:016x}: {e}"))
+    })?;
+    if data.len() as u64 != expected_len {
+        return Err(internal(anyhow::anyhow!(
+            "dedup block size mismatch for {hash:016x}"
+        )));
+    }
+    verify_checksum(&data, expected_checksum)?;
+    Ok(data)
+}
+
+fn decode_block_payload(
+    layout: &BlobLayout,
     blob: &[u8],
     file_offset: u64,
     expected_len: u64,
+    dict: Option<&[u8]>,
+    data_dir: Option<&str>,
 ) -> Result<Vec<u8>, StorageError> {
-    let start = file_offset as usize;
-    if blob.len() < start + BLOCK_HEADER_LEN {
-        return Err(internal(anyhow::anyhow!("block header truncated")));
-    }
-    let header = &blob[start..start + BLOCK_HEADER_LEN];
-    let block_type = header[0];
-    let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-    let payload_start = start + BLOCK_HEADER_LEN;
+    let parsed = parse_block_header_at(blob, file_offset as usize, layout)?;
+    let payload_start = file_offset as usize + parsed.header_len;
     let payload_end = payload_start
-        .checked_add(payload_len)
+        .checked_add(parsed.payload_len as usize)
         .ok_or_else(|| internal(anyhow::anyhow!("block payload overflow")))?;
     if blob.len() < payload_end {
         return Err(internal(anyhow::anyhow!("block payload truncated")));
     }
     let payload = &blob[payload_start..payload_end];
 
-    let decoded = match block_type {
-        BLOCK_COMPRESSED => zstd::decode_all(payload).map_err(internal)?,
+    let decoded = match parsed.block_type {
+        BLOCK_COMPRESSED => decode_compressed_payload(payload, dict)?,
         BLOCK_STORED => payload.to_vec(),
+        BLOCK_DEDUP_REF => {
+            if payload.len() != 12 {
+                return Err(internal(anyhow::anyhow!("invalid dedup ref")));
+            }
+            let hash = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+            let size = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            if size as u64 != expected_len {
+                return Err(internal(anyhow::anyhow!("dedup ref size mismatch")));
+            }
+            let dir = data_dir.ok_or_else(|| {
+                internal(anyhow::anyhow!("dedup block read requires data_dir"))
+            })?;
+            load_dedup_block(dir, hash, expected_len, parsed.logical_checksum)?
+        }
         other => {
             return Err(internal(anyhow::anyhow!("unknown block type: {other}")));
         }
@@ -47,43 +97,27 @@ fn read_block_payload_bytes(
             decoded.len()
         )));
     }
+    verify_checksum(&decoded, parsed.logical_checksum)?;
     Ok(decoded)
 }
 
-// Human: Read and decode a single block payload from an open blob file.
-// Agent: SEEKS file_offset; READS header+payload; DELEGATES to byte decoder.
-fn read_block_payload(
-    file: &mut File,
+fn read_block_payload_bytes(
+    blob: &[u8],
+    layout: &BlobLayout,
     file_offset: u64,
     expected_len: u64,
+    dict: Option<&[u8]>,
+    data_dir: Option<&str>,
 ) -> Result<Vec<u8>, StorageError> {
-    file.seek(SeekFrom::Start(file_offset))
-        .map_err(|e| internal(anyhow::anyhow!(e)))?;
-    let mut header = [0u8; BLOCK_HEADER_LEN];
-    file.read_exact(&mut header)
-        .map_err(|e| internal(anyhow::anyhow!(e)))?;
-    let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-    let mut payload = vec![0u8; payload_len];
-    file.read_exact(&mut payload)
-        .map_err(|e| internal(anyhow::anyhow!(e)))?;
-    let block_type = header[0];
-    let decoded = match block_type {
-        BLOCK_COMPRESSED => zstd::decode_all(payload.as_slice()).map_err(internal)?,
-        BLOCK_STORED => payload,
-        other => {
-            return Err(internal(anyhow::anyhow!("unknown block type: {other}")));
-        }
-    };
-    if decoded.len() as u64 != expected_len {
-        return Err(internal(anyhow::anyhow!(
-            "block size mismatch: got {} expected {expected_len}",
-            decoded.len()
-        )));
-    }
-    Ok(decoded)
+    decode_block_payload(layout, blob, file_offset, expected_len, dict, data_dir)
 }
 
-fn decompress_nosb_blob(blob: &[u8], expected_size: u64) -> Result<Vec<u8>, StorageError> {
+fn decompress_indexed_blob(
+    blob: &[u8],
+    expected_size: u64,
+    dict: Option<&[u8]>,
+    data_dir: Option<&str>,
+) -> Result<Vec<u8>, StorageError> {
     let layout = parse_layout_bytes(blob)?;
     if layout.logical_size != expected_size {
         return Err(internal(anyhow::anyhow!(
@@ -96,38 +130,38 @@ fn decompress_nosb_blob(blob: &[u8], expected_size: u64) -> Result<Vec<u8>, Stor
     for (idx, _entry) in layout.index.iter().enumerate() {
         let block_len = layout.logical_len(idx);
         let offset = layout.file_offset_for_block(idx);
-        let block = read_block_payload_bytes(blob, offset, block_len)?;
+        let block = read_block_payload_bytes(blob, &layout, offset, block_len, dict, data_dir)?;
         out.extend_from_slice(&block);
     }
     Ok(out)
 }
 
-// Human: Turn on-disk bytes back into the original object payload across all supported formats.
-// Agent: ROUTES NOSB block decode vs legacy NOSZ/NOS2 zstd; raw pass-through; NOSD errors.
 pub fn decompress_blob(
     blob: &[u8],
     expected_size: u64,
     dict: Option<&[u8]>,
+    data_dir: Option<&str>,
 ) -> Result<Vec<u8>, StorageError> {
     match super::format::detect_blob_format(blob) {
         super::format::BlobFormat::Raw => Ok(blob.to_vec()),
         super::format::BlobFormat::Nosd => Err(internal(anyhow::anyhow!(
             "decompress_blob called on dedup manifest"
         ))),
-        super::format::BlobFormat::Nosb => decompress_nosb_blob(blob, expected_size),
+        super::format::BlobFormat::Nosb | super::format::BlobFormat::Nosi => {
+            decompress_indexed_blob(blob, expected_size, dict, data_dir)
+        }
         super::format::BlobFormat::Nosz | super::format::BlobFormat::Nos2 => {
             super::legacy::decompress_zstd_blob(blob, expected_size, dict)
         }
     }
 }
 
-// Human: Materialize logical bytes from a blob file to a spill path (fallback for legacy zstd range reads).
-// Agent: READS layout; DECODES all blocks sequentially; WRITES spill file; VERIFY len.
 pub fn decompress_file_to_temp(
     blob_path: &Path,
     logical_size: u64,
     spill_path: &Path,
     dict: Option<&[u8]>,
+    data_dir: Option<&str>,
 ) -> Result<(), StorageError> {
     let data = std::fs::read(blob_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
     let format = super::format::detect_blob_format(&data);
@@ -140,28 +174,24 @@ pub fn decompress_file_to_temp(
             "decompress_file_to_temp called on dedup manifest"
         )));
     }
-    let restored = decompress_blob(&data, logical_size, dict)?;
+    let restored = decompress_blob(&data, logical_size, dict, data_dir)?;
     std::fs::write(spill_path, &restored).map_err(|e| internal(anyhow::anyhow!(e)))?;
     Ok(())
 }
 
-// Human: Stream the full logical object by decoding blocks sequentially into a channel.
-// Agent: SPAWN_BLOCKING friendly; READS each block; SENDS Bytes chunks to tx until EOF.
+pub struct IndexedReadContext {
+    pub dict: Option<Vec<u8>>,
+    pub data_dir: String,
+}
+
 pub fn pump_block_blob_full(
     blob_path: std::path::PathBuf,
     logical_size: u64,
+    ctx: IndexedReadContext,
     tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
-    let mut file = match File::open(&blob_path) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(e));
-            return;
-        }
-    };
-
     let layout = match read_blob_layout(
-        file.try_clone()
+        File::open(&blob_path)
             .unwrap_or_else(|_| std::fs::File::open(&blob_path).expect("reopen blob")),
     ) {
         Ok(l) => l,
@@ -176,10 +206,29 @@ pub fn pump_block_blob_full(
         return;
     }
 
+    let blob = match std::fs::read(&blob_path) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = tx.blocking_send(Err(e));
+            return;
+        }
+    };
+
     for (idx, _entry) in layout.index.iter().enumerate() {
         let block_len = layout.logical_len(idx);
         let offset = layout.file_offset_for_block(idx);
-        let block = match read_block_payload(&mut file, offset, block_len) {
+        let block = match read_block_payload_bytes(
+            &blob,
+            &layout,
+            offset,
+            block_len,
+            ctx.dict.as_deref(),
+            if ctx.data_dir.is_empty() {
+                None
+            } else {
+                Some(ctx.data_dir.as_str())
+            },
+        ) {
             Ok(b) => b,
             Err(e) => {
                 let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
@@ -192,27 +241,23 @@ pub fn pump_block_blob_full(
     }
 }
 
-// Human: Stream only the bytes in [range_start, range_start+length) without full-object decode.
-// Agent: FINDS start block via layout.block_for_offset; DECODES affected blocks; SKIPS/slices inside block.
 pub fn pump_block_blob_range(
     blob_path: std::path::PathBuf,
     logical_size: u64,
     range_start: u64,
     length: u64,
+    ctx: IndexedReadContext,
     tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
 ) {
-    let mut file = match File::open(&blob_path) {
-        Ok(f) => f,
+    let blob = match std::fs::read(&blob_path) {
+        Ok(b) => b,
         Err(e) => {
             let _ = tx.blocking_send(Err(e));
             return;
         }
     };
 
-    let layout = match read_blob_layout(
-        file.try_clone()
-            .unwrap_or_else(|_| std::fs::File::open(&blob_path).expect("reopen blob")),
-    ) {
+    let layout = match parse_layout_bytes(&blob) {
         Ok(l) => l,
         Err(e) => {
             let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
@@ -233,7 +278,18 @@ pub fn pump_block_blob_range(
         let block_start = layout.logical_start(block_idx);
         let block_len = layout.logical_len(block_idx);
         let offset = layout.file_offset_for_block(block_idx);
-        let block = match read_block_payload(&mut file, offset, block_len) {
+        let block = match read_block_payload_bytes(
+            &blob,
+            &layout,
+            offset,
+            block_len,
+            ctx.dict.as_deref(),
+            if ctx.data_dir.is_empty() {
+                None
+            } else {
+                Some(ctx.data_dir.as_str())
+            },
+        ) {
             Ok(b) => b,
             Err(e) => {
                 let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
@@ -268,7 +324,7 @@ mod tests {
 
     use super::*;
     use crate::storage::compressibility::DEFAULT_MIN_COMPRESSIBLE_SIZE;
-    use crate::storage::compression::encode::compress_blob;
+    use crate::storage::compression::encode::{compress_blob, EncodeOptions};
     use crate::storage::compressibility::CompressionContext;
 
     fn text_ctx(size: u64) -> CompressionContext<'static> {
@@ -277,6 +333,7 @@ mod tests {
             Some("text/plain"),
             size,
             DEFAULT_MIN_COMPRESSIBLE_SIZE,
+            &[],
         )
     }
 
@@ -288,16 +345,27 @@ mod tests {
             3,
             4096,
             text_ctx(payload.len() as u64),
+            EncodeOptions::default(),
         )
         .unwrap();
-        assert!(super::super::format::is_nosb_blob(&blob));
+        assert!(super::super::format::is_indexed_blob(&blob));
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&blob).unwrap();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         let path = tmp.path().to_path_buf();
         let size = payload.len() as u64;
-        pump_block_blob_range(path, size, 10_000, 50, tx);
+        pump_block_blob_range(
+            path,
+            size,
+            10_000,
+            50,
+            IndexedReadContext {
+                dict: None,
+                data_dir: String::new(),
+            },
+            tx,
+        );
 
         let mut collected = Vec::new();
         while let Some(chunk) = rx.blocking_recv() {
@@ -305,5 +373,22 @@ mod tests {
         }
         assert_eq!(collected.len(), 50);
         assert_eq!(&collected[..], &payload[10_000..10_050]);
+    }
+
+    #[test]
+    fn checksum_mismatch_fails_decode() {
+        let payload = b"checksum test payload".repeat(200);
+        let mut blob = compress_blob(
+            &payload,
+            3,
+            4096,
+            text_ctx(payload.len() as u64),
+            EncodeOptions::default(),
+        )
+        .unwrap();
+        if let Some(byte) = blob.last_mut() {
+            *byte ^= 0xFF;
+        }
+        assert!(decompress_blob(&blob, payload.len() as u64, None, None).is_err());
     }
 }

@@ -8,8 +8,9 @@ use super::blocks::BlockStore;
 use super::compressibility::CompressionContext;
 use super::compression::{
     compress_file_to_storage, detect_blob_format, is_dedup_manifest, is_compressed_blob,
-    read_stored_dict_id, read_stored_zstd_level, BlobFormat, BLOB_MAGIC, BLOB_MAGIC_V2,
-    DEDUP_MAGIC, HEADER_LEN, HEADER_LEN_V2,
+    read_indexed_dict_id, read_stored_dict_id, read_stored_zstd_level, BlobFormat,
+    EncodeOptions, BLOB_MAGIC, BLOB_MAGIC_V2, DEDUP_MAGIC, HEADER_LEN, HEADER_LEN_V2,
+    NOSI_MAGIC, NOSB_MAGIC,
 };
 use super::error::{internal, map_io_error, StorageError};
 
@@ -22,6 +23,7 @@ pub struct BlobFinalizeOptions {
     pub dedup_min_size: u64,
     pub compress_min_size: usize,
     pub compress_block_size: usize,
+    pub extra_excluded_extensions: Arc<Vec<String>>,
     pub object_key: Option<String>,
     pub content_type: Option<String>,
     pub data_dir: String,
@@ -29,7 +31,7 @@ pub struct BlobFinalizeOptions {
     pub existing_blob: Option<PathBuf>,
 }
 
-/// Human: After temp upload, block-compress-or-store (or dedup) to final blob path without loading the whole object into RAM.
+/// Human: After temp upload, NOSI block-compress-or-store (with optional dedup refs) to final blob path.
 pub async fn finalize_temp_to_blob(
     tmp_path: &Path,
     final_path: &Path,
@@ -56,35 +58,45 @@ pub async fn finalize_temp_to_blob(
     let fin = final_path.to_path_buf();
     let data_dir = opts.data_dir.clone();
     let pool = opts.system_pool.clone();
-
-    if use_dedup {
-        let block_size = opts.dedup_block_size;
-        let entries = tokio::task::spawn_blocking(move || {
-            let store = BlockStore::new(&data_dir);
-            store.write_dedup_from_file(&tmp, &fin, logical_size, block_size)
-        })
-        .await
-        .map_err(internal)??;
-        BlockStore::inc_refs(&pool, &entries).await?;
-        return Ok(());
-    }
-
     let level = opts.level;
-    let block_size = opts.compress_block_size;
-    let min_size = opts.compress_min_size;
+    let dict_id = opts.dict_id;
+    let dict = opts.dict.clone();
+    let block_size = if use_dedup {
+        opts.dedup_block_size
+    } else {
+        opts.compress_block_size
+    };
+    let min_size = if use_dedup {
+        opts.dedup_min_size as usize
+    } else {
+        opts.compress_min_size
+    };
     let object_key = opts.object_key.clone();
     let content_type = opts.content_type.clone();
-    tokio::task::spawn_blocking(move || {
+    let extra_ext = opts.extra_excluded_extensions.clone();
+
+    let entries = tokio::task::spawn_blocking(move || {
         let ctx = CompressionContext::new(
             object_key.as_deref(),
             content_type.as_deref(),
             logical_size,
             min_size,
+            &extra_ext,
         );
-        compress_file_to_storage(&tmp, &fin, logical_size, level, block_size, ctx)
+        let store = BlockStore::new(&data_dir);
+        let encode_opts = EncodeOptions {
+            dict_id,
+            dict: dict.as_deref().map(|v| v.as_slice()),
+            dedup_store: if use_dedup { Some(&store) } else { None },
+        };
+        compress_file_to_storage(&tmp, &fin, logical_size, level, block_size, ctx, encode_opts)
     })
     .await
     .map_err(internal)??;
+
+    if !entries.is_empty() {
+        BlockStore::inc_refs(&pool, &entries).await?;
+    }
     Ok(())
 }
 
@@ -100,10 +112,10 @@ impl ReadContext {
 }
 
 pub fn blob_needs_dict_for_read(header: &[u8]) -> Option<u16> {
-    if detect_blob_format(header) == BlobFormat::Nos2 {
-        read_stored_dict_id(header)
-    } else {
-        None
+    match detect_blob_format(header) {
+        BlobFormat::Nos2 => read_stored_dict_id(header),
+        BlobFormat::Nosi => read_indexed_dict_id(header),
+        _ => None,
     }
 }
 
@@ -124,7 +136,8 @@ pub fn blob_format_from_header(header: &[u8]) -> BlobFormat {
 }
 
 pub fn magic_matches_compressed(header: &[u8]) -> bool {
-    header.starts_with(super::compression::NOSB_MAGIC)
+    header.starts_with(NOSI_MAGIC)
+        || header.starts_with(NOSB_MAGIC)
         || header.starts_with(BLOB_MAGIC)
         || header.starts_with(BLOB_MAGIC_V2)
         || header.starts_with(DEDUP_MAGIC)

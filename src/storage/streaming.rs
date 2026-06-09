@@ -11,7 +11,7 @@ use tokio_util::io::ReaderStream;
 
 use super::compression::{
     decompress_file_to_temp, pump_block_blob_full, pump_block_blob_range, read_blob_header_size,
-    BlobFormat, FIXED_HEADER_LEN, HEADER_LEN, HEADER_LEN_V2,
+    BlobFormat, IndexedReadContext, FIXED_HEADER_LEN_V1, HEADER_LEN, HEADER_LEN_V2,
 };
 use super::blocks::BlockStore;
 use super::blob_finalize::blob_format_from_header;
@@ -144,7 +144,7 @@ pub async fn open_object_body_stream(
     content_length: u64,
     ctx: &super::blob_finalize::ReadContext,
 ) -> Result<GuardedObjectBodyStream, StorageError> {
-    let mut peek = [0u8; FIXED_HEADER_LEN];
+    let mut peek = [0u8; FIXED_HEADER_LEN_V1];
     let mut file = File::open(blob_path).await.map_err(map_io_error)?;
     let read = file.read(&mut peek).await.map_err(map_io_error)?;
     let format = blob_format_from_header(&peek[..read]);
@@ -169,14 +169,20 @@ pub async fn open_object_body_stream(
         });
     }
 
-    if format == BlobFormat::Nosb {
+    if matches!(format, BlobFormat::Nosb | BlobFormat::Nosi) {
         let path = blob_path.to_path_buf();
+        let read_ctx = IndexedReadContext {
+            dict: ctx.dict.as_ref().map(|d| d.to_vec()),
+            data_dir: ctx.data_dir.clone(),
+        };
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
         if range_start == 0 && content_length == logical_size {
-            tokio::task::spawn_blocking(move || pump_block_blob_full(path, logical_size, tx));
+            tokio::task::spawn_blocking(move || {
+                pump_block_blob_full(path, logical_size, read_ctx, tx)
+            });
         } else {
             tokio::task::spawn_blocking(move || {
-                pump_block_blob_range(path, logical_size, range_start, content_length, tx)
+                pump_block_blob_range(path, logical_size, range_start, content_length, read_ctx, tx)
             });
         }
         return Ok(GuardedObjectBodyStream {
@@ -203,12 +209,14 @@ pub async fn open_object_body_stream(
     let blob_path_owned = blob_path.to_path_buf();
     let spill_path = spill.clone();
     let dict_owned = ctx.dict.clone();
+    let data_dir = ctx.data_dir.clone();
     tokio::task::spawn_blocking(move || {
         decompress_file_to_temp(
             &blob_path_owned,
             logical_size,
             Path::new(&spill_path),
             dict_owned.as_deref().map(|v| v.as_slice()),
+            Some(data_dir.as_str()),
         )
     })
     .await

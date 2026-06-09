@@ -89,6 +89,7 @@ fn test_config_with_cap(
         dedup_min_size: 1024 * 1024,
         compress_min_size: 4096,
         compress_block_size: 64 * 1024,
+        compress_exclude_extensions: vec![],
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -724,7 +725,7 @@ async fn test_presigned_url_access() {
 #[tokio::test]
 async fn test_storage_compression_transparent() {
     use nebular_os::storage::blob_path;
-    use nebular_os::storage::compression::{is_nosb_blob, NOSB_MAGIC};
+    use nebular_os::storage::compression::{is_indexed_blob, NOSI_MAGIC};
 
     let (app, token, tmp) = setup_app(None, false).await;
     let content = "compressible payload ".repeat(500);
@@ -746,8 +747,8 @@ async fn test_storage_compression_transparent() {
         "compressed.bin",
     ))
     .unwrap();
-    assert!(is_nosb_blob(&on_disk));
-    assert!(on_disk.starts_with(NOSB_MAGIC));
+    assert!(is_indexed_blob(&on_disk));
+    assert!(on_disk.starts_with(NOSI_MAGIC));
     assert!(on_disk.len() < content.len());
 
     let req = Request::builder()
@@ -1593,7 +1594,7 @@ async fn test_bucket_policy_denies_other_bucket() {
 async fn test_recompress_nosz_at_higher_level() {
     use nebular_os::storage::blob_path;
     use nebular_os::storage::compression::{
-        is_nosb_blob, parse_layout_bytes, BLOB_MAGIC, HEADER_LEN,
+        is_indexed_blob, parse_layout_bytes, BLOB_MAGIC, HEADER_LEN,
     };
 
     let (storage, tmp) = setup_engine(EngineOptions {
@@ -1639,7 +1640,7 @@ async fn test_recompress_nosz_at_higher_level() {
         report
     );
     let on_disk = std::fs::read(&path).unwrap();
-    assert!(is_nosb_blob(&on_disk));
+    assert!(is_indexed_blob(&on_disk));
     assert!(parse_layout_bytes(&on_disk).is_ok());
 
     let outcome = storage
@@ -1670,7 +1671,7 @@ async fn test_recompress_nosz_at_higher_level() {
 #[tokio::test]
 async fn test_dedup_large_object() {
     use nebular_os::storage::blob_path;
-    use nebular_os::storage::compression::{is_dedup_manifest, DEDUP_MAGIC};
+    use nebular_os::storage::compression::{collect_dedup_refs, is_indexed_blob, NOSI_MAGIC};
 
     let (storage, tmp) = setup_engine(EngineOptions {
         dedup_enabled: true,
@@ -1693,8 +1694,9 @@ async fn test_dedup_large_object() {
         "big.bin",
     );
     let on_disk = std::fs::read(&path).unwrap();
-    assert!(is_dedup_manifest(&on_disk));
-    assert!(on_disk.starts_with(DEDUP_MAGIC));
+    assert!(is_indexed_blob(&on_disk));
+    assert!(on_disk.starts_with(NOSI_MAGIC));
+    assert!(!collect_dedup_refs(&on_disk).unwrap().is_empty());
 
     let outcome = storage
         .get_object("music", "big.bin", None, None, None)
@@ -1729,7 +1731,7 @@ async fn test_dedup_large_object() {
 
 #[tokio::test]
 async fn test_zstd_dictionary_train_and_use() {
-    use nebular_os::storage::compression::is_nosb_blob;
+    use nebular_os::storage::compression::{is_indexed_blob, read_indexed_dict_id};
 
     let (storage, tmp) = setup_engine(EngineOptions {
         zstd_dict_enabled: true,
@@ -1769,7 +1771,8 @@ async fn test_zstd_dictionary_train_and_use() {
         "new.log",
     );
     let on_disk = std::fs::read(&path).unwrap();
-    assert!(is_nosb_blob(&on_disk));
+    assert!(is_indexed_blob(&on_disk));
+    assert_eq!(read_indexed_dict_id(&on_disk), Some(0));
     assert!(storage.dict_store().exists_on_disk(0));
 }
 

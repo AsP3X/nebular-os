@@ -79,6 +79,7 @@ pub struct NosConfig {
     pub dedup_min_size: u64,
     pub compress_min_size: usize,
     pub compress_block_size: usize,
+    pub compress_exclude_extensions: Vec<String>,
     pub s3_compat: bool,
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
@@ -128,6 +129,7 @@ impl fmt::Debug for NosConfig {
             .field("dedup_enabled", &self.dedup_enabled)
             .field("compress_min_size", &self.compress_min_size)
             .field("compress_block_size", &self.compress_block_size)
+            .field("compress_exclude_extensions", &self.compress_exclude_extensions)
             .field("s3_compat", &self.s3_compat)
             .field(
                 "bucket_policy",
@@ -357,6 +359,10 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_COMPRESS_BLOCK_SIZE must be a valid usize"))
                 .transpose()?
                 .unwrap_or(crate::storage::compression::DEFAULT_BLOCK_SIZE),
+            compress_exclude_extensions: env::var("NOS_COMPRESS_EXCLUDE_EXTENSIONS")
+                .ok()
+                .map(|s| crate::storage::compressibility::parse_exclude_extensions(&s))
+                .unwrap_or_default(),
             s3_compat: env::var("NOS_S3_COMPAT")
                 .ok()
                 .map(|s| parse_bool(&s))

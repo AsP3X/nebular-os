@@ -102,6 +102,7 @@ pub struct EngineOptions {
     pub bulk_delete_batch_limit: u64,
     pub compress_min_size: usize,
     pub compress_block_size: usize,
+    pub compress_exclude_extensions: Vec<String>,
 }
 
 impl Default for EngineOptions {
@@ -131,6 +132,7 @@ impl Default for EngineOptions {
             bulk_delete_batch_limit: DEFAULT_BULK_DELETE_BATCH_LIMIT,
             compress_min_size: DEFAULT_MIN_COMPRESSIBLE_SIZE,
             compress_block_size: DEFAULT_BLOCK_SIZE,
+            compress_exclude_extensions: Vec::new(),
         }
     }
 }
@@ -165,6 +167,7 @@ pub struct StorageEngine {
     bulk_delete_batch_limit: u64,
     compress_min_size: usize,
     compress_block_size: usize,
+    compress_exclude_extensions: Arc<Vec<String>>,
 }
 
 pub(crate) struct TempFileGuard {
@@ -275,6 +278,7 @@ impl StorageEngine {
             bulk_delete_batch_limit: opts.bulk_delete_batch_limit.clamp(1, 10_000),
             compress_min_size: opts.compress_min_size.max(1),
             compress_block_size: opts.compress_block_size.max(4096),
+            compress_exclude_extensions: Arc::new(opts.compress_exclude_extensions),
         })
     }
 
@@ -415,6 +419,10 @@ impl StorageEngine {
         self.compress_block_size
     }
 
+    pub fn compress_exclude_extensions(&self) -> &[String] {
+        &self.compress_exclude_extensions
+    }
+
     pub fn dict_store(&self) -> &DictStore {
         &self.dict_store
     }
@@ -447,6 +455,7 @@ impl StorageEngine {
             dedup_min_size: self.dedup_min_size,
             compress_min_size: self.compress_min_size,
             compress_block_size: self.compress_block_size,
+            extra_excluded_extensions: self.compress_exclude_extensions.clone(),
             object_key: Some(object_key.to_string()),
             content_type: content_type.map(str::to_string),
             data_dir: self.data_dir.clone(),

@@ -2,24 +2,42 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
 
+use xxhash_rust::xxh3::xxh3_64;
 use zstd::zstd_safe::CParameter;
 
+use super::super::blocks::BlockStore;
 use super::super::compressibility::{
     prefix_looks_incompressible, should_attempt_compression, CompressionContext,
 };
 use super::super::error::{internal, StorageError};
 use super::format::{
-    write_blob_header, IndexEntry, BLOCK_COMPRESSED, BLOCK_STORED, DEFAULT_BLOCK_SIZE,
+    write_blob_header_v1, write_block_header_v1, IndexEntry, BLOCK_COMPRESSED, BLOCK_DEDUP_REF,
+    BLOCK_STORED, DEFAULT_BLOCK_SIZE, NOSI_FLAG_DEDUP,
 };
 
 /// Human: Default zstd level when env does not override (22 = smallest on disk, highest CPU).
-/// Agent: DEFAULT_ZSTD_LEVEL=22; overridden by NOS_ZSTD_LEVEL in config/engine.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 22;
 
 const LDM_SIZE_THRESHOLD: u64 = 128 * 1024;
 
-/// Human: Clamp user-provided zstd level into the range the zstd crate supports.
-/// Agent: CLAMP 1..=22; used for NOS_ZSTD_LEVEL parsing.
+/// Human: Optional zstd dictionary and dedup store for NOSI indexed writes.
+#[derive(Clone, Copy)]
+pub struct EncodeOptions<'a> {
+    pub dict_id: u16,
+    pub dict: Option<&'a [u8]>,
+    pub dedup_store: Option<&'a BlockStore>,
+}
+
+impl<'a> Default for EncodeOptions<'a> {
+    fn default() -> Self {
+        Self {
+            dict_id: 0,
+            dict: None,
+            dedup_store: None,
+        }
+    }
+}
+
 pub fn clamp_zstd_level(level: i32) -> i32 {
     level.clamp(1, 22)
 }
@@ -29,8 +47,6 @@ fn adaptive_window_log(logical_size: u64) -> u32 {
     bits.clamp(10, 27)
 }
 
-// Human: Apply per-block zstd tuning based on chunk size and configured level.
-// Agent: SETS window_log and optional LDM on bulk compressor before compress().
 fn tune_block_compressor(
     compressor: &mut zstd::bulk::Compressor<'_>,
     chunk_len: u64,
@@ -50,16 +66,21 @@ fn tune_block_compressor(
     Ok(())
 }
 
-// Human: Try zstd on one block and keep the smaller of compressed vs raw bytes.
-// Agent: RETURNS (BLOCK_COMPRESSED|BLOCK_STORED, payload bytes).
 fn compress_block(
     chunk: &[u8],
     level: i32,
+    dict: Option<&[u8]>,
 ) -> Result<(u8, Vec<u8>), StorageError> {
-    let mut compressor =
-        zstd::bulk::Compressor::new(clamp_zstd_level(level)).map_err(internal)?;
-    tune_block_compressor(&mut compressor, chunk.len() as u64, level)?;
-    let compressed = compressor.compress(chunk).map_err(internal)?;
+    let level = clamp_zstd_level(level);
+    let compressed = if let Some(d) = dict.filter(|d| !d.is_empty()) {
+        let mut compressor = zstd::bulk::Compressor::with_dictionary(level, d).map_err(internal)?;
+        tune_block_compressor(&mut compressor, chunk.len() as u64, level)?;
+        compressor.compress(chunk).map_err(internal)?
+    } else {
+        let mut compressor = zstd::bulk::Compressor::new(level).map_err(internal)?;
+        tune_block_compressor(&mut compressor, chunk.len() as u64, level)?;
+        compressor.compress(chunk).map_err(internal)?
+    };
     if compressed.len() < chunk.len() {
         Ok((BLOCK_COMPRESSED, compressed))
     } else {
@@ -67,26 +88,62 @@ fn compress_block(
     }
 }
 
-// Human: Serialize one block header plus payload into the staging buffer.
-// Agent: WRITES 8-byte block header then payload; updates staging Vec.
-fn append_block(staging: &mut Vec<u8>, block_type: u8, payload: &[u8]) -> Result<(), StorageError> {
-    super::format::write_block_header(staging, block_type, payload.len() as u32)?;
+fn store_dedup_chunk(store: &BlockStore, chunk: &[u8]) -> Result<(u8, Vec<u8>, u64), StorageError> {
+    let hash = BlockStore::hash_block(chunk);
+    let path = store.block_path(hash);
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| internal(anyhow::anyhow!(e)))?;
+        }
+        std::fs::write(&path, chunk).map_err(|e| internal(anyhow::anyhow!(e)))?;
+    }
+    let mut payload = Vec::with_capacity(12);
+    payload.extend_from_slice(&hash.to_le_bytes());
+    payload.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+    Ok((BLOCK_DEDUP_REF, payload, hash))
+}
+
+fn encode_logical_block(
+    chunk: &[u8],
+    level: i32,
+    dict: Option<&[u8]>,
+    dedup_store: Option<&BlockStore>,
+) -> Result<(u8, Vec<u8>, u64), StorageError> {
+    let checksum = xxh3_64(chunk);
+    if let Some(store) = dedup_store {
+        return store_dedup_chunk(store, chunk);
+    }
+    let (block_type, payload) = compress_block(chunk, level, dict)?;
+    Ok((block_type, payload, checksum))
+}
+
+fn append_block_v1(
+    staging: &mut Vec<u8>,
+    block_type: u8,
+    payload: &[u8],
+    logical_checksum: u64,
+) -> Result<(), StorageError> {
+    write_block_header_v1(staging, block_type, payload.len() as u32, logical_checksum)?;
     staging.extend_from_slice(payload);
     Ok(())
 }
 
-// Human: Split bytes into block_size chunks and build index + block staging area.
-// Agent: READS source; PER-BLOCK compress_block; BUILDS IndexEntry list and payload blob.
 fn encode_blocks_from_reader<R: Read>(
     mut source: R,
     logical_size: u64,
     block_size: usize,
     level: i32,
-) -> Result<(Vec<IndexEntry>, Vec<u8>), StorageError> {
+    opts: EncodeOptions<'_>,
+) -> Result<(Vec<IndexEntry>, Vec<u8>, u16), StorageError> {
     let mut index = Vec::new();
     let mut staging = Vec::new();
     let mut logical_end = 0u64;
     let mut chunk_buf = vec![0u8; block_size.max(1)];
+    let flags = if opts.dedup_store.is_some() {
+        NOSI_FLAG_DEDUP
+    } else {
+        0
+    };
 
     loop {
         let mut filled = 0usize;
@@ -104,9 +161,10 @@ fn encode_blocks_from_reader<R: Read>(
         }
 
         let chunk = &chunk_buf[..filled];
-        let (block_type, payload) = compress_block(chunk, level)?;
+        let (block_type, payload, checksum) =
+            encode_logical_block(chunk, level, opts.dict, opts.dedup_store)?;
         let compressed_offset = staging.len() as u64;
-        append_block(&mut staging, block_type, &payload)?;
+        append_block_v1(&mut staging, block_type, &payload, checksum)?;
         logical_end += filled as u64;
         index.push(IndexEntry {
             compressed_offset,
@@ -123,46 +181,47 @@ fn encode_blocks_from_reader<R: Read>(
             "block encoder size mismatch: encoded={logical_end} expected={logical_size}"
         )));
     }
-    Ok((index, staging))
+    Ok((index, staging, flags))
 }
 
-// Human: Build a complete NOSB blob in memory for maintenance recompression.
-// Agent: CALLS encode_blocks_from_reader; WRITES header+index+blocks; MAY return raw bytes.
 pub fn encode_blob_for_storage(
     uncompressed: &[u8],
     level: i32,
     block_size: usize,
     ctx: CompressionContext<'_>,
+    opts: EncodeOptions<'_>,
 ) -> Result<Vec<u8>, StorageError> {
     if !should_attempt_compression(ctx) {
         return Ok(uncompressed.to_vec());
     }
-    if prefix_looks_incompressible(&uncompressed[..uncompressed.len().min(16)]) {
+    if opts.dedup_store.is_none()
+        && prefix_looks_incompressible(&uncompressed[..uncompressed.len().min(16)])
+    {
         return Ok(uncompressed.to_vec());
     }
 
     let logical_size = uncompressed.len() as u64;
-    let (index, staging) =
-        encode_blocks_from_reader(uncompressed, logical_size, block_size, level)?;
-    let header_len = super::format::FIXED_HEADER_LEN + index.len() * super::format::INDEX_ENTRY_LEN;
+    let (index, staging, flags) =
+        encode_blocks_from_reader(uncompressed, logical_size, block_size, level, opts)?;
+    let header_len = super::format::FIXED_HEADER_LEN_V1 + index.len() * super::format::INDEX_ENTRY_LEN;
     let total_len = header_len + staging.len();
-    if total_len >= uncompressed.len() {
+    if opts.dedup_store.is_none() && total_len >= uncompressed.len() {
         return Ok(uncompressed.to_vec());
     }
 
     let mut out = Vec::with_capacity(total_len);
-    write_blob_header(
+    write_blob_header_v1(
         &mut out,
         logical_size,
         block_size as u32,
         &index,
+        opts.dict_id,
+        flags,
     )?;
     out.extend_from_slice(&staging);
     Ok(out)
 }
 
-// Human: Write a block-compressed blob from a temp file without buffering the whole object.
-// Agent: STREAM encode_blocks_from_reader; IF smaller than raw THEN write NOSB ELSE copy raw.
 pub fn compress_file_to_storage(
     tmp_path: &Path,
     final_path: &Path,
@@ -170,19 +229,22 @@ pub fn compress_file_to_storage(
     level: i32,
     block_size: usize,
     ctx: CompressionContext<'_>,
-) -> Result<(), StorageError> {
+    opts: EncodeOptions<'_>,
+) -> Result<Vec<(u64, u32)>, StorageError> {
     if !should_attempt_compression(ctx) {
         std::fs::copy(tmp_path, final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        return Ok(());
+        return Ok(vec![]);
     }
 
-    let mut prefix = [0u8; 16];
-    {
-        let mut raw = File::open(tmp_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        let read = raw.read(&mut prefix).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        if prefix_looks_incompressible(&prefix[..read]) {
-            std::fs::copy(tmp_path, final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-            return Ok(());
+    if opts.dedup_store.is_none() {
+        let mut prefix = [0u8; 16];
+        {
+            let mut raw = File::open(tmp_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
+            let read = raw.read(&mut prefix).map_err(|e| internal(anyhow::anyhow!(e)))?;
+            if prefix_looks_incompressible(&prefix[..read]) {
+                std::fs::copy(tmp_path, final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
+                return Ok(vec![]);
+            }
         }
     }
 
@@ -193,41 +255,44 @@ pub fn compress_file_to_storage(
     let block_size = block_size.max(4096);
 
     let source = File::open(tmp_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-    let (index, staging) =
-        encode_blocks_from_reader(source, logical_size, block_size, level)?;
-    let header_len = super::format::FIXED_HEADER_LEN + index.len() * super::format::INDEX_ENTRY_LEN;
+    let (index, staging, flags) =
+        encode_blocks_from_reader(source, logical_size, block_size, level, opts)?;
+    let header_len = super::format::FIXED_HEADER_LEN_V1 + index.len() * super::format::INDEX_ENTRY_LEN;
     let total_len = header_len + staging.len();
 
-    if total_len as u64 >= raw_len {
+    if opts.dedup_store.is_none() && total_len as u64 >= raw_len {
         std::fs::copy(tmp_path, final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        return Ok(());
+        return Ok(vec![]);
     }
 
     {
         let mut out = File::create(&part_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        write_blob_header(
+        write_blob_header_v1(
             &mut out,
             logical_size,
             block_size as u32,
             &index,
+            opts.dict_id,
+            flags,
         )?;
         out.write_all(&staging)
             .map_err(|e| internal(anyhow::anyhow!(e)))?;
     }
 
     std::fs::rename(&part_path, final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-    Ok(())
+
+    let blob = std::fs::read(final_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
+    super::format::collect_dedup_refs(&blob)
 }
 
-// Human: In-memory helper used by unit tests to build a NOSB blob from bytes.
-// Agent: WRAPS encode_blob_for_storage; REQUIRES compressible ctx; RETURNS NOSB or raw.
 pub fn compress_blob(
     uncompressed: &[u8],
     level: i32,
     block_size: usize,
     ctx: CompressionContext<'_>,
+    opts: EncodeOptions<'_>,
 ) -> Result<Vec<u8>, StorageError> {
-    encode_blob_for_storage(uncompressed, level, block_size, ctx)
+    encode_blob_for_storage(uncompressed, level, block_size, ctx, opts)
 }
 
 pub fn default_block_size() -> usize {
@@ -247,13 +312,14 @@ mod tests {
             Some("text/plain"),
             size,
             DEFAULT_MIN_COMPRESSIBLE_SIZE,
+            &[],
         )
     }
 
     #[test]
     fn file_encoder_roundtrip_via_decode_path() {
         use super::super::decode::decompress_blob;
-        use super::super::format::is_compressed_blob;
+        use super::super::format::{is_indexed_blob, BlobFormat, detect_blob_format};
 
         let mut tmp = NamedTempFile::new().unwrap();
         let payload = b"block compress me ".repeat(800);
@@ -266,11 +332,13 @@ mod tests {
             DEFAULT_ZSTD_LEVEL,
             64 * 1024,
             text_ctx(payload.len() as u64),
+            EncodeOptions::default(),
         )
         .unwrap();
         let on_disk = std::fs::read(&final_path).unwrap();
-        assert!(is_compressed_blob(&on_disk));
-        let restored = decompress_blob(&on_disk, payload.len() as u64, None).unwrap();
+        assert!(is_indexed_blob(&on_disk));
+        assert_eq!(detect_blob_format(&on_disk), BlobFormat::Nosi);
+        let restored = decompress_blob(&on_disk, payload.len() as u64, None, None).unwrap();
         assert_eq!(restored, payload);
     }
 }

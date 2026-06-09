@@ -6,7 +6,9 @@ use sqlx::Pool;
 use sqlx::Sqlite;
 use xxhash_rust::xxh3::xxh3_64;
 
-use super::compression::{parse_dedup_manifest, DEDUP_ENTRY_LEN, DEDUP_HEADER_LEN, DEDUP_MAGIC};
+use super::compression::{
+    collect_dedup_refs, parse_dedup_manifest, DEDUP_ENTRY_LEN, DEDUP_HEADER_LEN, DEDUP_MAGIC,
+};
 use super::error::{internal, StorageError};
 
 /// Human: Content-addressed block files under `.blocks/` with SQLite refcounts.
@@ -31,7 +33,7 @@ impl BlockStore {
             .join(hex)
     }
 
-    fn hash_block(data: &[u8]) -> u64 {
+    pub fn hash_block(data: &[u8]) -> u64 {
         xxh3_64(data)
     }
 
@@ -124,11 +126,7 @@ impl BlockStore {
 
     pub fn manifest_entries(blob_path: &Path) -> Result<Vec<(u64, u32)>, StorageError> {
         let data = std::fs::read(blob_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        if data.len() < DEDUP_HEADER_LEN || !data.starts_with(DEDUP_MAGIC) {
-            return Ok(vec![]);
-        }
-        let logical = u64::from_le_bytes(data[4..12].try_into().unwrap());
-        parse_dedup_manifest(&data, logical)
+        collect_dedup_refs(&data)
     }
 
     pub async fn inc_refs(

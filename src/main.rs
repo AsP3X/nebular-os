@@ -50,6 +50,7 @@ async fn main() -> Result<()> {
         bulk_delete_batch_limit: cfg.bulk_delete_batch_limit,
         compress_min_size: cfg.compress_min_size,
         compress_block_size: cfg.compress_block_size,
+        compress_exclude_extensions: cfg.compress_exclude_extensions.clone(),
     };
 
     let storage = storage::engine::StorageEngine::with_full_options(

@@ -6,8 +6,8 @@ use super::blob_path_variants;
 use super::blocks::BlockStore;
 use super::compressibility::CompressionContext;
 use super::compression::{
-    decompress_blob, detect_blob_format, encode_blob_for_storage, is_nosb_blob, is_zstd_blob,
-    read_stored_dict_id, read_stored_zstd_level, BlobFormat,
+    decompress_blob, detect_blob_format, encode_blob_for_storage, is_indexed_blob, is_zstd_blob,
+    read_stored_dict_id, read_stored_zstd_level, BlobFormat, EncodeOptions,
 };
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
@@ -106,12 +106,19 @@ impl StorageEngine {
                     None,
                     size as u64,
                     self.compress_min_size(),
+                    self.compress_exclude_extensions(),
                 );
+                let encode_opts = EncodeOptions {
+                    dict_id: 0,
+                    dict: dict_bytes,
+                    dedup_store: None,
+                };
                 let encoded = encode_blob_for_storage(
                     &blob,
                     background_level,
                     self.compress_block_size(),
                     ctx,
+                    encode_opts,
                 )?;
                 if encoded.len() >= blob.len() {
                     report.skipped += 1;
@@ -126,7 +133,7 @@ impl StorageEngine {
                 continue;
             }
 
-            if is_nosb_blob(&blob) {
+            if is_indexed_blob(&blob) {
                 report.skipped += 1;
                 continue;
             }
@@ -147,7 +154,7 @@ impl StorageEngine {
                 continue;
             }
 
-            let logical = match decompress_blob(&blob, size as u64, dict_bytes) {
+            let logical = match decompress_blob(&blob, size as u64, dict_bytes, None) {
                 Ok(v) => v,
                 Err(_) => {
                     report.skipped += 1;
@@ -161,15 +168,22 @@ impl StorageEngine {
                 None,
                 size as u64,
                 self.compress_min_size(),
+                self.compress_exclude_extensions(),
             );
+            let encode_opts = EncodeOptions {
+                dict_id: 0,
+                dict: dict_bytes,
+                dedup_store: None,
+            };
             let encoded = encode_blob_for_storage(
                 &logical,
                 background_level,
                 self.compress_block_size(),
                 ctx,
+                encode_opts,
             )?;
             if upgrading_level {
-                if !is_nosb_blob(&encoded) && encoded.len() >= old_len {
+                if !is_indexed_blob(&encoded) && encoded.len() >= old_len {
                     report.skipped += 1;
                     continue;
                 }
@@ -178,7 +192,7 @@ impl StorageEngine {
                     report.skipped += 1;
                     continue;
                 }
-                if !is_nosb_blob(&encoded) {
+                if !is_indexed_blob(&encoded) {
                     report.skipped += 1;
                     continue;
                 }
@@ -251,7 +265,7 @@ impl StorageEngine {
                 }
                 blob
             } else {
-                match decompress_blob(&blob, size as u64, None) {
+                match decompress_blob(&blob, size as u64, None, None) {
                     Ok(v) => v,
                     Err(_) => continue,
                 }
