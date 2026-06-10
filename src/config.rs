@@ -4,6 +4,7 @@ use std::fmt;
 use anyhow::{Context, Result};
 
 use crate::cluster::ClusterConfig;
+use crate::webhooks::WebhookConfig;
 use crate::storage::metadata_backend::MetadataBackendKind;
 use crate::storage::metadata_mode::MetadataMode;
 
@@ -85,6 +86,11 @@ pub struct NosConfig {
     pub block_cache_entries: usize,
     pub verify_interval_secs: u64,
     pub verify_batch_size: usize,
+    pub scrub_sample_denom: u64,
+    pub scrub_mode_light: bool,
+    pub verify_on_read: bool,
+    pub read_buffer_size: usize,
+    pub webhooks: WebhookConfig,
     pub s3_compat: bool,
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
@@ -402,6 +408,29 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_VERIFY_BATCH_SIZE must be a valid usize"))
                 .transpose()?
                 .unwrap_or(100),
+            scrub_sample_denom: env::var("NOS_SCRUB_SAMPLE_DENOM")
+                .ok()
+                .map(|s| s.parse().context("NOS_SCRUB_SAMPLE_DENOM must be a valid u64"))
+                .transpose()?
+                .unwrap_or(1024),
+            scrub_mode_light: env::var("NOS_SCRUB_MODE")
+                .ok()
+                .map(|s| s.eq_ignore_ascii_case("light"))
+                .unwrap_or(false),
+            verify_on_read: env::var("NOS_VERIFY_ON_READ")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(false),
+            read_buffer_size: env::var("NOS_READ_BUFFER_SIZE")
+                .ok()
+                .map(|s| s.parse().context("NOS_READ_BUFFER_SIZE must be a valid usize"))
+                .transpose()?
+                .unwrap_or(256 * 1024),
+            webhooks: env::var("NOS_WEBHOOKS_JSON")
+                .ok()
+                .map(|s| WebhookConfig::from_json(&s))
+                .transpose()?
+                .unwrap_or_default(),
             compress_exclude_extensions: env::var("NOS_COMPRESS_EXCLUDE_EXTENSIONS")
                 .ok()
                 .map(|s| crate::storage::compressibility::parse_exclude_extensions(&s))

@@ -106,6 +106,10 @@ pub struct EngineOptions {
     pub compress_exclude_extensions: Vec<String>,
     pub block_cache_entries: usize,
     pub verify_batch_size: usize,
+    pub scrub_sample_denom: u64,
+    pub scrub_mode_light: bool,
+    pub verify_on_read: bool,
+    pub read_buffer_size: usize,
 }
 
 impl Default for EngineOptions {
@@ -138,6 +142,10 @@ impl Default for EngineOptions {
             compress_exclude_extensions: Vec::new(),
             block_cache_entries: 256,
             verify_batch_size: 100,
+            scrub_sample_denom: 1,
+            scrub_mode_light: false,
+            verify_on_read: false,
+            read_buffer_size: 256 * 1024,
         }
     }
 }
@@ -175,6 +183,11 @@ pub struct StorageEngine {
     compress_exclude_extensions: Arc<Vec<String>>,
     block_decode_cache: Option<BlockDecodeCache>,
     verify_batch_size: usize,
+    scrub_sample_denom: u64,
+    scrub_mode_light: bool,
+    verify_on_read: bool,
+    read_buffer_pool: super::buffer_pool::BufferPool,
+    read_buffer_size: usize,
 }
 
 pub(crate) struct TempFileGuard {
@@ -288,6 +301,14 @@ impl StorageEngine {
             compress_exclude_extensions: Arc::new(opts.compress_exclude_extensions),
             block_decode_cache: BlockDecodeCache::new(opts.block_cache_entries),
             verify_batch_size: opts.verify_batch_size.max(1),
+            scrub_sample_denom: opts.scrub_sample_denom.max(1),
+            scrub_mode_light: opts.scrub_mode_light,
+            verify_on_read: opts.verify_on_read,
+            read_buffer_pool: super::buffer_pool::BufferPool::new(
+                opts.read_buffer_size.max(4096),
+                32,
+            ),
+            read_buffer_size: opts.read_buffer_size.max(4096),
         })
     }
 
@@ -495,7 +516,64 @@ impl StorageEngine {
                 None
             },
             block_cache: self.block_decode_cache.clone(),
+            read_buffer_size: self.read_buffer_size,
+            verify_on_read: self.verify_on_read,
+            buffer_pool: self.read_buffer_pool.clone(),
+            expected_etag: None,
         }
+    }
+
+    pub fn scrub_sample_denom(&self) -> u64 {
+        self.scrub_sample_denom
+    }
+
+    pub fn scrub_mode_light(&self) -> bool {
+        self.scrub_mode_light
+    }
+
+    pub async fn get_maintenance_state(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT value FROM maintenance_state WHERE key = ?",
+        )
+        .bind(key)
+        .fetch_optional(&self.system_read)
+        .await
+        .map_err(internal)?;
+        Ok(row.map(|(v,)| v))
+    }
+
+    pub async fn set_maintenance_state(&self, key: &str, value: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO maintenance_state (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.system_write)
+        .await
+        .map_err(internal)?;
+        Ok(())
+    }
+
+    pub async fn scrub_with_defaults(&self, limit: usize) -> Result<super::maintenance::VerifyBlobsReport, StorageError> {
+        let cursor = self.get_maintenance_state("scrub_cursor").await?;
+        let mode = if self.scrub_mode_light {
+            super::scrub::ScrubMode::Light
+        } else {
+            super::scrub::ScrubMode::Deep
+        };
+        let report = self
+            .scrub_objects(super::scrub::ScrubOptions {
+                limit,
+                sample_denom: self.scrub_sample_denom,
+                mode,
+                start_after: cursor,
+            })
+            .await?;
+        if let Some(ref next) = report.next_start_after {
+            self.set_maintenance_state("scrub_cursor", next).await?;
+        }
+        Ok(report)
     }
 
     async fn existing_blob_path(&self, bucket: &str, key: &str) -> Result<PathBuf, StorageError> {
@@ -725,12 +803,14 @@ impl StorageEngine {
 
         // Human: Stream object bytes from disk, decompressing via spill file or channel when the blob is zstd-wrapped.
         // Agent: CALLS open_object_body_stream(path, logical_size, range_start, content_length, data_dir); no full-blob RAM buffer.
+        let mut ctx = self.read_context();
+        ctx.expected_etag = meta.etag.clone();
         let stream = open_object_body_stream(
             path.as_path(),
             total_size,
             start,
             content_length,
-            &self.read_context(),
+            &ctx,
         )
         .await?;
 

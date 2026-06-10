@@ -124,14 +124,20 @@ pub async fn put_object(
             )
             .await
         {
-            Ok(meta) => {
-                state.metrics.add_uploaded(meta.size as u64);
-                return (
-                    StatusCode::CREATED,
-                    Json(json!({ "etag": meta.etag })),
-                )
-                    .into_response();
-            }
+        Ok(meta) => {
+            state.metrics.add_uploaded(meta.size as u64);
+            state.webhooks.dispatch_put(
+                &params.bucket,
+                &params.key,
+                meta.size,
+                meta.etag.as_deref(),
+            );
+            return (
+                StatusCode::CREATED,
+                Json(json!({ "etag": meta.etag })),
+            )
+                .into_response();
+        }
             Err(e) => return map_storage_error(e).into_response(),
         }
     }
@@ -166,6 +172,12 @@ pub async fn put_object(
     {
         Ok(meta) => {
             state.metrics.add_uploaded(meta.size as u64);
+            state.webhooks.dispatch_put(
+                &params.bucket,
+                &params.key,
+                meta.size,
+                meta.etag.as_deref(),
+            );
             let mut resp = (StatusCode::CREATED, Json(json!({ "etag": meta.etag }))).into_response();
             if let Some(etag) = meta.etag
                 && let Ok(etag_header) = etag.parse() {
@@ -297,7 +309,12 @@ pub async fn delete_object(
         )
         .await
     {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            state
+                .webhooks
+                .dispatch_delete(&params.bucket, &params.key);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => {
             state.metrics.inc_errors();
             map_storage_error(e).into_response()

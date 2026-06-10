@@ -20,6 +20,7 @@ use crate::config::NosConfig;
 use crate::middleware::rate_limit::ClientBucket;
 use crate::middleware::UploadBudget;
 use crate::observability::NosMetrics;
+use crate::webhooks::WebhookDispatcher;
 use crate::cluster::StorageBackend;
 use crate::storage::engine::StorageEngine;
 
@@ -34,6 +35,7 @@ pub struct AppState {
     pub signing_secret: Option<Arc<String>>,
     pub metrics_token: Option<Arc<String>>,
     pub metrics: Arc<NosMetrics>,
+    pub webhooks: WebhookDispatcher,
     pub rate_limiters: Arc<DashMap<String, ClientBucket>>,
     pub upload_budget: Option<Arc<UploadBudget>>,
     pub max_body_size: usize,

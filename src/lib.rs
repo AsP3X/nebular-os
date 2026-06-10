@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod cluster;
 pub mod config;
+pub mod webhooks;
 pub mod s3_compat;
 pub mod middleware;
 pub mod observability;

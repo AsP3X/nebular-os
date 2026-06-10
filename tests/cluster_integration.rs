@@ -97,6 +97,11 @@ fn cluster_test_config(
         block_cache_entries: 0,
         verify_interval_secs: 0,
         verify_batch_size: 100,
+        scrub_sample_denom: 1,
+        scrub_mode_light: false,
+        verify_on_read: false,
+        read_buffer_size: 256 * 1024,
+        webhooks: nebular_os::webhooks::WebhookConfig::default(),
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -224,6 +229,7 @@ async fn cluster_idempotent_replay() {
         replication_group: "default".into(),
         content_type: Some("text/plain".into()),
         custom_meta: Some(r#"{"tag":"v1"}"#.into()),
+        wire_checksum: None,
         created_at: 1,
     };
 
@@ -1127,4 +1133,109 @@ async fn replication_status_reports_pending() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json["pending"].as_u64().unwrap_or(0) >= 1);
+}
+
+#[tokio::test]
+async fn replication_wire_checksum_mismatch_rejected() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = cluster_test_config("node-a", "node-b=http://127.0.0.1:1", "member", 2);
+    let (backend, engine, _) = engine_and_backend(&cfg, &tmp).await;
+    let log = match &backend {
+        nebular_os::cluster::StorageBackend::Replicated(r) => r.replication_log(),
+        _ => panic!("expected replicated"),
+    };
+
+    engine
+        .put_object(
+            "music",
+            "wire.bin",
+            None,
+            None,
+            std::io::Cursor::new(b"bytes"),
+        )
+        .await
+        .unwrap();
+
+    let event = ReplicationEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        origin_node: "node-b".into(),
+        op: ReplicationOp::Put,
+        bucket: "music".into(),
+        key: "wire-remote.bin".into(),
+        etag: Some("dummy".into()),
+        size: Some(5),
+        payload_path: None,
+        storage_class: "default".into(),
+        replication_group: "default".into(),
+        content_type: None,
+        custom_meta: None,
+        wire_checksum: Some("0000000000000000".into()),
+        created_at: 1,
+    };
+
+    let err = apply_replication_event_bytes(&engine, log, &event, Some(b"bytes".to_vec()))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        nebular_os::storage::error::StorageError::Internal(_)
+    ));
+}
+
+#[tokio::test]
+async fn dead_letter_replay_resets_event() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = cluster_test_config("node-a", "node-b=http://127.0.0.1:1", "member", 2);
+    let (backend, engine, _) = engine_and_backend(&cfg, &tmp).await;
+    let log = match &backend {
+        nebular_os::cluster::StorageBackend::Replicated(r) => r.replication_log(),
+        _ => panic!("expected replicated"),
+    };
+
+    engine
+        .put_object(
+            "music",
+            "dl-replay.bin",
+            None,
+            None,
+            std::io::Cursor::new(b"dl"),
+        )
+        .await
+        .unwrap();
+
+    let event = log
+        .enqueue_put(
+            &engine
+                .head_object("music", "dl-replay.bin", None, None)
+                .await
+                .unwrap()
+                .expect("meta"),
+            "default",
+            "default",
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..20 {
+        log.mark_failed(&event.event_id, 20).await.unwrap();
+    }
+
+    let app = app_with_metrics(backend, engine, cfg).await;
+    let token = make_token();
+    let replay = Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/_nos/maintenance/replication_replay?event_id={}",
+            event.event_id
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(replay).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["replayed"], true);
 }

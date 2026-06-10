@@ -152,11 +152,11 @@ impl ReplicatedBackend {
         Ok(report)
     }
 
-    pub async fn verify_blob_integrity_with_recovery(
+    pub async fn scrub_with_recovery(
         &self,
-        limit: usize,
+        opts: crate::storage::scrub::ScrubOptions,
     ) -> Result<VerifyBlobsReport, StorageError> {
-        let mut report = self.inner.engine().verify_blob_integrity(limit).await?;
+        let mut report = self.inner.engine().scrub_objects(opts).await?;
         if self.cluster.replication_factor <= 1 || report.corrupted == 0 {
             return Ok(report);
         }
@@ -166,16 +166,7 @@ impl ReplicatedBackend {
             .as_deref()
             .unwrap_or_default();
         let client = reqwest::Client::new();
-        let rows = self
-            .inner
-            .engine()
-            .object_meta()
-            .list_recompress_candidates(limit.max(1) as i64)
-            .await?;
-        for (bucket, key, _) in rows {
-            if report.recovered >= report.corrupted {
-                break;
-            }
+        for (bucket, key) in report.corrupted_keys.clone() {
             if replication_recover::heal_object_from_peers(
                 &client,
                 &self.peers,
@@ -192,6 +183,23 @@ impl ReplicatedBackend {
             }
         }
         Ok(report)
+    }
+
+    pub async fn replay_dead_letter(&self, event_id: &str) -> Result<bool, StorageError> {
+        self.log.replay_dead_letter(event_id).await
+    }
+
+    pub async fn verify_blob_integrity_with_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<VerifyBlobsReport, StorageError> {
+        self.scrub_with_recovery(crate::storage::scrub::ScrubOptions {
+            limit,
+            sample_denom: 1,
+            mode: crate::storage::scrub::ScrubMode::Deep,
+            start_after: None,
+        })
+        .await
     }
 
     pub fn engine(&self) -> &StorageEngine {

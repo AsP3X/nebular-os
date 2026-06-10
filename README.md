@@ -46,6 +46,11 @@ Server listens on `NOS_BIND_ADDR` (default `0.0.0.0:9000`).
 | `NOS_RECOMPRESS_BATCH_SIZE` | Max objects scanned per recompression pass (default `100`) |
 | `NOS_VERIFY_INTERVAL_SECS` | Periodic integrity scrub interval; `0` disables (default `0`) |
 | `NOS_VERIFY_BATCH_SIZE` | Max objects verified per integrity pass (default `100`) |
+| `NOS_SCRUB_SAMPLE_DENOM` | Hash-sample rate for periodic scrub (`1024` ≈ 1/1024 of keys per pass) |
+| `NOS_SCRUB_MODE` | `light` (headers/sizes) or `deep` (checksums/decode; default `deep`) |
+| `NOS_VERIFY_ON_READ` | When `true`, full raw-object GET verifies on-disk xxh3 against metadata etag |
+| `NOS_READ_BUFFER_SIZE` | Pooled read buffer for raw GET streaming (default `262144`) |
+| `NOS_WEBHOOKS_JSON` | Per-bucket webhook URLs, e.g. `{"music":["https://app/hooks/storage"]}` |
 | `NOS_METRICS_TOKEN` | Bearer token required for `/metrics` when set |
 | `NOS_RATE_LIMIT_RPS` | Per-IP request limit; `0` disables (default `0`) |
 | `NOS_RATE_LIMIT_BURST` | Burst size for rate limiting (default `50`) |
@@ -125,7 +130,7 @@ Incompressible types (e.g. `video/*`, `.mp3`, `.zip`) and objects below `NOS_COM
 
 **Legacy formats** (`NOSB`, `NOSZ`, `NOS2`, `NOSD`) remain readable. Background recompression (`NOS_RECOMPRESS_*`) migrates them to `NOSI` and upgrades upload-level blobs to `NOS_ZSTD_LEVEL` / trained dictionary when enabled.
 
-**Integrity:** `POST /_nos/maintenance/verify_blobs` (admin JWT) or `NOS_VERIFY_INTERVAL_SECS` walks objects and verifies block checksums without client GET traffic.
+**Integrity:** `POST /_nos/maintenance/verify_blobs` (admin JWT) supports `?mode=light|deep&sample_denom=&start_after=`; periodic scrub uses `NOS_SCRUB_*` with a rotating key cursor. `NOS_VERIFY_ON_READ` checks raw blob etags on full-object GET.
 
 ## HTTP API
 

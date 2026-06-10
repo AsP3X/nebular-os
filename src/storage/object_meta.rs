@@ -1319,6 +1319,19 @@ pub(crate) async fn init_system_sqlite_schema(pool: &Pool<Sqlite>) -> Result<(),
     let _ = sqlx::query("ALTER TABLE replication_log ADD COLUMN custom_meta TEXT")
         .execute(pool)
         .await;
+    let _ = sqlx::query("ALTER TABLE replication_log ADD COLUMN wire_checksum TEXT")
+        .execute(pool)
+        .await;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS maintenance_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(internal)?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS cluster_runtime_config (

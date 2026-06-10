@@ -6,6 +6,8 @@ use tokio::io::BufReader;
 use crate::storage::engine::StorageEngine;
 use crate::storage::error::{internal, StorageError};
 
+use crate::storage::streaming::verify_wire_checksum;
+
 use super::log::{ReplicationEvent, ReplicationLog, ReplicationOp};
 
 /// Human: Apply a peer replication event locally (idempotent on event_id).
@@ -30,6 +32,9 @@ pub async fn apply_replication_event_bytes(
             let content_type = event.content_type.as_deref();
             let custom_meta = event.custom_meta.as_deref();
             if let Some(bytes) = blob {
+                if let Some(expected) = event.wire_checksum.as_deref() {
+                    verify_wire_checksum(&bytes, expected)?;
+                }
                 engine
                     .put_object(
                         &event.bucket,

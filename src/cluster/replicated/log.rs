@@ -51,6 +51,8 @@ pub struct ReplicationEvent {
     pub content_type: Option<String>,
     #[serde(default)]
     pub custom_meta: Option<String>,
+    #[serde(default)]
+    pub wire_checksum: Option<String>,
     pub created_at: i64,
 }
 
@@ -112,6 +114,20 @@ impl ReplicationLog {
         storage_class: &str,
         replication_group: &str,
     ) -> Result<ReplicationEvent, StorageError> {
+        let rel = self.relative_blob_path(&meta.bucket, &meta.key);
+        let blob_path = std::path::Path::new(&self.data_dir).join(&rel);
+        let wire_checksum = if blob_path.exists() {
+            let path = blob_path.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    crate::storage::streaming::hash_file_xxh3_hex(&path, 256 * 1024)
+                })
+                .await
+                .map_err(internal)??,
+            )
+        } else {
+            None
+        };
         let event = ReplicationEvent {
             event_id: Uuid::new_v4().to_string(),
             origin_node: self.origin_node.clone(),
@@ -120,11 +136,12 @@ impl ReplicationLog {
             key: meta.key.clone(),
             etag: meta.etag.clone(),
             size: Some(meta.size),
-            payload_path: Some(self.relative_blob_path(&meta.bucket, &meta.key)),
+            payload_path: Some(rel),
             storage_class: storage_class.to_string(),
             replication_group: replication_group.to_string(),
             content_type: meta.mime_type.clone(),
             custom_meta: meta.custom_meta.clone(),
+            wire_checksum,
             created_at: Utc::now().timestamp(),
         };
         self.insert_pending(&event).await?;
@@ -151,6 +168,7 @@ impl ReplicationLog {
             replication_group: replication_group.to_string(),
             content_type: None,
             custom_meta: None,
+            wire_checksum: None,
             created_at: Utc::now().timestamp(),
         };
         self.insert_pending(&event).await?;
@@ -159,8 +177,8 @@ impl ReplicationLog {
 
     async fn insert_pending(&self, event: &ReplicationEvent) -> Result<(), StorageError> {
         sqlx::query(
-            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, replication_group, content_type, custom_meta, created_at, status, attempts, next_retry_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL)",
+            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, replication_group, content_type, custom_meta, wire_checksum, created_at, status, attempts, next_retry_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL)",
         )
         .bind(&event.event_id)
         .bind(&event.origin_node)
@@ -174,6 +192,7 @@ impl ReplicationLog {
         .bind(&event.replication_group)
         .bind(&event.content_type)
         .bind(&event.custom_meta)
+        .bind(&event.wire_checksum)
         .bind(event.created_at)
         .execute(&self.pool)
         .await
@@ -184,7 +203,7 @@ impl ReplicationLog {
     pub async fn list_pending(&self, limit: i64) -> Result<Vec<ReplicationEvent>, StorageError> {
         let now = Utc::now().timestamp();
         let rows = sqlx::query_as::<_, ReplicationRow>(
-            "SELECT event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, COALESCE(replication_group, 'default') AS replication_group, content_type, custom_meta, created_at, status
+            "SELECT event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, COALESCE(replication_group, 'default') AS replication_group, content_type, custom_meta, wire_checksum, created_at, status
              FROM replication_log
              WHERE status = 'pending'
                 OR (status = 'failed' AND (next_retry_at IS NULL OR next_retry_at <= ?))
@@ -306,8 +325,8 @@ impl ReplicationLog {
     pub async fn record_applied(&self, event: &ReplicationEvent) -> Result<bool, StorageError> {
         let now = Utc::now().timestamp();
         let result = sqlx::query(
-            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, replication_group, content_type, custom_meta, created_at, applied_at, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied')
+            "INSERT INTO replication_log (event_id, origin_node, op, bucket, key, etag, size, payload_path, storage_class, replication_group, content_type, custom_meta, wire_checksum, created_at, applied_at, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'applied')
              ON CONFLICT(event_id) DO NOTHING",
         )
         .bind(&event.event_id)
@@ -322,8 +341,21 @@ impl ReplicationLog {
         .bind(&event.replication_group)
         .bind(&event.content_type)
         .bind(&event.custom_meta)
+        .bind(&event.wire_checksum)
         .bind(event.created_at)
         .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(internal)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn replay_dead_letter(&self, event_id: &str) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE replication_log SET status = 'pending', attempts = 0, next_retry_at = NULL
+             WHERE event_id = ? AND status = 'dead_letter'",
+        )
+        .bind(event_id)
         .execute(&self.pool)
         .await
         .map_err(internal)?;
@@ -356,6 +388,7 @@ struct ReplicationRow {
     replication_group: String,
     content_type: Option<String>,
     custom_meta: Option<String>,
+    wire_checksum: Option<String>,
     created_at: i64,
     status: Option<String>,
 }
@@ -378,6 +411,7 @@ impl ReplicationRow {
             replication_group: self.replication_group,
             content_type: self.content_type,
             custom_meta: self.custom_meta,
+            wire_checksum: self.wire_checksum,
             created_at: self.created_at,
         })
     }

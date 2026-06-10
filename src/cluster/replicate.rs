@@ -13,6 +13,7 @@ use crate::cluster::replicated::apply::apply_replication_event_bytes;
 use crate::cluster::replicated::ReplicationEvent;
 use crate::routes::AppState;
 use crate::storage::error::{internal, StorageError};
+use crate::storage::streaming::{read_multipart_blob_field, verify_wire_checksum};
 
 /// Human: Peers apply idempotent replication events (JSON delete or multipart put).
 /// Agent: POST /_cluster/replicate; Bearer cluster token; 200 on apply or duplicate event_id.
@@ -60,6 +61,7 @@ pub async fn replicate(
             tracing::error!(error = %e, "replicate apply failed");
             let status = match &e {
                 StorageError::NotFound => StatusCode::NOT_FOUND,
+                StorageError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
             (
@@ -96,7 +98,9 @@ async fn apply_multipart(
                 event_json = Some(field.text().await.map_err(internal)?);
             }
             Some("blob") => {
-                blob = Some(field.bytes().await.map_err(internal)?.to_vec());
+                let (bytes, _checksum) =
+                    read_multipart_blob_field(field, state.max_body_size).await?;
+                blob = Some(bytes);
             }
             _ => {}
         }
@@ -105,6 +109,9 @@ async fn apply_multipart(
     let event_raw = event_json.ok_or(StorageError::NotFound)?;
     let event: ReplicationEvent =
         serde_json::from_str(&event_raw).map_err(internal)?;
+    if let (Some(expected), Some(bytes)) = (&event.wire_checksum, &blob) {
+        verify_wire_checksum(bytes, expected)?;
+    }
     let log = replication_log(state)?;
     let backend = state.backend();
     apply_replication_event_bytes(backend.engine(), log.as_ref(), &event, blob).await

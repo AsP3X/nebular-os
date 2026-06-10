@@ -9,7 +9,7 @@ use super::compressibility::CompressionContext;
 use super::compression::{
     decompress_blob, detect_blob_format, encode_blob_for_storage, is_indexed_blob,
     is_zstd_blob, parse_dedup_manifest, parse_layout_bytes, read_blob_stored_zstd_level,
-    read_indexed_dict_id, verify_indexed_blob, BlobFormat, EncodeOptions, IndexedFormat,
+    read_indexed_dict_id, BlobFormat, EncodeOptions, IndexedFormat,
 };
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
@@ -45,6 +45,12 @@ pub struct VerifyBlobsReport {
     pub corrupted: u64,
     pub recovered: u64,
     pub skipped: u64,
+    pub sampled_out: u64,
+    pub sample_denom: u64,
+    pub mode: String,
+    pub next_start_after: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub corrupted_keys: Vec<(String, String)>,
 }
 
 fn is_legacy_format(format: BlobFormat) -> bool {
@@ -443,12 +449,15 @@ impl StorageEngine {
         self.recompress_blobs(limit).await
     }
 
-    /// Walk indexed blobs and verify block checksums without a client GET.
-    pub async fn verify_blob_integrity(&self, limit: usize) -> Result<VerifyBlobsReport, StorageError> {
-        let limit = limit.max(1) as i64;
+    /// Walk objects with optional hash sampling and light/deep scrub modes.
+    pub async fn scrub_objects(
+        &self,
+        opts: super::scrub::ScrubOptions,
+    ) -> Result<VerifyBlobsReport, StorageError> {
+        let limit = opts.limit.max(1) as i64;
         let rows = self
             .object_meta()
-            .list_recompress_candidates(limit)
+            .list_migration_page(limit, opts.start_after.as_deref())
             .await?;
 
         let dict = if self.zstd_dict_enabled() {
@@ -458,9 +467,33 @@ impl StorageEngine {
         };
         let dict_bytes = dict.as_deref().map(|v| v.as_slice());
 
-        let mut report = VerifyBlobsReport::default();
+        let mut report = VerifyBlobsReport {
+            sample_denom: opts.sample_denom.max(1),
+            mode: match opts.mode {
+                super::scrub::ScrubMode::Light => "light",
+                super::scrub::ScrubMode::Deep => "deep",
+            }
+            .into(),
+            ..VerifyBlobsReport::default()
+        };
+
+        let mut last_key: Option<String> = None;
         for (bucket, key, size) in rows {
+            last_key = Some(key.clone());
+            if !super::scrub::scrub_sample_selected(&bucket, &key, opts.sample_denom) {
+                report.sampled_out += 1;
+                continue;
+            }
             report.scanned += 1;
+
+            let meta = match self.head_object(&bucket, &key, None, None).await? {
+                Some(m) => m,
+                None => {
+                    report.skipped += 1;
+                    continue;
+                }
+            };
+
             let variants = blob_path_variants(self.data_dir(), &bucket, &key);
             let Some(path) = super::first_existing_blob_path(&variants)
                 .await
@@ -475,39 +508,52 @@ impl StorageEngine {
             };
 
             let format = detect_blob_format(&blob);
-            let ok = match format {
-                BlobFormat::Raw => blob.len() as i64 == size,
-                BlobFormat::Nosd => {
-                    self.decode_for_maintenance(&blob, format, size, dict_bytes).is_ok()
-                }
-                BlobFormat::Nosb | BlobFormat::Nosi => verify_indexed_blob(
-                    &blob,
-                    size as u64,
-                    dict_bytes,
-                    Some(self.data_dir()),
-                )
-                .is_ok(),
-                BlobFormat::Nosz | BlobFormat::Nos2 => {
-                    decompress_blob(&blob, size as u64, dict_bytes, None).is_ok()
-                }
-            };
+            let ok = super::scrub::verify_blob_for_scrub(
+                &blob,
+                format,
+                size,
+                opts.mode,
+                path.as_path(),
+                meta.etag.as_deref(),
+                dict_bytes,
+                Some(self.data_dir()),
+                |b, f, s, d| self.decode_for_maintenance(b, f, s, d),
+            )
+            .await;
 
             if ok {
                 report.verified += 1;
             } else {
                 report.corrupted += 1;
-                tracing::warn!(bucket = %bucket, key = %key, "blob integrity verification failed");
+                report.corrupted_keys.push((bucket.clone(), key.clone()));
+                tracing::warn!(bucket = %bucket, key = %key, mode = ?opts.mode, "blob scrub failed");
             }
+        }
+
+        if let Some(k) = last_key {
+            report.next_start_after = Some(k);
         }
 
         if report.corrupted > 0 {
             tracing::warn!(
                 scanned = report.scanned,
                 corrupted = report.corrupted,
-                "storage::verify_blob_integrity found corruption"
+                mode = %report.mode,
+                "storage::scrub_objects found corruption"
             );
         }
         Ok(report)
+    }
+
+    /// Walk indexed blobs and verify block checksums without a client GET.
+    pub async fn verify_blob_integrity(&self, limit: usize) -> Result<VerifyBlobsReport, StorageError> {
+        self.scrub_objects(super::scrub::ScrubOptions {
+            limit,
+            sample_denom: 1,
+            mode: super::scrub::ScrubMode::Deep,
+            start_after: None,
+        })
+        .await
     }
 
     /// Sample recent objects and train a global zstd dictionary when enabled.

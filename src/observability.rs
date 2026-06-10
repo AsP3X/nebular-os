@@ -12,6 +12,9 @@ pub struct NosMetrics {
     pub objects_deleted_total: AtomicU64,
     pub upload_rejected_total: AtomicU64,
     pub orphan_gc_bytes_reclaimed_total: AtomicU64,
+    pub scrub_objects_checked_total: AtomicU64,
+    pub scrub_corruptions_total: AtomicU64,
+    pub webhook_errors_total: AtomicU64,
 }
 
 impl NosMetrics {
@@ -49,6 +52,18 @@ impl NosMetrics {
 
     pub fn add_orphan_gc_bytes(&self, n: u64) {
         self.orphan_gc_bytes_reclaimed_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_scrub_checked(&self, n: u64) {
+        self.scrub_objects_checked_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_scrub_corruptions(&self, n: u64) {
+        self.scrub_corruptions_total.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn inc_webhook_errors(&self) {
+        self.webhook_errors_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn replication_errors_total(&self) -> u64 {

@@ -94,6 +94,11 @@ fn test_config_with_cap(
         block_cache_entries: 0,
         verify_interval_secs: 0,
         verify_batch_size: 100,
+        scrub_sample_denom: 1,
+        scrub_mode_light: false,
+        verify_on_read: false,
+        read_buffer_size: 256 * 1024,
+        webhooks: nebular_os::webhooks::WebhookConfig::default(),
         s3_compat: false,
         bucket_policy: nebular_os::config::BucketPolicy::default(),
         s3_access_key: None,
@@ -2185,6 +2190,142 @@ async fn test_ownly_style_rewrite_preserves_legacy_nested_content() {
     let legacy = blob_path_legacy(base.as_ref(), bucket, key);
     assert!(encoded.is_file());
     assert!(!legacy.exists());
+}
+
+#[tokio::test]
+async fn test_scrub_sampling_and_light_mode() {
+    use nebular_os::storage::scrub::{scrub_sample_selected, ScrubMode, ScrubOptions};
+
+    let (storage, _tmp) = setup_engine(EngineOptions::default()).await;
+    for i in 0..5 {
+        let payload = format!("payload-{i}");
+        let mut body = std::io::Cursor::new(payload.as_bytes());
+        storage
+            .put_object("music", &format!("obj-{i}.bin"), None, None, &mut body)
+            .await
+            .unwrap();
+    }
+
+    let report = storage
+        .scrub_objects(ScrubOptions {
+            limit: 10,
+            sample_denom: 1024,
+            mode: ScrubMode::Light,
+            start_after: None,
+        })
+        .await
+        .unwrap();
+    assert!(report.sampled_out > 0 || report.scanned <= 5);
+    assert_eq!(report.mode, "light");
+
+    assert!(scrub_sample_selected("music", "obj-0.bin", 1));
+}
+
+#[tokio::test]
+async fn test_verify_on_read_rejects_corrupt_raw_blob() {
+    use nebular_os::storage::blob_path;
+
+    let (storage, tmp) = setup_engine(EngineOptions {
+        verify_on_read: true,
+        compress_min_size: 10_000_000,
+        ..EngineOptions::default()
+    })
+    .await;
+
+    let mut body = std::io::Cursor::new(b"integrity-check");
+    storage
+        .put_object("music", "raw.bin", None, None, &mut body)
+        .await
+        .unwrap();
+
+    let path = blob_path(
+        &tmp.path().join("blobs").to_string_lossy(),
+        "music",
+        "raw.bin",
+    );
+    let mut bytes = std::fs::read(&path).unwrap();
+    if !bytes.is_empty() {
+        bytes[0] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+    }
+
+    let result = storage
+        .get_object("music", "raw.bin", None, None, None)
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_webhook_dispatches_on_put() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_bg = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(move || {
+                let hits = hits_bg.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        axum::serve(listener, app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let mut cfg = (*test_config(None, false)).clone();
+    cfg.webhooks = nebular_os::webhooks::WebhookConfig::from_json(&format!(
+        r#"{{"music":["http://{addr}/hook"]}}"#
+    ))
+    .unwrap();
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().join("blobs");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let meta_path_str = format!("file:{}?mode=memory&cache=shared", id);
+    let data_dir_str = data_dir.to_string_lossy().replace('\\', "/");
+    let cfg = Arc::new(cfg);
+    let storage = StorageEngine::with_full_options(
+        &meta_path_str,
+        &data_dir_str,
+        EngineOptions {
+            upload_buffer_size: cfg.upload_buffer_size,
+            read_pool_size: cfg.read_pool_size,
+            ..EngineOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let metrics = NosMetrics::new();
+    let backend = build_backend(storage.clone(), &cfg.cluster, metrics.clone()).unwrap();
+    let app = create_app(backend, storage, cfg, metrics).await.unwrap();
+    let token = make_token();
+
+    let put = Request::builder()
+        .method("PUT")
+        .uri("/music/hook.bin")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from("hooked"))
+        .unwrap();
+    assert_eq!(
+        app.oneshot(put).await.unwrap().status(),
+        StatusCode::CREATED
+    );
+
+    for _ in 0..30 {
+        if hits.load(Ordering::SeqCst) >= 1 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("webhook was not delivered");
 }
 
 async fn http_get_bytes(app: &axum::Router, token: &str, bucket: &str, key: &str) -> Vec<u8> {

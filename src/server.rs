@@ -20,6 +20,7 @@ use crate::middleware::{
     rate_limit::new_rate_limit_map, upload_budget::upload_budget_middleware,
 };
 use crate::observability::NosMetrics;
+use crate::webhooks::WebhookDispatcher;
 use crate::routes::{batch, bucket, capabilities, health, maintenance, metrics, multipart, object, AppState};
 
 pub async fn create_app(
@@ -39,6 +40,8 @@ pub async fn create_app(
     } else {
         None
     };
+    let metrics_for_webhooks = metrics.clone();
+    let webhooks = WebhookDispatcher::new(cfg.webhooks.clone(), metrics_for_webhooks);
     let state = Arc::new(AppState {
         backend,
         cluster,
@@ -49,6 +52,7 @@ pub async fn create_app(
         signing_secret: cfg.signing_secret.clone().map(Arc::new),
         metrics_token: cfg.metrics_token.clone().map(Arc::new),
         metrics,
+        webhooks,
         rate_limiters: new_rate_limit_map(),
         upload_budget,
         max_body_size: cfg.max_body_size,
@@ -99,6 +103,10 @@ pub async fn create_app(
         .route(
             "/_nos/maintenance/replication_status",
             get(maintenance::replication_status),
+        )
+        .route(
+            "/_nos/maintenance/replication_replay",
+            axum::routing::post(maintenance::replication_replay),
         )
         .merge(multipart_routes)
         .route("/{bucket}/_batch_delete", axum::routing::post(batch::batch_delete))

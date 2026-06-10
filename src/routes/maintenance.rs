@@ -92,10 +92,13 @@ pub async fn gc_orphans(
 #[derive(Debug, Deserialize)]
 pub struct VerifyBlobsQuery {
     pub limit: Option<u64>,
+    pub mode: Option<String>,
+    pub sample_denom: Option<u64>,
+    pub start_after: Option<String>,
 }
 
 /// Human: Proactively verify blob block checksums without client GET traffic.
-/// Agent: POST /_nos/maintenance/verify_blobs; admin JWT; optional limit (default engine batch size).
+/// Agent: POST /_nos/maintenance/verify_blobs; admin JWT; optional limit/mode/sample_denom/start_after.
 pub async fn verify_blobs(
     State(state): State<Arc<AppState>>,
     Query(query): Query<VerifyBlobsQuery>,
@@ -110,8 +113,61 @@ pub async fn verify_blobs(
         .limit
         .unwrap_or(state.engine().verify_batch_size() as u64)
         .min(10_000) as usize;
-    match state.backend().verify_blob_integrity(limit).await {
-        Ok(report) => Json(report).into_response(),
+    let mode = query
+        .mode
+        .as_deref()
+        .and_then(crate::storage::scrub::ScrubMode::parse)
+        .unwrap_or_else(|| {
+            if state.config.scrub_mode_light {
+                crate::storage::scrub::ScrubMode::Light
+            } else {
+                crate::storage::scrub::ScrubMode::Deep
+            }
+        });
+    let sample_denom = query
+        .sample_denom
+        .unwrap_or(state.config.scrub_sample_denom)
+        .max(1);
+    let opts = crate::storage::scrub::ScrubOptions {
+        limit,
+        sample_denom,
+        mode,
+        start_after: query.start_after,
+    };
+    match state.backend().scrub_objects(opts).await {
+        Ok(report) => {
+            state.metrics.add_scrub_checked(report.scanned);
+            if report.corrupted > 0 {
+                state.metrics.add_scrub_corruptions(report.corrupted);
+            }
+            Json(report).into_response()
+        }
+        Err(e) => {
+            let (status, json) = crate::routes::errors::map_storage_error(e);
+            (status, json).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReplayDeadLetterQuery {
+    pub event_id: String,
+}
+
+/// Human: Re-queue a dead-letter replication event for another push attempt.
+/// Agent: POST /_nos/maintenance/replication_replay; admin JWT; requires event_id query param.
+pub async fn replication_replay(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ReplayDeadLetterQuery>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let claims = req.extensions().get::<Claims>();
+    if let Err(resp) = require_admin(claims) {
+        return resp.into_response();
+    }
+
+    match state.backend().replay_dead_letter(&query.event_id).await {
+        Ok(replayed) => Json(serde_json::json!({ "replayed": replayed })).into_response(),
         Err(e) => {
             let (status, json) = crate::routes::errors::map_storage_error(e);
             (status, json).into_response()

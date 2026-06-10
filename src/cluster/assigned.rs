@@ -89,14 +89,63 @@ impl AssignedBackend {
         }
     }
 
-    pub async fn verify_blob_integrity_with_recovery(
+    pub async fn scrub_with_recovery(
+        &self,
+        opts: crate::storage::scrub::ScrubOptions,
+    ) -> Result<crate::storage::maintenance::VerifyBlobsReport, StorageError> {
+        match &self.inner {
+            AssignedInner::Standalone(b) => b.engine().scrub_objects(opts).await,
+            AssignedInner::Replicated(b) => b.scrub_with_recovery(opts).await,
+        }
+    }
+
+    pub async fn scrub_with_defaults(
         &self,
         limit: usize,
     ) -> Result<crate::storage::maintenance::VerifyBlobsReport, StorageError> {
         match &self.inner {
-            AssignedInner::Standalone(b) => b.engine().verify_blob_integrity(limit).await,
-            AssignedInner::Replicated(b) => b.verify_blob_integrity_with_recovery(limit).await,
+            AssignedInner::Standalone(b) => b.engine().scrub_with_defaults(limit).await,
+            AssignedInner::Replicated(b) => {
+                let cursor = b.engine().get_maintenance_state("scrub_cursor").await?;
+                let mode = if b.engine().scrub_mode_light() {
+                    crate::storage::scrub::ScrubMode::Light
+                } else {
+                    crate::storage::scrub::ScrubMode::Deep
+                };
+                let report = b
+                    .scrub_with_recovery(crate::storage::scrub::ScrubOptions {
+                        limit,
+                        sample_denom: b.engine().scrub_sample_denom(),
+                        mode,
+                        start_after: cursor,
+                    })
+                    .await?;
+                if let Some(ref next) = report.next_start_after {
+                    b.engine().set_maintenance_state("scrub_cursor", next).await?;
+                }
+                Ok(report)
+            }
         }
+    }
+
+    pub async fn replay_dead_letter(&self, event_id: &str) -> Result<bool, StorageError> {
+        match &self.inner {
+            AssignedInner::Standalone(_) => Ok(false),
+            AssignedInner::Replicated(b) => b.replay_dead_letter(event_id).await,
+        }
+    }
+
+    pub async fn verify_blob_integrity_with_recovery(
+        &self,
+        limit: usize,
+    ) -> Result<crate::storage::maintenance::VerifyBlobsReport, StorageError> {
+        self.scrub_with_recovery(crate::storage::scrub::ScrubOptions {
+            limit,
+            sample_denom: 1,
+            mode: crate::storage::scrub::ScrubMode::Deep,
+            start_after: None,
+        })
+        .await
     }
 
     pub fn replication_log(&self) -> Option<&super::replicated::ReplicationLog> {

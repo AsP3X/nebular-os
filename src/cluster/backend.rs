@@ -436,6 +436,52 @@ impl StorageBackend {
             Self::Assigned(b) => b.backfill_replication(limit).await,
         }
     }
+
+    pub async fn scrub_objects(
+        &self,
+        opts: crate::storage::scrub::ScrubOptions,
+    ) -> Result<VerifyBlobsReport, StorageError> {
+        match self {
+            Self::Standalone(b) => b.engine().scrub_objects(opts).await,
+            Self::Replicated(b) => b.scrub_with_recovery(opts).await,
+            Self::Assigned(b) => b.scrub_with_recovery(opts).await,
+        }
+    }
+
+    pub async fn scrub_with_defaults(&self, limit: usize) -> Result<VerifyBlobsReport, StorageError> {
+        match self {
+            Self::Standalone(b) => b.engine().scrub_with_defaults(limit).await,
+            Self::Replicated(b) => {
+                let cursor = b.engine().get_maintenance_state("scrub_cursor").await?;
+                let mode = if b.engine().scrub_mode_light() {
+                    crate::storage::scrub::ScrubMode::Light
+                } else {
+                    crate::storage::scrub::ScrubMode::Deep
+                };
+                let report = b
+                    .scrub_with_recovery(crate::storage::scrub::ScrubOptions {
+                        limit,
+                        sample_denom: b.engine().scrub_sample_denom(),
+                        mode,
+                        start_after: cursor,
+                    })
+                    .await?;
+                if let Some(ref next) = report.next_start_after {
+                    b.engine().set_maintenance_state("scrub_cursor", next).await?;
+                }
+                Ok(report)
+            }
+            Self::Assigned(b) => b.scrub_with_defaults(limit).await,
+        }
+    }
+
+    pub async fn replay_dead_letter(&self, event_id: &str) -> Result<bool, StorageError> {
+        match self {
+            Self::Standalone(_) => Ok(false),
+            Self::Replicated(b) => b.replay_dead_letter(event_id).await,
+            Self::Assigned(b) => b.replay_dead_letter(event_id).await,
+        }
+    }
 }
 
 /// Human: Construct the storage facade from engine + config.

@@ -53,6 +53,10 @@ async fn main() -> Result<()> {
         compress_exclude_extensions: cfg.compress_exclude_extensions.clone(),
         block_cache_entries: cfg.block_cache_entries,
         verify_batch_size: cfg.verify_batch_size,
+        scrub_sample_denom: cfg.scrub_sample_denom,
+        scrub_mode_light: cfg.scrub_mode_light,
+        verify_on_read: cfg.verify_on_read,
+        read_buffer_size: cfg.read_buffer_size,
     };
 
     let storage = storage::engine::StorageEngine::with_full_options(
@@ -193,7 +197,7 @@ fn spawn_storage_maintenance(
                 }
             }
             if verify {
-                match backend.verify_blob_integrity(cfg.verify_batch_size).await {
+                match backend.scrub_with_defaults(cfg.verify_batch_size).await {
                     Ok(report) if report.corrupted > 0 => {
                         tracing::warn!(?report, "Periodic blob integrity verification found issues")
                     }

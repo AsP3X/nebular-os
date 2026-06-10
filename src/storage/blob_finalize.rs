@@ -105,6 +105,10 @@ pub struct ReadContext {
     pub data_dir: String,
     pub dict: Option<Arc<Vec<u8>>>,
     pub block_cache: Option<BlockDecodeCache>,
+    pub read_buffer_size: usize,
+    pub verify_on_read: bool,
+    pub buffer_pool: super::buffer_pool::BufferPool,
+    pub expected_etag: Option<String>,
 }
 
 impl ReadContext {
