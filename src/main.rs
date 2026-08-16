@@ -152,9 +152,7 @@ fn spawn_storage_maintenance(
     let recompress = cfg.recompress_interval_secs > 0;
     let verify = cfg.verify_interval_secs > 0;
     let orphan_gc = cfg.orphan_gc_interval_secs > 0;
-    if !purge_soft && !purge_multipart && !recompress && !verify && !orphan_gc {
-        return;
-    }
+    // Human: Always run — interrupted video PUTs leave `{data_dir}/.tmp/*.tmp` even when other GC is off.
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(300));
@@ -177,6 +175,16 @@ fn spawn_storage_maintenance(
                     Ok(_) => {}
                     Err(e) => tracing::error!(error = %e, "Stale multipart upload purge failed"),
                 }
+            }
+            match storage
+                .purge_stale_tmp_files(Duration::from_secs(3600))
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::info!(purged = n, "Stale .tmp upload scratch files removed")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "Stale .tmp purge failed"),
             }
             if recompress {
                 match storage.recompress_blobs(cfg.recompress_batch_size).await {

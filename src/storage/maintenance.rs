@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
@@ -623,5 +623,89 @@ impl StorageEngine {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// Human: Interrupted PUTs leave `{data_dir}/.tmp/*.tmp` — they are not objects and never GC'd.
+    /// Agent: DELETES idle children of `.tmp` older than max_age; SKIPS missing dir.
+    pub async fn purge_stale_tmp_files(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Result<u64, StorageError> {
+        let tmp_dir = PathBuf::from(self.data_dir()).join(".tmp");
+        purge_stale_tmp_dir(&tmp_dir, max_age)
+            .await
+            .map_err(internal)
+    }
+}
+
+// Human: Remove leftover upload/decompress scratch files that outlived their PUT/GET.
+// Agent: READS mtime; DELETES regular files idle >= max_age; NEVER deletes the .tmp directory itself.
+pub async fn purge_stale_tmp_dir(
+    tmp_dir: &Path,
+    max_age: std::time::Duration,
+) -> std::io::Result<u64> {
+    let read_dir = match tokio::fs::read_dir(tmp_dir).await {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let mut read_dir = read_dir;
+    let mut removed = 0u64;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
+        let meta = match entry.metadata().await {
+            Ok(meta) => meta,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = match meta.modified() {
+            Ok(time) => time,
+            Err(_) => continue,
+        };
+        let idle = match modified.elapsed() {
+            Ok(elapsed) => elapsed >= max_age,
+            Err(_) => false,
+        };
+        if !idle {
+            continue;
+        }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
+mod tmp_janitor_tests {
+    use super::*;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn purge_stale_tmp_dir_removes_only_idle_files() {
+        let root = TempDir::new().expect("tmp");
+        let dir = root.path();
+        let stale = dir.join("upload-stale.tmp");
+        let fresh = dir.join("upload-fresh.tmp");
+        std::fs::write(&stale, vec![0u8; 1024]).unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let removed = purge_stale_tmp_dir(dir, Duration::from_millis(50))
+            .await
+            .expect("purge stale");
+        assert_eq!(removed, 1, "idle upload scratch must be deleted");
+        assert!(!stale.exists());
+
+        std::fs::write(&fresh, vec![0u8; 1024]).unwrap();
+        let removed_fresh = purge_stale_tmp_dir(dir, Duration::from_secs(3600))
+            .await
+            .expect("purge fresh");
+        assert_eq!(removed_fresh, 0, "in-flight tmp must not be deleted");
+        assert!(fresh.exists());
     }
 }
