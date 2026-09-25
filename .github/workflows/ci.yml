@@ -22,9 +22,13 @@ jobs:
 
   audit:
     runs-on: ubuntu-latest
-    # Human: RustSec advisory scan of Cargo.lock. Non-blocking until the dependency tree has been triaged
-    # once in CI; read the job log for findings.
+    # Human: RustSec advisory scan of Cargo.lock; ignores with their reasons live in .cargo/audit.toml.
+    # Non-blocking, so a new advisory is reported without stopping unrelated work.
     continue-on-error: true
+    # Human: audit-check reports through a check run, which the default token may not create.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2

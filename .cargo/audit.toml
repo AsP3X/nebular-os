@@ -1,0 +1,8 @@
+# cargo-audit configuration (also read by the CI audit job).
+
+[advisories]
+ignore = [
+    # rsa (Marvin attack): listed in Cargo.lock only as an optional dependency of sqlx's MySQL driver,
+    # which this crate doesn't enable, so it is never compiled. No fixed release exists yet.
+    "RUSTSEC-2023-0071",
+]
