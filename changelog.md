@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-25
+
 ### Upgrading from 0.1.4
 
 - Existing data is read as it is: NOS2 compressed blobs (with or without the trained dictionary), NOSD dedup manifests and raw blobs. New writes, recompression and `POST /_nos/maintenance/migrate_blobs` store the block-indexed NOSI format. `tests/fixtures/v0.1.4` holds storage written by the released 0.1.4 binary, and a test checks on every run that all of it reads back, scrubs clean and survives recompression and migration.
@@ -241,7 +243,8 @@ See `.env.example` and `README.md` for full operator notes, including alignment 
 - Cluster modes: standalone, replicated, assigned, replicated+assigned; runtime config via `PUT /_cluster/config` and bootstrap token.
 - Write preconditions (`If-Match`, `If-None-Match`), readiness probe (`/health/ready`), and metrics (`/metrics` JSON or Prometheus text).
 
-[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/AsP3X/nebular-os/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/AsP3X/nebular-os/releases/tag/v0.2.0
 [0.1.4]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.4
 [0.1.3]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.3
 [0.1.2]: https://github.com/AsP3X/nebular-os/releases/tag/v0.1.2
