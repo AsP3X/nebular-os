@@ -4607,24 +4607,27 @@ async fn test_concurrent_writes_never_overshoot_the_capacity_cap() {
         .map(|i| {
             let storage = storage.clone();
             tokio::spawn(async move {
-                storage
-                    .put_object("quota", &format!("obj-{i}"), None, None, std::io::Cursor::new(vec![b'x'; 100]))
-                    .await
+                let key = format!("obj-{i}");
+                let written = storage
+                    .put_object("quota", &key, None, None, std::io::Cursor::new(vec![b'x'; 100]))
+                    .await;
+                (key, written)
             })
         })
         .collect();
-    let mut stored = 0;
+    let mut stored = Vec::new();
     for writer in writers {
         match writer.await.unwrap() {
-            Ok(_) => stored += 1,
-            Err(nebular_os::storage::error::StorageError::InsufficientStorage) => {}
-            Err(e) => panic!("unexpected error: {e:?}"),
+            (key, Ok(_)) => stored.push(key),
+            (_, Err(nebular_os::storage::error::StorageError::InsufficientStorage)) => {}
+            (key, Err(e)) => panic!("{key}: unexpected error: {e:?}"),
         }
     }
-    assert_eq!(stored, 10);
+    assert_eq!(stored.len(), 10);
     assert_eq!(storage.total_bytes().await.unwrap(), 1_000);
-    // Human: Room freed by a delete is available again (reservations were released, not leaked).
-    storage.delete_object("quota", "obj-0", None).await.unwrap();
+    // Human: Room freed by a delete is available again (reservations were released, not leaked). Which writers
+    // won the race varies, so free the room of one that did.
+    storage.delete_object("quota", &stored[0], None).await.unwrap();
     put_bytes(&storage, "quota", "after-delete", &[b'y'; 100]).await;
 }
 
