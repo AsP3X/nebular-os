@@ -8,7 +8,7 @@ Nebular OS is a single-binary Rust/Axum object storage service with embedded SQL
 
 ### Prerequisites (handled by update script)
 
-- **Rust stable >= 1.85** (`edition = "2024"` in `Cargo.toml`). The update script runs `rustup update stable`.
+- **Rust stable >= 1.88** (`rust-version` in `Cargo.toml`; the code uses let-chains). The update script runs `rustup update stable`.
 - **`libssl-dev` + `pkg-config`** on Ubuntu — needed by the `reqwest` dev-dependency (used only in `tests/integration.rs`). The update script installs them.
 
 ### Running the server

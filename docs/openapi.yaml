@@ -2,7 +2,9 @@ openapi: 3.1.0
 info:
   title: Nebular OS API
   version: 0.2.0
-  description: Self-hosted object storage with JWT and presigned URL auth.
+  description: >-
+    Self-hosted object storage. Requests authenticate with a JWT, a presigned URL (Nebular's own or AWS SigV4),
+    or an AWS Signature V4 `Authorization` header. ETags are the xxh3-64 of the object's content (16 hex digits).
 servers:
   - url: http://localhost:9000
 paths:
@@ -55,6 +57,10 @@ paths:
   /_cluster/replicate:
     post:
       summary: Apply idempotent replication event from peer
+      description: >-
+        Applied only when the event's version (`version` microseconds, then `origin_node`) is newer than the
+        version this node has for the key; an older event, or one already applied, is acknowledged with `200`
+        and dropped. Events without `version` (from older nodes) count as made at the start of `created_at`'s second.
       security:
         - clusterToken: []
       requestBody:
@@ -103,6 +109,76 @@ paths:
       responses:
         "200":
           description: Resolution JSON
+  /_cluster/config:
+    get:
+      summary: Current cluster configuration (cluster token or bootstrap token)
+      security:
+        - clusterToken: []
+      responses:
+        "200":
+          description: '`{ "configured": bool, "config"?: {...} }`; the cluster token itself is reported only as `cluster_token_set`'
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      summary: Save and apply a cluster configuration (hot reload)
+      description: >-
+        Persisted in the metadata database; it replaces the NOS_CLUSTER_* environment settings at every start.
+        `replication_factor` defaults to 2 in replicating modes.
+      security:
+        - clusterToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode, node_id, cluster_token, peers]
+              properties:
+                mode: { type: string, enum: [replicated, assigned, replicated+assigned] }
+                node_id: { type: string }
+                cluster_token: { type: string }
+                peers:
+                  type: array
+                  items:
+                    type: object
+                    required: [id, url]
+                    properties:
+                      id: { type: string }
+                      url: { type: string }
+                      storage_classes: { type: array, items: { type: string } }
+                      replication_group: { type: string }
+                replication_factor: { type: integer, minimum: 1 }
+                storage_classes: { type: array, items: { type: string } }
+                replication_group: { type: string }
+                replication_role: { type: string, enum: [member, readonly] }
+                replication_read_repair: { type: boolean }
+                replication_heal_on_read: { type: boolean }
+                replication_prefixes: { type: array, items: { type: string } }
+                replication_exclude_prefixes: { type: array, items: { type: string } }
+                replication_max_attempts: { type: integer }
+                replication_peer_concurrency: { type: integer }
+                default_storage_class: { type: string }
+                assignment_rules: { description: Rules object or JSON string }
+                assignment_forward: { type: boolean }
+      responses:
+        "200": { description: Applied }
+        "400": { description: Invalid configuration }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /_cluster/replication/backfill:
+    post:
+      summary: Queue one batch of existing objects for replication
+      security:
+        - clusterToken: []
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, default: 100, maximum: 10000 }
+        - in: query
+          name: start_after
+          description: The previous response's `next_start_after`
+          schema: { type: string }
+      responses:
+        "200":
+          description: '`{ scanned, enqueued, skipped, next_start_after, is_truncated }` — repeat while `is_truncated`'
   /_cluster/objects/{bucket}/{key}:
     get:
       summary: Stream object from local disk (peer read-repair)
@@ -115,9 +191,15 @@ paths:
           name: Range
           schema: { type: string }
       responses:
-        "200": { description: Object bytes }
+        "200":
+          description: Object bytes
+          headers:
+            x-nd-replication-version:
+              description: "`{microseconds};{node id}` — the version this node has recorded for the key, if any"
+              schema: { type: string }
         "206": { description: Partial content }
         "404": { $ref: "#/components/responses/NotFound" }
+        "416": { $ref: "#/components/responses/RangeNotSatisfiable" }
     head:
       summary: Check object exists locally
       security:
@@ -257,14 +339,103 @@ paths:
           description: GC report
         "403":
           description: Admin role required
+  /_nos/maintenance/verify_blobs:
+    post:
+      summary: Integrity scrub of one batch (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, maximum: 10000 }
+        - in: query
+          name: mode
+          schema: { type: string, enum: [light, deep] }
+        - in: query
+          name: sample_denom
+          description: Verify 1/N of the objects
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: start_after
+          schema: { type: string }
+      responses:
+        "200":
+          description: >-
+            `{ scanned, verified, corrupted, recovered, skipped, sampled_out, sample_denom, mode,
+            next_start_after, is_truncated, corrupted_keys? }`; deep mode decodes every block and checks the ETag
+        "403": { description: Admin role required }
+  /_nos/maintenance/migrate_blobs:
+    post:
+      summary: Move legacy blob layouts and formats to the current ones, one batch (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, maximum: 10000 }
+        - in: query
+          name: start_after
+          schema: { type: string }
+      responses:
+        "200":
+          description: '`{ scanned, migrated, skipped, failed, next_start_after, is_truncated }`'
+        "403": { description: Admin role required }
+  /_nos/maintenance/train_dictionary:
+    post:
+      summary: Train a new zstd dictionary for new writes (admin)
+      description: >-
+        Samples current objects. New writes use the new dictionary and recompression moves existing blobs to it;
+        blobs compressed with earlier dictionaries stay readable.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: '`{ "samples": n, "trained": bool, "id": n|null }` — not trained when there is too little sample data'
+        "400": { description: NOS_ZSTD_DICT_ENABLED is off }
+        "403": { description: Admin role required }
+  /_nos/maintenance/replication_status:
+    get:
+      summary: Replication queue counts (admin; zero in standalone mode)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: '`{ pending, failed, dead_letter, sent, applied, superseded, oldest_pending_age_secs }`'
+        "403": { description: Admin role required }
+  /_nos/maintenance/replication_replay:
+    post:
+      summary: Re-queue a dead-letter replication event (admin)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: event_id
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: '`{ "replayed": bool }`' }
+        "403": { description: Admin role required }
   /{bucket}/{key}:
     put:
       summary: Upload or copy object
       security:
         - bearerAuth: []
+        - sigv4: []
+        - presigned: []
       parameters:
         - $ref: "#/components/parameters/bucket"
         - $ref: "#/components/parameters/key"
+        - in: header
+          name: Content-MD5
+          description: Base64 MD5 of the body (RFC 1864); verified before the object is committed
+          schema: { type: string }
+        - in: header
+          name: If-Match
+          schema: { type: string }
+        - in: header
+          name: If-None-Match
+          description: "`*` creates the object only if it doesn't exist"
+          schema: { type: string }
         - in: header
           name: x-nd-storage-class
           schema: { type: string, description: "Ignored in standalone mode" }
@@ -273,12 +444,19 @@ paths:
           schema: { type: string, description: "Override NOS_REPLICATION_GROUP for replication enqueue" }
         - in: header
           name: x-nd-copy-source
+          description: >-
+            Server-side copy from `bucket/key`. The caller must be allowed to GET the source bucket
+            (role and NOS_BUCKET_POLICY); presigned URLs cannot copy.
           schema: { type: string, example: music/source.mp3 }
         - in: header
           name: x-nd-custom-meta-*
           schema: { type: string }
       responses:
-        "201": { description: Created, returns `{ "etag": "..." }` }
+        "201": { description: 'Created, returns `{ "etag": "..." }`' }
+        "400": { description: "Malformed copy-source header, invalid key or bucket, or a body that doesn't match `Content-MD5` / the signed SigV4 payload hash" }
+        "408": { description: "The body sent nothing for NOS_UPLOAD_IDLE_TIMEOUT_SECS" }
+        "412": { description: Precondition failed }
+        "403": { description: "Copy source not readable by the caller, or copy via presigned URL" }
         "409":
           description: Object not assigned to this node (assigned cluster mode)
           content:
@@ -291,16 +469,20 @@ paths:
                   assigned_node: { type: string }
                   storage_class: { type: string }
         "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "503": { description: "Upload budget full (NOS_UPLOAD_MAX_IN_FLIGHT_BYTES); retry after `Retry-After`" }
+        "507": { description: "NOS_MAX_LOGICAL_BYTES would be exceeded" }
     get:
       summary: Download object
       security:
         - bearerAuth: []
+        - sigv4: []
         - presigned: []
       parameters:
         - $ref: "#/components/parameters/bucket"
         - $ref: "#/components/parameters/key"
         - in: header
           name: Range
+          description: Single byte range; malformed or multi-range values are ignored (full 200).
           schema: { type: string, example: "bytes=-500" }
         - in: header
           name: If-None-Match
@@ -308,24 +490,42 @@ paths:
         - in: header
           name: If-Modified-Since
           schema: { type: string }
+        - in: header
+          name: If-Range
+          description: With `Range`, serve the range only if this ETag or date still matches; otherwise the full object
+          schema: { type: string }
       responses:
         "200": { description: Object bytes }
-        "206": { description: Partial content }
+        "206": { description: Partial content; `Content-Length` is the slice length }
         "304": { description: Not modified }
         "404": { $ref: "#/components/responses/NotFound" }
+        "416": { $ref: "#/components/responses/RangeNotSatisfiable" }
     head:
       summary: Object metadata
       security:
         - bearerAuth: []
+        - sigv4: []
+        - presigned: []
       responses:
         "200": { description: Headers only }
-        "304": { description: Not modified }
+        "304": { description: Not modified (with the object's ETag and Last-Modified) }
+        "404": { $ref: "#/components/responses/NotFound" }
     delete:
-      summary: Soft-delete object
+      summary: Delete object (soft delete unless NOS_SOFT_DELETE_TTL_SECS is 0)
+      description: >-
+        Deleting a missing object succeeds. In assigned cluster mode with forwarding on, the delete is sent to every
+        node, since the object may be on any of them.
       security:
         - bearerAuth: []
+        - sigv4: []
+        - presigned: []
+      parameters:
+        - in: header
+          name: If-Match
+          schema: { type: string }
       responses:
-        "204": { description: Marked deleted }
+        "204": { description: Deleted }
+        "412": { description: Precondition failed }
   /{bucket}/_multipart:
     post:
       summary: Init multipart upload
@@ -339,38 +539,103 @@ paths:
           schema: { type: string }
       responses:
         "200":
-          description: `{ "upload_id", "part_size" }`
+          description: '`{ "upload_id", "part_size" }`'
+  /{bucket}/_multipart/{uploadId}:
+    delete:
+      summary: Abort multipart upload
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - in: path
+          name: uploadId
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Aborted; its parts are removed }
+        "404": { $ref: "#/components/responses/NotFound" }
   /{bucket}/_multipart/{uploadId}/parts/{partNumber}:
     put:
       summary: Upload multipart part
       security:
         - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/bucket"
+        - in: path
+          name: uploadId
+          required: true
+          schema: { type: string }
+        - in: path
+          name: partNumber
+          required: true
+          schema: { type: integer, minimum: 1, maximum: 10000 }
+        - in: header
+          name: Content-MD5
+          description: Base64 MD5 of the part; verified before the part is stored
+          schema: { type: string }
       responses:
-        "200": { description: `{ "etag" }` }
+        "200": { description: '`{ "etag" }`' }
+        "400": { description: "Part number outside 1–10000, or a body that doesn't match `Content-MD5`" }
   /{bucket}/_multipart/{uploadId}/complete:
     post:
       summary: Complete multipart upload
+      description: >-
+        Assembles the listed parts (ascending part numbers; ETags must match the stored parts). Without a
+        body, stored parts must be contiguous from 1. Each part is verified against its recorded size and ETag.
       security:
         - bearerAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [parts]
+              properties:
+                parts:
+                  type: array
+                  items:
+                    type: object
+                    required: [part_number]
+                    properties:
+                      part_number: { type: integer, minimum: 1 }
+                      etag: { type: string }
       responses:
         "201": { description: Final object created }
+        "400": { description: "Missing, unknown, out-of-order or changed parts (the error names the part)" }
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
       bearerFormat: JWT
+    sigv4:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: >-
+        AWS Signature V4 (`AWS4-HMAC-SHA256`) with NOS_S3_ACCESS_KEY / NOS_S3_SECRET_KEY, as a header (any route) or as
+        a presigned query on /{bucket}/{key} only (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+        `X-Amz-SignedHeaders`, `X-Amz-Signature`). Every `x-amz-*` and `x-nd-*` header sent must be signed. A signed `x-amz-content-sha256`
+        binds the body, which is verified; requests are accepted within 15 minutes of `X-Amz-Date`. Access-key
+        requests act with NOS_S3_ACCESS_KEY_ROLE.
     presigned:
       type: apiKey
       in: query
       name: signature
+      description: >-
+        HMAC-SHA256 (hex) of "METHOD\nbucket\nkey\nexpires" with NOS_SIGNING_SECRET, plus an `expires`
+        unix-seconds query parameter. Accepted only on /{bucket}/{key} (never list, prefix/batch delete or
+        multipart) and only when `expires` is within NOS_PRESIGN_MAX_TTL_SECS (default 7 days).
     metricsToken:
       type: http
       scheme: bearer
     clusterToken:
       type: http
       scheme: bearer
-      description: NOS_CLUSTER_TOKEN for /_cluster/* routes
+      description: >-
+        NOS_CLUSTER_TOKEN for /_cluster/* routes. Until a cluster token is configured,
+        NOS_CLUSTER_BOOTSTRAP_TOKEN is accepted for /_cluster/config, /_cluster/health and /_cluster/capabilities.
   parameters:
     bucket:
       in: path
@@ -397,6 +662,16 @@ components:
             $ref: "#/components/schemas/Error"
     PayloadTooLarge:
       description: Payload too large
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RangeNotSatisfiable:
+      description: No byte of the requested range exists
+      headers:
+        Content-Range:
+          description: Current object length, e.g. `bytes */1024`
+          schema: { type: string }
       content:
         application/json:
           schema:

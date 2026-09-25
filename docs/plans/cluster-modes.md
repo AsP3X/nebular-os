@@ -131,7 +131,7 @@ flowchart TB
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `NOS_REPLICATION_ROLE` | `member` | `primary` \| `member` \| `readonly` |
-| `NOS_REPLICATION_FACTOR` | `1` | Target copies including self; `1` = no peer copies |
+| `NOS_REPLICATION_FACTOR` | `2` in replicating modes | Target copies including self; `1` = no peer copies (logs a warning) |
 | `NOS_REPLICATION_ASYNC` | `true` | `true` = eventual; `false` = **DEFERRED** quorum |
 | `NOS_REPLICATION_GROUP` | `default` | Peers with same group replicate to each other |
 | `NOS_REPLICATION_READ_REPAIR` | `false` | Phase 4: fetch from peer on local miss |
