@@ -1,0 +1,9 @@
+# Only Cargo.toml, Cargo.lock, src/, migrations/ and docker/ are used by the build.
+target/
+.git/
+.env
+.env.*
+.claude/
+.cursor/
+tests/
+docs/
