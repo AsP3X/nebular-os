@@ -43,7 +43,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`/metrics` can't be used to load the database.** Every scrape scanned the metadata tables, and the endpoint is open unless `NOS_METRICS_TOKEN` is set. Totals are now computed at most once every 10 seconds, and concurrent scrapes share one computation.
 - **Multipart part numbers are limited to 1–10000**, like S3.
 - **The Docker image no longer runs as root** (see Upgrading). The ownership pass over `/data` runs until one has completed, which a `.nos-owned` marker records; later starts check only the directory's top level, so a large volume doesn't delay startup.
-- **Dependencies:** `lru` (two RustSec "unsound" advisories) is replaced by `hashlink`. A non-blocking `cargo audit` job runs in CI.
+- **Dependencies:** `lru` (two RustSec "unsound" advisories) is replaced by `hashlink`. `rustls` 0.23.45 fixes TLS 1.3 handshake messages being accepted across encryption levels (RUSTSEC-2026-0285; used for HTTPS to cluster peers and webhooks); `anyhow` 1.0.104 and `event-listener` 5.4.2 fix unsound APIs; the test-only `testcontainers` 0.27 drops `tokio-tar` (RUSTSEC-2025-0111) and the unmaintained `rustls-pemfile`. A non-blocking `cargo audit` job runs in CI; `.cargo/audit.toml` records the one ignored advisory (`rsa`, an optional dependency of sqlx's MySQL driver that is never compiled here).
 
 ### Fixed — data integrity
 
