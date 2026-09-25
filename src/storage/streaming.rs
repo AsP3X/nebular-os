@@ -6,13 +6,13 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use futures_util::Stream;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf};
 use tokio_util::io::ReaderStream;
 
 use super::buffer_pool::BufferPool;
 use super::compression::{
-    decompress_file_to_temp, pump_block_blob_full, pump_block_blob_range, read_blob_header_size,
-    BlobFormat, IndexedReadContext, FIXED_HEADER_LEN_V1, HEADER_LEN, HEADER_LEN_V2,
+    read_blob_header_size, stored_blob_format, BlobFormat, IndexedBlobReader, IndexedReadContext,
+    FIXED_HEADER_LEN_V1, HEADER_LEN, HEADER_LEN_V2,
 };
 use super::blocks::BlockStore;
 use super::blob_finalize::blob_format_from_header;
@@ -147,158 +147,122 @@ pub async fn open_object_body_stream(
     content_length: u64,
     ctx: &super::blob_finalize::ReadContext,
 ) -> Result<GuardedObjectBodyStream, StorageError> {
-    let mut peek = [0u8; FIXED_HEADER_LEN_V1];
+    // Human: Everything below reads through this one handle, so an overwrite or maintenance swap that renames a
+    // new blob over the path mid-request can't pair the format sniffed here with another file's bytes (a raw
+    // GET used to reopen the path and could stream a freshly recompressed container as the object).
     let mut file = File::open(blob_path).await.map_err(map_io_error)?;
-    let read = file.read(&mut peek).await.map_err(map_io_error)?;
-    let format = blob_format_from_header(&peek[..read]);
-
-    if format == BlobFormat::Nosd {
-        return open_dedup_object_stream(
-            blob_path,
-            logical_size,
-            range_start,
-            content_length,
-            ctx,
-        )
-        .await;
+    let mut peek = [0u8; FIXED_HEADER_LEN_V1];
+    let read = read_up_to(&mut file, &mut peek).await.map_err(map_io_error)?;
+    let mut format = blob_format_from_header(&peek[..read]);
+    if format != BlobFormat::Raw {
+        let file_len = file.metadata().await.map_err(map_io_error)?.len();
+        format = stored_blob_format(&peek[..read], file_len, logical_size);
     }
+    let whole = range_start == 0 && content_length == logical_size;
 
-    if format == BlobFormat::Raw {
-        drop(file);
-        if ctx.verify_on_read
-            && range_start == 0
-            && content_length == logical_size
-            && let Some(expected) = ctx.expected_etag.as_deref()
-        {
-            let path = blob_path.to_path_buf();
-            let expected = expected.to_string();
-            tokio::task::spawn_blocking(move || verify_raw_file_etag(&path, &expected))
+    let stream = match format {
+        BlobFormat::Nosd => {
+            let file = file.into_std().await;
+            let data_dir = ctx.data_dir.clone();
+            let reader = tokio::task::spawn_blocking(move || {
+                DedupBlobReader::from_file(file, &data_dir, logical_size, range_start, content_length)
+            })
+            .await
+            .map_err(internal)??;
+            stream_chunks(reader)
+        }
+        BlobFormat::Raw => {
+            if ctx.verify_on_read
+                && whole
+                && let Some(expected) = ctx.expected_etag.as_deref()
+            {
+                let copy = file.try_clone().await.map_err(map_io_error)?.into_std().await;
+                let expected = expected.to_string();
+                tokio::task::spawn_blocking(move || verify_raw_etag(copy, &expected))
+                    .await
+                    .map_err(internal)??;
+            }
+            file.seek(std::io::SeekFrom::Start(range_start))
                 .await
-                .map_err(internal)??;
+                .map_err(map_io_error)?;
+            let pooled = PooledFileRead::new(file, ctx.buffer_pool.clone());
+            ObjectBodyStream::PooledLimited(ReaderStream::new(LimitedAsyncRead::new(
+                pooled,
+                0,
+                content_length,
+            )))
         }
-        let stream = open_raw_file_stream(
-            blob_path,
-            range_start,
-            content_length,
-            &ctx.buffer_pool,
-            ctx.read_buffer_size,
-        )
-        .await?;
-        return Ok(GuardedObjectBodyStream {
-            stream,
-            _spill_guard: None,
-        });
-    }
-
-    if matches!(format, BlobFormat::Nosb | BlobFormat::Nosi) {
-        let path = blob_path.to_path_buf();
-        let read_ctx = IndexedReadContext {
-            dict: ctx.dict.as_ref().map(|d| d.to_vec()),
-            data_dir: ctx.data_dir.clone(),
-            block_cache: ctx.block_cache.clone(),
-        };
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-        if range_start == 0 && content_length == logical_size {
-            tokio::task::spawn_blocking(move || {
-                pump_block_blob_full(path, logical_size, read_ctx, tx)
-            });
-        } else {
-            tokio::task::spawn_blocking(move || {
-                pump_block_blob_range(path, logical_size, range_start, content_length, read_ctx, tx)
-            });
+        BlobFormat::Nosb | BlobFormat::Nosi => {
+            let file = file.into_std().await;
+            let path = blob_path.to_path_buf();
+            let read_ctx = IndexedReadContext {
+                dict: ctx.dict.clone(),
+                data_dir: ctx.data_dir.clone(),
+                block_cache: ctx.block_cache.clone(),
+            };
+            let reader = tokio::task::spawn_blocking(move || {
+                IndexedBlobReader::from_file(file, &path, logical_size, range_start, content_length, read_ctx)
+            })
+            .await
+            .map_err(internal)??;
+            stream_chunks(reader)
         }
-        return Ok(GuardedObjectBodyStream {
-            stream: ObjectBodyStream::Channel(tokio_stream::wrappers::ReceiverStream::new(rx)),
-            _spill_guard: None,
-        });
-    }
-
-    let dict = ctx.dict_bytes();
-
-    if range_start == 0 && content_length == logical_size {
-        let stream = open_full_zstd_stream(blob_path, logical_size, format, dict).await?;
-        return Ok(GuardedObjectBodyStream {
-            stream,
-            _spill_guard: None,
-        });
-    }
-
-    let spill = format!(
-        "{}/.tmp/decompress-{}.bin",
-        ctx.data_dir,
-        uuid::Uuid::new_v4()
-    );
-    let blob_path_owned = blob_path.to_path_buf();
-    let spill_path = spill.clone();
-    let dict_owned = ctx.dict.clone();
-    let data_dir = ctx.data_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        decompress_file_to_temp(
-            &blob_path_owned,
-            logical_size,
-            Path::new(&spill_path),
-            dict_owned.as_deref().map(|v| v.as_slice()),
-            Some(data_dir.as_str()),
-        )
-    })
-    .await
-    .map_err(internal)??;
-
-    let guard = SpillFileGuard {
-        path: PathBuf::from(&spill),
+        BlobFormat::Nosz | BlobFormat::Nos2 => {
+            let file = file.into_std().await;
+            let dict = ctx.dict.clone();
+            let reader = tokio::task::spawn_blocking(move || {
+                ZstdBlobReader::from_file(file, logical_size, format, dict.as_deref().map(|d| d.as_slice()))
+            })
+            .await
+            .map_err(internal)?
+            .map_err(map_io_error)?;
+            if whole {
+                stream_chunks(reader)
+            } else {
+                // Human: A legacy zstd stream can't seek, so decode up to the range and drop what precedes it —
+                // this used to decode the whole object into memory (plus a spill file) for every range request.
+                stream_chunks(RangeOf {
+                    inner: reader,
+                    skip: range_start,
+                    remaining: content_length,
+                })
+            }
+        }
     };
-    let file = File::open(&spill).await.map_err(map_io_error)?;
-    let limited = LimitedAsyncRead::new(file, range_start, content_length);
     Ok(GuardedObjectBodyStream {
-        stream: ObjectBodyStream::FileLimited(ReaderStream::new(limited)),
-        _spill_guard: Some(guard),
+        stream,
+        _spill_guard: None,
     })
 }
 
-async fn open_dedup_object_stream(
-    blob_path: &Path,
-    logical_size: u64,
-    range_start: u64,
-    content_length: u64,
-    ctx: &super::blob_finalize::ReadContext,
-) -> Result<GuardedObjectBodyStream, StorageError> {
-    let spill = format!(
-        "{}/.tmp/dedup-{}.bin",
-        ctx.data_dir,
-        uuid::Uuid::new_v4()
-    );
-    let blob_path_owned = blob_path.to_path_buf();
-    let spill_path = spill.clone();
-    let data_dir = ctx.data_dir.clone();
-    tokio::task::spawn_blocking(move || {
-        let store = BlockStore::new(&data_dir);
-        store.assemble_to_file(&blob_path_owned, Path::new(&spill_path), logical_size)
-    })
-    .await
-    .map_err(internal)??;
-
-    let guard = SpillFileGuard {
-        path: PathBuf::from(&spill),
-    };
-    let file = File::open(&spill).await.map_err(map_io_error)?;
-    let limited = LimitedAsyncRead::new(file, range_start, content_length);
-    Ok(GuardedObjectBodyStream {
-        stream: ObjectBodyStream::FileLimited(ReaderStream::new(limited)),
-        _spill_guard: Some(guard),
-    })
+/// Read until `buf` is full or the file ends (a single read may return fewer bytes).
+async fn read_up_to(file: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = file.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
 }
 
 /// Human: xxh3 hex digest of on-disk file bytes (used for scrub and wire checksum).
 /// Agent: Blocking read with configurable buffer; returns 16-char lowercase hex.
 pub fn hash_file_xxh3_hex(path: &Path, buffer_size: usize) -> Result<String, StorageError> {
-    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(map_io_error)?;
+    hash_reader_xxh3_hex(file, buffer_size)
+}
+
+/// xxh3 hex digest of everything `reader` yields.
+pub fn hash_reader_xxh3_hex(mut reader: impl Read, buffer_size: usize) -> Result<String, StorageError> {
     use xxhash_rust::xxh3::Xxh3;
 
-    let mut f = std::fs::File::open(path).map_err(map_io_error)?;
     let mut hasher = Xxh3::new();
     let mut buf = vec![0u8; buffer_size.max(4096)];
     loop {
-        let n = f.read(&mut buf).map_err(map_io_error)?;
+        let n = reader.read(&mut buf).map_err(map_io_error)?;
         if n == 0 {
             break;
         }
@@ -307,8 +271,10 @@ pub fn hash_file_xxh3_hex(path: &Path, buffer_size: usize) -> Result<String, Sto
     Ok(format!("{:016x}", hasher.digest()))
 }
 
-fn verify_raw_file_etag(path: &Path, expected: &str) -> Result<(), StorageError> {
-    let actual = hash_file_xxh3_hex(path, 256 * 1024)?;
+/// Check a raw blob, read through an open handle from its start, against its ETag.
+fn verify_raw_etag(mut file: std::fs::File, expected: &str) -> Result<(), StorageError> {
+    file.seek(std::io::SeekFrom::Start(0)).map_err(map_io_error)?;
+    let actual = hash_reader_xxh3_hex(file, 256 * 1024)?;
     if actual != expected {
         return Err(internal(anyhow::anyhow!("raw blob etag mismatch on read")));
     }
@@ -317,7 +283,7 @@ fn verify_raw_file_etag(path: &Path, expected: &str) -> Result<(), StorageError>
 
 /// Human: AsyncRead that serves file bytes using a pooled buffer (fewer allocations on GET).
 /// Agent: WRAPS File; refills pooled cache; copies into caller ReadBuf per poll.
-pub(crate) struct PooledFileRead {
+pub struct PooledFileRead {
     file: File,
     pool: BufferPool,
     cache: Vec<u8>,
@@ -391,111 +357,240 @@ impl Drop for PooledFileRead {
     }
 }
 
-async fn open_raw_file_stream(
-    blob_path: &Path,
-    range_start: u64,
-    content_length: u64,
-    pool: &BufferPool,
-    _read_buffer_size: usize,
-) -> Result<ObjectBodyStream, StorageError> {
-    let file = File::open(blob_path).await.map_err(map_io_error)?;
-    let pooled = PooledFileRead::new(file, pool.clone());
-    let limited = LimitedAsyncRead::new(pooled, range_start, content_length);
-    Ok(ObjectBodyStream::PooledLimited(ReaderStream::new(limited)))
+/// Human: A blocking reader of an object's bytes that can be stepped one chunk at a time.
+trait ChunkSource: Send + 'static {
+    /// The next chunk, or `None` at the end.
+    fn read_chunk(&mut self) -> std::io::Result<Option<Bytes>>;
 }
 
-async fn open_full_zstd_stream(
-    blob_path: &Path,
-    logical_size: u64,
-    format: BlobFormat,
-    dict: Option<&[u8]>,
-) -> Result<ObjectBodyStream, StorageError> {
-    let path = blob_path.to_path_buf();
-    let dict_vec = dict.map(|d| d.to_vec());
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
-    tokio::task::spawn_blocking(move || {
-        pump_zstd_decode(path, logical_size, format, dict_vec, tx)
-    });
-    Ok(ObjectBodyStream::Channel(
-        tokio_stream::wrappers::ReceiverStream::new(rx),
-    ))
+impl ChunkSource for IndexedBlobReader {
+    fn read_chunk(&mut self) -> std::io::Result<Option<Bytes>> {
+        self.next_chunk()
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
 }
 
-fn pump_zstd_decode(
-    blob_path: PathBuf,
-    logical_size: u64,
-    format: BlobFormat,
-    dict: Option<Vec<u8>>,
-    tx: tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
-) {
-    let mut file = match std::fs::File::open(&blob_path) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(e));
-            return;
-        }
-    };
-    let stored = match read_blob_header_size(
-        file.try_clone()
-            .unwrap_or_else(|_| std::fs::File::open(&blob_path).expect("reopen blob")),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.blocking_send(Err(std::io::Error::other(e.to_string())));
-            return;
-        }
-    };
-    if stored != logical_size {
-        let _ = tx.blocking_send(Err(std::io::Error::other("blob header size mismatch")));
-        return;
-    }
-    let header_len = match format {
-        BlobFormat::Nosz => HEADER_LEN,
-        BlobFormat::Nos2 => HEADER_LEN_V2,
-        _ => {
-            let _ = tx.blocking_send(Err(std::io::Error::other("not a zstd blob")));
-            return;
-        }
-    };
-    if file
-        .seek(std::io::SeekFrom::Start(header_len as u64))
-        .is_err()
-    {
-        let _ = tx.blocking_send(Err(std::io::Error::other("seek past header failed")));
-        return;
-    }
-    let reader = std::io::BufReader::new(file);
-    let mut decoder = if let Some(ref d) = dict.filter(|d| !d.is_empty()) {
-        match zstd::stream::read::Decoder::with_dictionary(reader, d) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(e));
+/// Decoded chunks (blocks, up to 1 MiB by default) a download may read ahead of its client — the memory a
+/// stalled download holds here, on top of the chunk the HTTP layer is writing.
+const READ_AHEAD: usize = 2;
+
+/// Chunks one blocking step may read before handing its thread back, so a download that keeps pace with the
+/// decoder doesn't hold a pool thread for its whole transfer while fsyncs and uploads queue behind it.
+const CHUNKS_PER_STEP: usize = 16;
+
+type ChunkSender = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+type ChunkPermit = tokio::sync::mpsc::OwnedPermit<Result<Bytes, std::io::Error>>;
+
+/// Human: Stream a blocking source without tying a blocking-pool thread to the client. A blocking step reads
+/// while the channel has room and hands its thread back once the channel is full; the pump then waits for the
+/// client asynchronously. The old pumps parked a thread per download until the client had read everything, so
+/// a few hundred slow downloads exhausted the pool and stalled all file I/O in the process.
+/// Agent: fast clients keep one step running continuously (no per-chunk handoff); the pump ends when the
+/// response body (receiver) is dropped.
+fn stream_chunks(source: impl ChunkSource) -> ObjectBodyStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(READ_AHEAD);
+    tokio::spawn(async move {
+        let errors = tx.clone();
+        let (mut source, mut tx) = (source, tx);
+        loop {
+            let Ok(permit) = tx.reserve_owned().await else {
                 return;
-            }
-        }
-    } else {
-        match zstd::stream::read::Decoder::with_buffer(reader) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = tx.blocking_send(Err(e));
-                return;
-            }
-        }
-    };
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        match decoder.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if tx.blocking_send(Ok(Bytes::copy_from_slice(&buf[..n]))).is_err() {
+            };
+            match tokio::task::spawn_blocking(move || fill_while_room(source, permit)).await {
+                Ok((returned, Some(sender))) => (source, tx) = (returned, sender),
+                Ok((_, None)) => return,
+                Err(e) => {
+                    let _ = errors.send(Err(std::io::Error::other(e))).await;
                     return;
                 }
             }
-            Err(e) => {
-                let _ = tx.blocking_send(Err(e));
-                return;
-            }
         }
+    });
+    ObjectBodyStream::Channel(tokio_stream::wrappers::ReceiverStream::new(rx))
+}
+
+/// Human: Read chunks into the channel until it is full (or CHUNKS_PER_STEP were read), then give the thread back.
+/// Agent: RETURNS the sender to wait for room with, or None once the stream is over (end, error, or the
+/// receiver was dropped).
+fn fill_while_room<S: ChunkSource>(mut source: S, mut permit: ChunkPermit) -> (S, Option<ChunkSender>) {
+    use tokio::sync::mpsc::error::TrySendError;
+    for _ in 0..CHUNKS_PER_STEP {
+        let sender = match source.read_chunk() {
+            Ok(Some(chunk)) => permit.send(Ok(chunk)),
+            Ok(None) => return (source, None),
+            Err(e) => {
+                permit.send(Err(e));
+                return (source, None);
+            }
+        };
+        permit = match sender.try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(TrySendError::Full(sender)) => return (source, Some(sender)),
+            Err(TrySendError::Closed(_)) => return (source, None),
+        };
+    }
+    // Human: Dropping the unused permit frees its slot; the pump reserves again before the next step.
+    let sender = permit.release();
+    (source, Some(sender))
+}
+
+/// Human: `remaining` bytes of a source after dropping its first `skip` bytes (ranges of unseekable streams).
+struct RangeOf<S> {
+    inner: S,
+    skip: u64,
+    remaining: u64,
+}
+
+impl<S: ChunkSource> ChunkSource for RangeOf<S> {
+    fn read_chunk(&mut self) -> std::io::Result<Option<Bytes>> {
+        while self.remaining > 0 {
+            let Some(mut chunk) = self.inner.read_chunk()? else {
+                return Err(std::io::Error::other("stream ended before the requested range"));
+            };
+            if self.skip >= chunk.len() as u64 {
+                self.skip -= chunk.len() as u64;
+                continue;
+            }
+            let mut tail = chunk.split_off(self.skip as usize);
+            self.skip = 0;
+            tail.truncate(tail.len().min(self.remaining as usize));
+            self.remaining -= tail.len() as u64;
+            return Ok(Some(tail));
+        }
+        Ok(None)
+    }
+}
+
+/// Human: A legacy NOSD dedup manifest, served one referenced block at a time; a range starts at the block that
+/// holds its first byte. This used to rebuild the whole object in a spill file for every GET, ranges included.
+struct DedupBlobReader {
+    store: BlockStore,
+    blocks: std::vec::IntoIter<(u64, u32)>,
+    skip: usize,
+    remaining: u64,
+}
+
+impl DedupBlobReader {
+    fn from_file(
+        mut file: std::fs::File,
+        data_dir: &str,
+        logical_size: u64,
+        range_start: u64,
+        length: u64,
+    ) -> Result<Self, StorageError> {
+        file.seek(std::io::SeekFrom::Start(0)).map_err(map_io_error)?;
+        let mut manifest = Vec::new();
+        file.read_to_end(&mut manifest).map_err(map_io_error)?;
+        let mut blocks = super::compression::parse_dedup_manifest(&manifest, logical_size)?;
+        let mut offset = 0u64;
+        let first = blocks
+            .iter()
+            .position(|(_, size)| {
+                let end = offset + u64::from(*size);
+                let holds_start = range_start < end;
+                if !holds_start {
+                    offset = end;
+                }
+                holds_start
+            })
+            .unwrap_or(blocks.len());
+        Ok(Self {
+            store: BlockStore::new(data_dir),
+            blocks: {
+                blocks.drain(..first);
+                blocks.into_iter()
+            },
+            skip: (range_start - offset) as usize,
+            remaining: length,
+        })
+    }
+}
+
+impl ChunkSource for DedupBlobReader {
+    fn read_chunk(&mut self) -> std::io::Result<Option<Bytes>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        let (hash, size) = self
+            .blocks
+            .next()
+            .ok_or_else(|| std::io::Error::other("dedup manifest ends before the requested range"))?;
+        let block = self
+            .store
+            .read_logical_block(hash, size as usize)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let start = std::mem::take(&mut self.skip).min(block.len());
+        let take = ((block.len() - start) as u64).min(self.remaining) as usize;
+        self.remaining -= take as u64;
+        Ok(Some(if start == 0 && take == block.len() {
+            Bytes::from(block)
+        } else {
+            Bytes::copy_from_slice(&block[start..start + take])
+        }))
+    }
+}
+
+/// Human: A legacy NOSZ/NOS2 blob, decoded as one zstd stream in 256 KiB steps.
+/// Agent: Errors if the stream ends short of, or runs past, the object's logical size.
+struct ZstdBlobReader {
+    decoder: zstd::stream::read::Decoder<'static, std::io::BufReader<std::fs::File>>,
+    buf: Vec<u8>,
+    remaining: u64,
+}
+
+impl ZstdBlobReader {
+    fn from_file(
+        mut file: std::fs::File,
+        logical_size: u64,
+        format: BlobFormat,
+        dict: Option<&[u8]>,
+    ) -> std::io::Result<Self> {
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let stored = read_blob_header_size(file.try_clone()?)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if stored != logical_size {
+            return Err(std::io::Error::other("blob header size mismatch"));
+        }
+        let header_len = match format {
+            BlobFormat::Nosz => HEADER_LEN,
+            BlobFormat::Nos2 => HEADER_LEN_V2,
+            _ => return Err(std::io::Error::other("not a zstd blob")),
+        };
+        // Human: The frame header names the dictionary it was compressed with (18 bytes is its longest form).
+        file.seek(std::io::SeekFrom::Start(header_len as u64))?;
+        let mut frame_head = Vec::with_capacity(18);
+        (&mut file).take(18).read_to_end(&mut frame_head)?;
+        file.seek(std::io::SeekFrom::Start(header_len as u64))?;
+        let dict = crate::storage::dict_store::dictionary_for_frame(&frame_head, dict)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let reader = std::io::BufReader::new(file);
+        let decoder = match dict {
+            Some(d) => zstd::stream::read::Decoder::with_dictionary(reader, &d)?,
+            None => zstd::stream::read::Decoder::with_buffer(reader)?,
+        };
+        Ok(Self {
+            decoder,
+            buf: vec![0u8; 256 * 1024],
+            remaining: logical_size,
+        })
+    }
+}
+
+impl ChunkSource for ZstdBlobReader {
+    fn read_chunk(&mut self) -> std::io::Result<Option<Bytes>> {
+        let n = self.decoder.read(&mut self.buf)?;
+        if n == 0 {
+            return if self.remaining == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::Error::other("zstd stream ended before the object's size"))
+            };
+        }
+        if n as u64 > self.remaining {
+            return Err(std::io::Error::other("zstd stream is longer than the object"));
+        }
+        self.remaining -= n as u64;
+        Ok(Some(Bytes::copy_from_slice(&self.buf[..n])))
     }
 }
 
@@ -522,8 +617,40 @@ pub async fn read_multipart_blob_field(
     Ok((data, format!("{:016x}", hasher.digest())))
 }
 
+/// Human: Stream a multipart file field into `dest` while hashing it, so replicated objects of any size never
+/// sit in memory. `max_len` (the event's declared size, when known first) stops oversized bodies early.
+/// Agent: RETURNS (bytes written, xxh3 hex); caller owns `dest` cleanup.
+pub async fn receive_multipart_blob_field(
+    field: axum::extract::multipart::Field<'_>,
+    dest: &Path,
+    max_len: Option<u64>,
+) -> Result<(u64, String), StorageError> {
+    use futures_util::{StreamExt, TryStreamExt};
+    use xxhash_rust::xxh3::Xxh3;
+
+    let mut file = fs::File::create(dest).await.map_err(map_io_error)?;
+    let mut hasher = Xxh3::new();
+    let mut written = 0u64;
+    let mut stream = field.into_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| internal(anyhow::anyhow!(e)))?;
+        written += chunk.len() as u64;
+        if max_len.is_some_and(|max| written > max) {
+            return Err(internal(anyhow::anyhow!("replication payload larger than its event size")));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(map_io_error)?;
+    }
+    file.flush().await.map_err(map_io_error)?;
+    Ok((written, format!("{:016x}", hasher.digest())))
+}
+
 pub fn verify_wire_checksum(bytes: &[u8], expected: &str) -> Result<(), StorageError> {
     use xxhash_rust::xxh3::xxh3_64;
+    // Human: Objects without an ETag (e.g. copies of legacy rows) carry no checksum to compare.
+    if expected.is_empty() {
+        return Ok(());
+    }
     let actual = format!("{:016x}", xxh3_64(bytes));
     if actual != expected {
         return Err(internal(anyhow::anyhow!("replication wire checksum mismatch")));
@@ -572,4 +699,174 @@ pub fn hash_temp_file(tmp_path: &Path, buffer_size: usize) -> Result<(u64, Strin
     Ok((total_size, format!("{:016x}", hasher.digest())))
 }
 
-pub use super::blob_finalize::{finalize_temp_to_blob, BlobFinalizeOptions, ReadContext};
+#[allow(deprecated)]
+pub use super::blob_finalize::finalize_temp_to_blob;
+pub use super::blob_finalize::{stage_temp_blob, BlobFinalizeOptions, ReadContext, StagedBlob};
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use futures_util::StreamExt;
+
+    use super::*;
+    use crate::storage::blob_finalize::ReadContext;
+    use crate::storage::compressibility::{CompressionContext, DEFAULT_MIN_COMPRESSIBLE_SIZE};
+    use crate::storage::compression::{compress_blob, is_indexed_blob, EncodeOptions};
+
+    fn legacy_zstd_blob(logical: &[u8], header_size: u64) -> Vec<u8> {
+        let mut blob = crate::storage::compression::BLOB_MAGIC.to_vec();
+        blob.extend_from_slice(&header_size.to_le_bytes());
+        blob.extend_from_slice(&zstd::encode_all(logical, 1).unwrap());
+        blob
+    }
+
+    async fn collect(mut body: GuardedObjectBodyStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn dedup_manifests_stream_block_by_block() {
+        use crate::storage::blocks::BlockStore;
+        use crate::storage::compression::DEDUP_MAGIC;
+
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_string_lossy().to_string();
+        let store = BlockStore::new(&data_dir);
+        let blocks: [&[u8]; 3] = [b"hello", b" dedup ", b"blocks"];
+        let logical: Vec<u8> = blocks.concat();
+        let mut manifest = DEDUP_MAGIC.to_vec();
+        manifest.extend_from_slice(&(logical.len() as u64).to_le_bytes());
+        manifest.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        for block in blocks {
+            let hash = store.write_logical_block(block, 3).unwrap();
+            manifest.extend_from_slice(&hash.to_le_bytes());
+            manifest.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        }
+        let path = dir.path().join("manifest");
+        std::fs::write(&path, &manifest).unwrap();
+        let ctx = ReadContext::for_data_dir(&data_dir);
+        let size = logical.len() as u64;
+        for (start, len) in [(0, size), (5, 7), (3, 6), (12, 6), (size - 1, 1)] {
+            let body = open_object_body_stream(&path, size, start, len, &ctx).await.unwrap();
+            assert_eq!(collect(body).await, logical[start as usize..(start + len) as usize], "range {start}+{len}");
+        }
+
+        // Human: A damaged block fails the read instead of being served.
+        let damaged = store.block_path(BlockStore::hash_block(b" dedup "));
+        std::fs::write(&damaged, b" DEDUP ").unwrap();
+        let mut body = open_object_body_stream(&path, size, 0, size, &ctx).await.unwrap();
+        let mut failed = false;
+        while let Some(chunk) = body.next().await {
+            failed |= chunk.is_err();
+        }
+        assert!(failed);
+    }
+
+    #[tokio::test]
+    async fn legacy_zstd_ranges_stream_without_a_spill_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".tmp")).unwrap();
+        let logical: Vec<u8> = (0..700_000u32).map(|i| (i % 251) as u8).collect();
+        let size = logical.len() as u64;
+        let path = dir.path().join("legacy");
+        std::fs::write(&path, legacy_zstd_blob(&logical, size)).unwrap();
+        let ctx = ReadContext::for_data_dir(&dir.path().to_string_lossy());
+        // Human: Ranges inside, across and exactly on the decoder's 256 KiB chunk boundaries, and at the end.
+        for (start, len) in [(0, 10), (5, 300_000), (262_143, 2), (262_144, 262_144), (699_000, 1_000)] {
+            let body = open_object_body_stream(&path, size, start, len, &ctx).await.unwrap();
+            assert!(
+                collect(body).await == logical[start as usize..(start + len) as usize],
+                "range {start}+{len}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(dir.path().join(".tmp")).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_zstd_stream_shorter_than_its_header_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy");
+        std::fs::write(&path, legacy_zstd_blob(&[7u8; 900], 1_000)).unwrap();
+        let ctx = ReadContext::for_data_dir(&dir.path().to_string_lossy());
+        let mut body = open_object_body_stream(&path, 1_000, 0, 1_000, &ctx).await.unwrap();
+        let mut got = 0;
+        let mut failed = false;
+        while let Some(chunk) = body.next().await {
+            match chunk {
+                Ok(c) => got += c.len(),
+                Err(_) => failed = true,
+            }
+        }
+        assert!(failed, "a short stream must end in an error, not a silently short body ({got} bytes)");
+
+        // Human: A header that disagrees with the metadata is refused before any byte is sent.
+        assert!(open_object_body_stream(&path, 999, 0, 999, &ctx).await.is_err());
+    }
+
+    /// Human: Downloads whose clients stop reading must not pin blocking-pool threads: with the pool
+    /// exhausted, every file operation in the process (uploads, fsync, tokio::fs) waits behind them.
+    #[test]
+    fn stalled_downloads_leave_the_blocking_pool_free() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let payload: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+            let ctx = CompressionContext::new(
+                Some("data/log.txt"),
+                Some("text/plain"),
+                payload.len() as u64,
+                DEFAULT_MIN_COMPRESSIBLE_SIZE,
+                &[],
+            );
+            let blob = compress_blob(&payload, 1, 16 * 1024, ctx, EncodeOptions::default()).unwrap();
+            assert!(is_indexed_blob(&blob));
+            let indexed = dir.path().join("indexed");
+            std::fs::write(&indexed, &blob).unwrap();
+            let legacy = dir.path().join("legacy");
+            std::fs::write(&legacy, legacy_zstd_blob(&payload, payload.len() as u64)).unwrap();
+            let read_ctx = ReadContext::for_data_dir(&dir.path().to_string_lossy());
+            let size = payload.len() as u64;
+
+            // Human: Three downloads (full, range, legacy zstd) on a pool of two threads, none of them read.
+            let mut stalled = Vec::new();
+            for (path, start, len) in [(&indexed, 0, size), (&indexed, 1_000, size - 2_000), (&legacy, 0, size)] {
+                let (body, first) = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut body = open_object_body_stream(path, size, start, len, &read_ctx)
+                        .await
+                        .unwrap();
+                    let first = body.next().await.unwrap().unwrap();
+                    (body, first)
+                })
+                .await
+                .expect("blocking pool exhausted by stalled downloads");
+                stalled.push((body, start, first));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+
+            let other = tokio::time::timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| 7)).await;
+            assert_eq!(
+                other.expect("blocking pool exhausted by two stalled downloads").unwrap(),
+                7
+            );
+
+            for (mut body, start, first) in stalled {
+                let mut got = first.to_vec();
+                while let Some(chunk) = body.next().await {
+                    got.extend_from_slice(&chunk.unwrap());
+                }
+                assert_eq!(got.len(), (size - 2 * start) as usize);
+                assert_eq!(&got[..], &payload[start as usize..(size - start) as usize]);
+            }
+        });
+    }
+}

@@ -28,8 +28,9 @@ pub struct ClusterConfigSnapshot {
     pub replication_group: String,
     #[serde(default = "default_replication_role")]
     pub replication_role: String,
-    #[serde(default = "default_replication_factor")]
-    pub replication_factor: u32,
+    /// Copies to keep, this node's included; absent = the mode's default (`ClusterMode::default_replication_factor`).
+    #[serde(default)]
+    pub replication_factor: Option<u32>,
     #[serde(default)]
     pub replication_read_repair: bool,
     #[serde(default = "default_true")]
@@ -65,9 +66,6 @@ fn default_replication_group() -> String {
 fn default_replication_role() -> String {
     "member".into()
 }
-fn default_replication_factor() -> u32 {
-    1
-}
 fn default_storage_class() -> String {
     "default".into()
 }
@@ -86,6 +84,13 @@ pub struct ClusterPeerSnapshot {
 }
 
 impl ClusterConfigSnapshot {
+    /// The replication factor in effect: the configured one, else the mode's default.
+    pub fn effective_replication_factor(&self) -> u32 {
+        self.replication_factor.unwrap_or_else(|| {
+            ClusterMode::parse(&self.mode).map_or(1, ClusterMode::default_replication_factor)
+        })
+    }
+
     pub fn into_cluster_config(self) -> Result<ClusterConfig> {
         let mode = ClusterMode::parse(&self.mode)?;
         if mode == ClusterMode::Standalone {
@@ -125,7 +130,7 @@ impl ClusterConfigSnapshot {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| node_id.clone());
 
-        Ok(ClusterConfig {
+        let config = ClusterConfig {
             mode,
             node_id,
             instance_id,
@@ -135,7 +140,9 @@ impl ClusterConfigSnapshot {
             storage_classes,
             replication_group: self.replication_group,
             replication_role: self.replication_role,
-            replication_factor: self.replication_factor,
+            replication_factor: self
+                .replication_factor
+                .unwrap_or(mode.default_replication_factor()),
             replication_pending_events: 0,
             replication_read_repair: self.replication_read_repair,
             replication_heal_on_read: self.replication_heal_on_read,
@@ -147,7 +154,14 @@ impl ClusterConfigSnapshot {
             default_storage_class: self.default_storage_class,
             assignment_rules_raw,
             assignment_forward: self.assignment_forward,
-        })
+        };
+        // Human: Reject what building the backend would reject — at startup that used to stop the server, and
+        // `PUT /_cluster/config` saved it first.
+        config.peer_registry()?;
+        if config.mode_includes_assignment() {
+            config.assignment_rules()?;
+        }
+        Ok(config)
     }
 
     pub fn from_config(cfg: &ClusterConfig) -> Result<Self> {
@@ -192,7 +206,7 @@ impl ClusterConfigSnapshot {
             storage_classes: cfg.storage_classes.clone(),
             replication_group: cfg.replication_group.clone(),
             replication_role: cfg.replication_role.clone(),
-            replication_factor: cfg.replication_factor,
+            replication_factor: Some(cfg.replication_factor),
             replication_read_repair: cfg.replication_read_repair,
             replication_heal_on_read: cfg.replication_heal_on_read,
             replication_async: cfg.replication_async,

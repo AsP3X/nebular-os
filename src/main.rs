@@ -1,11 +1,8 @@
 use std::sync::Arc;
-use std::time::Duration;
 
-use nebular_os::{cluster, config, observability::NosMetrics, secrets, server, storage};
+use nebular_os::{background_jobs, cluster, config, observability::NosMetrics, secrets, server, storage};
 
 use anyhow::Result;
-use axum::serve;
-use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -24,6 +21,7 @@ async fn main() -> Result<()> {
     }
 
     tracing::info!(?cfg, "Configuration loaded (env)");
+    warn_about_access_key_settings(&cfg);
 
     let engine_opts = storage::engine::EngineOptions {
         upload_buffer_size: cfg.upload_buffer_size,
@@ -52,11 +50,13 @@ async fn main() -> Result<()> {
         compress_block_size: cfg.compress_block_size,
         compress_exclude_extensions: cfg.compress_exclude_extensions.clone(),
         block_cache_entries: cfg.block_cache_entries,
+        block_cache_max_bytes: cfg.block_cache_max_bytes,
         verify_batch_size: cfg.verify_batch_size,
         scrub_sample_denom: cfg.scrub_sample_denom,
         scrub_mode_light: cfg.scrub_mode_light,
         verify_on_read: cfg.verify_on_read,
         read_buffer_size: cfg.read_buffer_size,
+        fsync_writes: cfg.fsync_writes,
     };
 
     let storage = storage::engine::StorageEngine::with_full_options(
@@ -75,12 +75,33 @@ async fn main() -> Result<()> {
                     node_id = %loaded.node_id,
                     "Loaded persisted cluster configuration"
                 );
+                if !cfg.cluster.is_standalone() {
+                    tracing::warn!(
+                        env_mode = cfg.cluster.mode.as_str(),
+                        "the cluster configuration saved through PUT /_cluster/config replaces the NOS_CLUSTER_* \
+                         environment settings; change it through that API"
+                    );
+                }
                 cfg.cluster = loaded;
             }
             Err(e) => {
                 tracing::error!(error = %e, "Ignoring invalid persisted cluster config");
             }
         }
+    }
+
+    if !cfg.cluster.is_standalone() {
+        tracing::warn!(
+            mode = cfg.cluster.mode.as_str(),
+            "cluster modes are experimental: replication is asynchronous, and nodes writing the same key \
+             converge on the last write by wall-clock time (keep node clocks synchronized)"
+        );
+    }
+    if cfg.cluster.mode_includes_replication() && cfg.cluster.replication_factor <= 1 {
+        tracing::warn!(
+            "replication factor 1 keeps no copies on peers: writes here are not replicated; set \
+             NOS_REPLICATION_FACTOR (or replication_factor) to 2 or more"
+        );
     }
 
     let cfg = Arc::new(cfg);
@@ -90,142 +111,68 @@ async fn main() -> Result<()> {
         tracing::info!(?report, "Startup reconciliation finished");
     }
 
-    if cfg.recompress_on_startup {
-        let engine = storage.clone();
-        let batch = cfg.recompress_batch_size;
-        let dict = cfg.zstd_dict_enabled;
-        tokio::spawn(async move {
-            match engine.recompress_blobs(batch).await {
-                Ok(report) => tracing::info!(?report, "Background startup blob recompression finished"),
-                Err(e) => tracing::error!(error = %e, "Background startup blob recompression failed"),
-            }
-            if dict {
-                match engine.train_zstd_dictionary().await {
-                    Ok(report) => tracing::info!(?report, "Background startup dictionary training finished"),
-                    Err(e) => tracing::error!(error = %e, "Background startup dictionary training failed"),
-                }
-            }
-        });
-    }
-
-    if cfg.reconcile_interval_secs > 0 {
-        let engine = storage.clone();
-        let interval = cfg.reconcile_interval_secs;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(interval));
-            loop {
-                ticker.tick().await;
-                match engine.reconcile().await {
-                    Ok(report) => tracing::info!(?report, "Periodic reconciliation finished"),
-                    Err(e) => tracing::error!(error = %e, "Periodic reconciliation failed"),
-                }
-            }
-        });
-    }
-
     let metrics = NosMetrics::new();
     let backend = cluster::build_backend(storage.clone(), &cfg.cluster, metrics.clone())?;
-    spawn_storage_maintenance(storage.clone(), backend.clone(), cfg.clone());
+    background_jobs::spawn_background_jobs(storage.clone(), backend.clone(), cfg.clone());
 
     let app = server::create_app(backend, storage, cfg.clone(), metrics).await?;
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     tracing::info!("Listening on {}", cfg.bind_addr);
 
-    // Human: Expose peer IP to rate-limit middleware via ConnectInfo<SocketAddr>.
-    // Agent: into_make_service_with_connect_info; REQUIRED for per-IP NOS_RATE_LIMIT_RPS.
-    serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    // Human: Serves with connection timeouts and limits, exposing the peer IP (ConnectInfo) to the rate limiter,
+    // until SIGTERM or Ctrl-C; then requests in progress get NOS_SHUTDOWN_GRACE_SECS to finish.
+    server::serve_until(listener, app, server::ServeOptions::from_config(&cfg), shutdown_signal()).await?;
+    tracing::info!("Server stopped");
     Ok(())
 }
 
-fn spawn_storage_maintenance(
-    storage: storage::StorageEngine,
-    backend: cluster::StorageBackend,
-    cfg: Arc<config::NosConfig>,
-) {
-    let purge_soft = cfg.soft_delete_ttl_secs > 0;
-    let purge_multipart = cfg.multipart_upload_ttl_secs > 0;
-    let recompress = cfg.recompress_interval_secs > 0;
-    let verify = cfg.verify_interval_secs > 0;
-    let orphan_gc = cfg.orphan_gc_interval_secs > 0;
-    // Human: Always run — interrupted video PUTs leave `{data_dir}/.tmp/*.tmp` even when other GC is off.
-
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(300));
-        let mut orphan_ticker = orphan_gc
-            .then(|| tokio::time::interval(Duration::from_secs(cfg.orphan_gc_interval_secs)));
-        loop {
-            ticker.tick().await;
-            if purge_soft {
-                match storage.purge_soft_deleted().await {
-                    Ok(n) if n > 0 => tracing::info!(purged = n, "Soft-delete purge completed"),
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "Soft-delete purge failed"),
-                }
+/// Human: Resolves on Ctrl-C (SIGINT) or SIGTERM — what `docker stop` and orchestrators send. As PID 1 in a
+/// container the server ignored SIGTERM, so every stop waited out the kill timeout and cut requests off.
+/// Agent: SIGTERM (unix only) | Ctrl-C; a listener that can't be installed waits forever, leaving the other.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
             }
-            if purge_multipart {
-                match storage.purge_stale_multipart_uploads().await {
-                    Ok(n) if n > 0 => {
-                        tracing::info!(purged = n, "Stale multipart upload purge completed")
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "Stale multipart upload purge failed"),
-                }
-            }
-            match storage
-                .purge_stale_tmp_files(Duration::from_secs(3600))
-                .await
-            {
-                Ok(n) if n > 0 => {
-                    tracing::info!(purged = n, "Stale .tmp upload scratch files removed")
-                }
-                Ok(_) => {}
-                Err(e) => tracing::error!(error = %e, "Stale .tmp purge failed"),
-            }
-            if recompress {
-                match storage.recompress_blobs(cfg.recompress_batch_size).await {
-                    Ok(report) if report.recompressed > 0 => {
-                        tracing::info!(?report, "Periodic blob recompression finished")
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "Blob recompression failed"),
-                }
-                if cfg.zstd_dict_enabled {
-                    match storage.train_zstd_dictionary().await {
-                        Ok(report) if report.trained => {
-                            tracing::info!(?report, "Periodic dictionary training finished")
-                        }
-                        Ok(_) => {}
-                        Err(e) => tracing::error!(error = %e, "Dictionary training failed"),
-                    }
-                }
-            }
-            if verify {
-                match backend.scrub_with_defaults(cfg.verify_batch_size).await {
-                    Ok(report) if report.corrupted > 0 => {
-                        tracing::warn!(?report, "Periodic blob integrity verification found issues")
-                    }
-                    Ok(report) if report.verified > 0 => {
-                        tracing::debug!(?report, "Periodic blob integrity verification finished")
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "Blob integrity verification failed"),
-                }
-            }
-            if let Some(t) = orphan_ticker.as_mut() {
-                t.tick().await;
-                match storage.gc_orphan_blobs(None, None, 500).await {
-                    Ok(report) if report.removed > 0 => {
-                        tracing::info!(?report, "Periodic orphan GC completed")
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::error!(error = %e, "Periodic orphan GC failed"),
-                }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await;
             }
         }
-    });
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "cannot listen for Ctrl-C");
+                std::future::pending::<()>().await;
+            }
+        }
+        () = terminate => {}
+    }
+    tracing::info!("Shutdown requested");
+}
+
+/// Human: Access-key settings that start fine but leave a gap: the replayable legacy scheme, half a key pair,
+/// or a secret short enough to guess.
+fn warn_about_access_key_settings(cfg: &config::NosConfig) {
+    match (&cfg.s3_access_key, &cfg.s3_secret_key) {
+        (Some(_), None) | (None, Some(_)) => tracing::warn!(
+            "only one of NOS_S3_ACCESS_KEY / NOS_S3_SECRET_KEY is set; access-key authentication is disabled"
+        ),
+        (Some(_), Some(secret)) if secret.len() < 16 => {
+            tracing::warn!("NOS_S3_SECRET_KEY is shorter than 16 characters; use a long random secret")
+        }
+        _ => {}
+    }
+    if cfg.legacy_access_key_auth {
+        tracing::warn!(
+            "NOS_LEGACY_ACCESS_KEY_AUTH is on: `NOS` signatures cover only method and bucket and never expire; \
+             move clients to SigV4 and turn it off"
+        );
+    }
 }

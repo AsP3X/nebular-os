@@ -38,8 +38,10 @@ impl UploadBudget {
         self.in_flight.load(Ordering::Relaxed)
     }
 
+    /// Human: Charge is capped at the whole budget, so an upload larger than the budget still runs
+    /// when nothing else is in flight (it then holds the full budget until it finishes).
     pub fn try_acquire(&self, bytes: u64) -> Option<UploadPermitGuard<'_>> {
-        let need = self.permits_for(bytes);
+        let need = self.permits_for(bytes).min(self.max_bytes);
         loop {
             let current = self.in_flight.load(Ordering::Relaxed);
             if current.saturating_add(need) > self.max_bytes {
@@ -124,4 +126,29 @@ pub async fn upload_budget_middleware(
 
 pub fn default_retry_after() -> Duration {
     Duration::from_secs(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn oversized_upload_admitted_when_idle() {
+        let budget = UploadBudget::new(32 * MIB, 5 * MIB);
+        let guard = budget.try_acquire(100 * MIB).expect("idle budget must admit");
+        assert_eq!(budget.in_flight_bytes(), 32 * MIB);
+        assert!(budget.try_acquire(1).is_none(), "full budget must refuse others");
+        drop(guard);
+        assert_eq!(budget.in_flight_bytes(), 0);
+    }
+
+    #[test]
+    fn oversized_upload_refused_while_others_in_flight() {
+        let budget = UploadBudget::new(32 * MIB, 5 * MIB);
+        let _small = budget.try_acquire(MIB).unwrap();
+        assert!(budget.try_acquire(100 * MIB).is_none());
+        assert!(budget.try_acquire(10 * MIB).is_some());
+    }
 }

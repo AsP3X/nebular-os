@@ -18,6 +18,14 @@ pub struct WriteContext {
     pub authorization: Option<String>,
     /// Optional override for replication peer group selection (`x-nd-replication-group`).
     pub replication_group_header: Option<String>,
+    /// Another node forwarded this request (`x-nd-forwarded`): handle it here, never forward it again.
+    pub forwarded: bool,
+}
+
+impl WriteContext {
+    pub fn is_forwarded(ctx: Option<&Self>) -> bool {
+        ctx.is_some_and(|c| c.forwarded)
+    }
 }
 
 /// Human: Replication group for enqueue/worker — header wins over NOS_REPLICATION_GROUP.

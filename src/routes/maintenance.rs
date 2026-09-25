@@ -131,6 +131,7 @@ pub async fn verify_blobs(
     let opts = crate::storage::scrub::ScrubOptions {
         limit,
         sample_denom,
+        sample_epoch: 0,
         mode,
         start_after: query.start_after,
     };
@@ -202,6 +203,27 @@ pub async fn migrate_blobs(
         .migrate_blobs(limit, query.start_after.as_deref())
         .await
     {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => {
+            let (status, json) = crate::routes::errors::map_storage_error(e);
+            (status, json).into_response()
+        }
+    }
+}
+
+/// Human: Train a new zstd dictionary from current objects. New writes use it and recompression moves
+/// existing blobs to it over time; blobs compressed with earlier dictionaries stay readable.
+/// Agent: POST /_nos/maintenance/train_dictionary; admin JWT; 400 when NOS_ZSTD_DICT_ENABLED is off.
+pub async fn train_dictionary(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let claims = req.extensions().get::<Claims>();
+    if let Err(resp) = require_admin(claims) {
+        return resp.into_response();
+    }
+
+    match state.engine().retrain_zstd_dictionary().await {
         Ok(report) => Json(report).into_response(),
         Err(e) => {
             let (status, json) = crate::routes::errors::map_storage_error(e);

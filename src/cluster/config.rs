@@ -16,6 +16,17 @@ pub enum ClusterMode {
 }
 
 impl ClusterMode {
+    /// True for the modes that copy writes to peers.
+    pub fn replicates(self) -> bool {
+        matches!(self, Self::Replicated | Self::ReplicatedAssigned)
+    }
+
+    /// Human: Copies kept by default, this node's included: two in replicating modes — one used to mean that a
+    /// node in `replicated` mode quietly copied nothing to its peers.
+    pub fn default_replication_factor(self) -> u32 {
+        if self.replicates() { 2 } else { 1 }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Standalone => "standalone",
@@ -116,10 +127,7 @@ impl ClusterConfig {
     /// Human: True when this node should replicate writes to peers.
     /// Agent: Replicated or ReplicatedAssigned; Assigned-only is false until Phase 3 gates.
     pub fn mode_includes_replication(&self) -> bool {
-        matches!(
-            self.mode,
-            ClusterMode::Replicated | ClusterMode::ReplicatedAssigned
-        )
+        self.mode.replicates()
     }
 
     pub fn is_readonly_replica(&self) -> bool {
@@ -178,7 +186,7 @@ impl ClusterConfig {
                     .context("NOS_REPLICATION_FACTOR must be a valid u32")
             })
             .transpose()?
-            .unwrap_or(1);
+            .unwrap_or(mode.default_replication_factor());
 
         let default_storage_class =
             env::var("NOS_DEFAULT_STORAGE_CLASS").unwrap_or_else(|_| "default".into());

@@ -16,6 +16,8 @@
 *.db
 *.db-shm
 *.db-wal
+# ...except metadata written by released versions for upgrade tests
+!tests/fixtures/**/*.db
 
 # IDE
 .idea/

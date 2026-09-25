@@ -60,13 +60,8 @@ pub fn decompress_zstd_blob(
     }
 
     let payload = &blob[header_len..];
-    let decompressed = if let Some(d) = dict.filter(|d| !d.is_empty()) {
-        let mut dec = zstd::bulk::Decompressor::with_dictionary(d).map_err(internal)?;
-        dec.decompress(payload, expected_size as usize)
-            .map_err(internal)?
-    } else {
-        zstd::decode_all(payload).map_err(internal)?
-    };
+    // Human: Bounded by the expected size, with the dictionary the frame names (was unbounded without one).
+    let decompressed = super::decode::decode_compressed_payload(payload, dict, expected_size)?;
 
     if decompressed.len() as u64 != expected_size {
         return Err(internal(anyhow::anyhow!(
@@ -91,9 +86,14 @@ pub fn parse_dedup_manifest(
         )));
     }
     let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-    let expected_len = DEDUP_HEADER_LEN + count * DEDUP_ENTRY_LEN;
-    if data.len() < expected_len {
-        return Err(internal(anyhow::anyhow!("dedup manifest truncated")));
+    let expected_len = count
+        .checked_mul(DEDUP_ENTRY_LEN)
+        .and_then(|entries| entries.checked_add(DEDUP_HEADER_LEN))
+        .ok_or_else(|| internal(anyhow::anyhow!("dedup manifest entry count overflows")))?;
+    // Human: A manifest is exactly its header and entries, and the entries add up to the object; anything
+    // else isn't a manifest (e.g. a raw upload that happens to start with "NOSD") and must not move refcounts.
+    if data.len() != expected_len {
+        return Err(internal(anyhow::anyhow!("dedup manifest length mismatch")));
     }
     let mut entries = Vec::with_capacity(count);
     let mut off = DEDUP_HEADER_LEN;
@@ -102,6 +102,10 @@ pub fn parse_dedup_manifest(
         let size = u32::from_le_bytes(data[off + 8..off + 12].try_into().unwrap());
         entries.push((hash, size));
         off += DEDUP_ENTRY_LEN;
+    }
+    let total: u64 = entries.iter().map(|(_, size)| u64::from(*size)).sum();
+    if total != logical {
+        return Err(internal(anyhow::anyhow!("dedup manifest sizes do not add up")));
     }
     Ok(entries)
 }

@@ -5,8 +5,7 @@ use super::blocks::BlockStore;
 use super::engine::StorageEngine;
 use super::error::{internal, StorageError};
 use super::{
-    blob_path, blob_path_variants, first_existing_blob_path, object_key_from_blob_relpath,
-    sanitize_bucket,
+    blob_path_variants, first_existing_blob_path, object_key_from_blob_relpath, sanitize_bucket,
 };
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -49,15 +48,15 @@ impl StorageEngine {
         let mut db_keys: HashSet<(String, String)> = HashSet::new();
         for (bucket, key) in &rows {
             db_keys.insert((bucket.clone(), key.clone()));
-            let variants = blob_path_variants(self.data_dir(), bucket, key);
-            if first_existing_blob_path(&variants)
-                .await
-                .map_err(internal)?
-                .is_none()
+            if self.blob_exists(bucket, key).await? {
+                continue;
+            }
+            // Human: Re-check with writers excluded — the snapshot row may already be gone or re-uploaded.
+            let _key_guard = self.key_locks().lock(bucket, key).await;
+            if !self.blob_exists(bucket, key).await?
+                && self.object_meta().active_row_count(bucket, key).await? > 0
             {
-                self.object_meta()
-                    .delete_object_row(bucket, key)
-                    .await?;
+                self.object_meta().delete_object_row(bucket, key).await?;
                 report.stale_rows_removed += 1;
             }
         }
@@ -77,7 +76,8 @@ impl StorageEngine {
                 Ok(b) => b,
                 Err(_) => continue,
             };
-            Self::scan_bucket_blobs(entry.path(), &bucket, &db_keys, &mut report).await?;
+            self.scan_bucket_blobs(entry.path(), &bucket, &db_keys, &mut report)
+                .await?;
         }
 
         if let Ok(hints) = self.replication_reconcile_hints().await {
@@ -161,15 +161,37 @@ impl StorageEngine {
             ..Default::default()
         };
         for orphan in listed.orphans {
-            let path = blob_path(self.data_dir(), &orphan.bucket, &orphan.key);
-            if path.exists() {
-                BlockStore::release_blob(self.system_write_pool(), self.data_dir(), &path).await?;
-                let _ = fs::remove_file(&path).await;
+            if self.remove_orphan_blob(&orphan.bucket, &orphan.key).await? {
                 report.removed += 1;
                 report.bytes_reclaimed += orphan.bytes;
             }
         }
         Ok(report)
+    }
+
+    async fn blob_exists(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
+        let variants = blob_path_variants(self.data_dir(), bucket, key);
+        Ok(first_existing_blob_path(&variants)
+            .await
+            .map_err(internal)?
+            .is_some())
+    }
+
+    /// Human: Delete an object's blob files only if, with writers excluded, it still has no live metadata —
+    /// the orphan scan works from a snapshot, and an upload may have committed since.
+    /// Agent: Takes the key lock; releases dedup refs; RETURNS whether anything was removed.
+    async fn remove_orphan_blob(&self, bucket: &str, key: &str) -> Result<bool, StorageError> {
+        let _key_guard = self.key_locks().lock(bucket, key).await;
+        if self.object_meta().active_row_count(bucket, key).await? > 0 {
+            return Ok(false);
+        }
+        let mut removed = false;
+        for path in super::existing_blob_paths(&blob_path_variants(self.data_dir(), bucket, key)) {
+            BlockStore::release_blob(self.system_write_pool(), self.data_dir(), &path).await?;
+            let _ = fs::remove_file(&path).await;
+            removed = true;
+        }
+        Ok(removed)
     }
 
     async fn collect_orphans_in_bucket(
@@ -269,12 +291,14 @@ impl StorageEngine {
     }
 
     async fn scan_bucket_blobs(
+        &self,
         bucket_dir: std::path::PathBuf,
         bucket: &str,
         db_keys: &HashSet<(String, String)>,
         report: &mut ReconcileReport,
     ) -> Result<(), StorageError> {
         let mut stack = vec![bucket_dir.clone()];
+        let mut candidates = Vec::new();
         while let Some(dir) = stack.pop() {
             let mut rd = fs::read_dir(&dir).await.map_err(internal)?;
             while let Some(ent) = rd.next_entry().await.map_err(internal)? {
@@ -295,10 +319,14 @@ impl StorageEngine {
                 let Some(key) = object_key_from_blob_relpath(&rel) else {
                     continue;
                 };
-                if !db_keys.contains(&(bucket.to_string(), key)) {
-                    let _ = fs::remove_file(path).await;
-                    report.orphan_blobs_removed += 1;
+                if !db_keys.contains(&(bucket.to_string(), key.clone())) {
+                    candidates.push(key);
                 }
+            }
+        }
+        for key in candidates {
+            if self.remove_orphan_blob(bucket, &key).await? {
+                report.orphan_blobs_removed += 1;
             }
         }
         Ok(())

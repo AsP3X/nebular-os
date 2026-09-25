@@ -9,11 +9,15 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::cluster::backend::StorageBackend;
-use crate::cluster::replicated::apply::apply_replication_event_bytes;
+use crate::cluster::replicated::apply::{
+    apply_replication_event_bytes, apply_replication_event_file,
+};
 use crate::cluster::replicated::ReplicationEvent;
 use crate::routes::AppState;
+use crate::storage::engine::TempFileGuard;
 use crate::storage::error::{internal, StorageError};
-use crate::storage::streaming::{read_multipart_blob_field, verify_wire_checksum};
+use crate::storage::streaming::receive_multipart_blob_field;
+use std::path::PathBuf;
 
 /// Human: Peers apply idempotent replication events (JSON delete or multipart put).
 /// Agent: POST /_cluster/replicate; Bearer cluster token; 200 on apply or duplicate event_id.
@@ -85,8 +89,8 @@ async fn apply_multipart(
     state: &AppState,
     multipart: &mut Multipart,
 ) -> Result<(), StorageError> {
-    let mut event_json: Option<String> = None;
-    let mut blob: Option<Vec<u8>> = None;
+    let mut event: Option<ReplicationEvent> = None;
+    let mut received: Option<(TempFileGuard, u64, String)> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -95,26 +99,49 @@ async fn apply_multipart(
     {
         match field.name() {
             Some("event") => {
-                event_json = Some(field.text().await.map_err(internal)?);
+                let raw = field.text().await.map_err(internal)?;
+                event = Some(serde_json::from_str(&raw).map_err(internal)?);
             }
             Some("blob") => {
-                let (bytes, _checksum) =
-                    read_multipart_blob_field(field, state.max_body_size).await?;
-                blob = Some(bytes);
+                // Human: Spool to disk while hashing — objects of any size replicate without buffering.
+                let spool = TempFileGuard {
+                    path: PathBuf::from(format!(
+                        "{}/.tmp/{}.repl",
+                        state.engine.data_dir(),
+                        uuid::Uuid::new_v4()
+                    )),
+                };
+                let max_len = event
+                    .as_ref()
+                    .and_then(|e| e.size)
+                    .and_then(|s| u64::try_from(s).ok());
+                let (len, checksum) =
+                    receive_multipart_blob_field(field, &spool.path, max_len).await?;
+                received = Some((spool, len, checksum));
             }
             _ => {}
         }
     }
 
-    let event_raw = event_json.ok_or(StorageError::NotFound)?;
-    let event: ReplicationEvent =
-        serde_json::from_str(&event_raw).map_err(internal)?;
-    if let (Some(expected), Some(bytes)) = (&event.wire_checksum, &blob) {
-        verify_wire_checksum(bytes, expected)?;
-    }
+    let event = event.ok_or(StorageError::NotFound)?;
     let log = replication_log(state)?;
     let backend = state.backend();
-    apply_replication_event_bytes(backend.engine(), log.as_ref(), &event, blob).await
+    let Some((spool, len, checksum)) = received else {
+        return apply_replication_event_bytes(backend.engine(), log.as_ref(), &event, None).await;
+    };
+    if let Some(size) = event.size
+        && u64::try_from(size).ok() != Some(len)
+    {
+        return Err(internal(anyhow::anyhow!(
+            "replication payload is {len} bytes, event says {size}"
+        )));
+    }
+    if let Some(expected) = event.wire_checksum.as_deref().filter(|e| !e.is_empty())
+        && expected != checksum
+    {
+        return Err(internal(anyhow::anyhow!("replication wire checksum mismatch")));
+    }
+    apply_replication_event_file(backend.engine(), log.as_ref(), &event, &spool.path).await
 }
 
 fn replication_log(

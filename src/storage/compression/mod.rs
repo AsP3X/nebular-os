@@ -3,22 +3,25 @@ mod encode;
 mod format;
 mod legacy;
 
+#[allow(deprecated)]
+pub use decode::{pump_block_blob_full, pump_block_blob_range};
 pub use decode::{
-    decompress_blob, decompress_file_to_temp, pump_block_blob_full, pump_block_blob_range,
-    verify_indexed_blob, IndexedReadContext,
+    decompress_blob, decompress_file_to_temp, verify_indexed_blob, IndexedBlobReader,
+    IndexedReadContext,
 };
 pub use encode::{
     clamp_zstd_level, compress_blob, compress_file_to_storage, default_block_size,
-    encode_blob_for_storage, EncodeOptions, DEFAULT_ZSTD_LEVEL,
+    encode_blob_for_storage, encode_file_for_storage, raw_would_be_misread, EncodeOptions,
+    FileEncoding, DEFAULT_ZSTD_LEVEL,
 };
 pub use format::{
-    collect_dedup_refs, detect_blob_format, is_compressed_blob, is_dedup_manifest,
+    collect_dedup_refs, detect_blob_format, is_compressed_blob, stored_blob_format, is_dedup_manifest,
     is_indexed_blob, is_nosb_blob, is_zstd_blob, parse_layout_bytes, read_blob_header_size,
     read_blob_layout, read_blob_logical_size,     read_blob_stored_zstd_level, read_indexed_dict_id, read_indexed_zstd_level, BlobFormat,
     BlobLayout, IndexedFormat, BLOB_MAGIC, BLOB_MAGIC_V2, DEDUP_MAGIC, DEDUP_ENTRY_LEN,
     DEDUP_HEADER_LEN, BLOCK_DEDUP_REF, FIXED_HEADER_LEN, FIXED_HEADER_LEN_V1,
     FIXED_HEADER_LEN_V1_LEVEL, HEADER_LEN, HEADER_LEN_V2, NOSB_MAGIC, NOSI_MAGIC,
-    NOSI_FLAG_HAS_LEVEL, DEFAULT_BLOCK_SIZE,
+    NOSI_FLAG_DEDUP, NOSI_FLAG_HAS_LEVEL, DEFAULT_BLOCK_SIZE,
 };
 pub use legacy::{
     parse_dedup_manifest, read_stored_dict_id, read_stored_zstd_level, zstd_payload_offset,

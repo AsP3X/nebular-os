@@ -1,14 +1,16 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
 
 use sqlx::Pool;
 use sqlx::Sqlite;
 use xxhash_rust::xxh3::xxh3_64;
 
 use super::compression::{
-    clamp_zstd_level, collect_dedup_refs, parse_dedup_manifest, DEDUP_ENTRY_LEN, DEDUP_HEADER_LEN,
-    DEDUP_MAGIC,
+    clamp_zstd_level, collect_dedup_refs, detect_blob_format, parse_dedup_manifest, BlobFormat,
+    DEDUP_ENTRY_LEN, DEDUP_HEADER_LEN, DEDUP_MAGIC, FIXED_HEADER_LEN_V1, NOSI_FLAG_DEDUP,
 };
 use super::error::{internal, StorageError};
 
@@ -16,7 +18,25 @@ use super::error::{internal, StorageError};
 pub const BLOCK_CHUNK_MAGIC: &[u8; 4] = b"NOSK";
 pub const BLOCK_CHUNK_HEADER_LEN: usize = 8;
 
+/// Stripes serializing, per block hash, a reuse check against GC deleting the same block file.
+static BLOCK_FILE_LOCKS: LazyLock<Vec<Mutex<()>>> = LazyLock::new(|| (0..256).map(|_| Mutex::new(())).collect());
+
+fn block_file_lock(hash: u64) -> MutexGuard<'static, ()> {
+    BLOCK_FILE_LOCKS[(hash % 256) as usize]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// Human: Content-addressed block files under `.blocks/` with SQLite refcounts.
+/// A block whose refcount drops to zero is only deleted by `gc_released_blocks`, after a grace period and only if
+/// no upload reused it meanwhile — an upload counts its refs after encoding, so deleting at once could remove a
+/// block it had just decided to share.
 /// Agent: WRITES NOSD manifest blobs; INCREMENT/DECREMENT dedup_blocks on share/release.
 #[derive(Clone)]
 pub struct BlockStore {
@@ -48,10 +68,32 @@ impl BlockStore {
         chunk: &[u8],
         zstd_level: i32,
     ) -> Result<u64, StorageError> {
+        self.store_block(chunk, zstd_level)?.ok_or_else(|| {
+            internal(anyhow::anyhow!("a different block is stored under this chunk's hash"))
+        })
+    }
+
+    /// Human: Store `chunk` under its content hash, or share the stored copy — after checking it holds exactly
+    /// these bytes. `None` means a different block already has this hash (a hash collision, possibly crafted, or
+    /// a damaged file): the caller then keeps the chunk in the object itself instead of sharing it.
+    /// Agent: A shared block's mtime is refreshed so the zero-ref GC grace period restarts; new blocks are
+    /// written to a temp name and renamed, so a crash never leaves a partial block under a hash.
+    pub fn store_block(&self, chunk: &[u8], zstd_level: i32) -> Result<Option<u64>, StorageError> {
         let hash = Self::hash_block(chunk);
         let path = self.block_path(hash);
+        let _guard = block_file_lock(hash);
         if path.exists() {
-            return Ok(hash);
+            let same = self
+                .read_logical_block(hash, chunk.len())
+                .is_ok_and(|existing| existing == chunk);
+            if !same {
+                return Ok(None);
+            }
+            let _ = File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(SystemTime::now()));
+            return Ok(Some(hash));
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| internal(anyhow::anyhow!(e)))?;
@@ -71,17 +113,26 @@ impl BlockStore {
         } else {
             chunk.to_vec()
         };
-        std::fs::write(&path, &on_disk).map_err(|e| internal(anyhow::anyhow!(e)))?;
-        Ok(hash)
+        let partial = path.with_extension(format!("partial-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&partial, &on_disk)
+            .and_then(|()| std::fs::rename(&partial, &path))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&partial);
+                internal(anyhow::anyhow!(e))
+            })?;
+        Ok(Some(hash))
     }
 
     /// Read logical bytes for a content-addressed block (raw or NOSK-wrapped).
+    /// Human: A block's logical bytes, checked against the content hash it is stored under (the address is the
+    /// checksum), so a damaged or swapped block file is reported instead of served.
+    /// Agent: Decompression is bounded by `expected_len` (a corrupt frame can't expand without limit).
     pub fn read_logical_block(&self, hash: u64, expected_len: usize) -> Result<Vec<u8>, StorageError> {
         let path = self.block_path(hash);
         let data = std::fs::read(&path).map_err(|e| {
             internal(anyhow::anyhow!("missing dedup block {hash:016x}: {e}"))
         })?;
-        if data.len() >= BLOCK_CHUNK_HEADER_LEN && data.starts_with(BLOCK_CHUNK_MAGIC) {
+        let block = if data.len() >= BLOCK_CHUNK_HEADER_LEN && data.starts_with(BLOCK_CHUNK_MAGIC) {
             let logical_len =
                 u32::from_le_bytes(data[4..8].try_into().map_err(|_| {
                     internal(anyhow::anyhow!("invalid block chunk header"))
@@ -91,15 +142,27 @@ impl BlockStore {
                     "dedup block logical size mismatch for {hash:016x}"
                 )));
             }
-            let payload = &data[BLOCK_CHUNK_HEADER_LEN..];
-            return zstd::decode_all(payload).map_err(internal);
-        }
-        if data.len() != expected_len {
+            let mut decoded = Vec::with_capacity(expected_len);
+            zstd::stream::read::Decoder::new(&data[BLOCK_CHUNK_HEADER_LEN..])
+                .map_err(internal)?
+                .take(expected_len as u64 + 1)
+                .read_to_end(&mut decoded)
+                .map_err(internal)?;
+            decoded
+        } else {
+            data
+        };
+        if block.len() != expected_len {
             return Err(internal(anyhow::anyhow!(
                 "dedup block size mismatch for {hash:016x}"
             )));
         }
-        Ok(data)
+        if Self::hash_block(&block) != hash {
+            return Err(internal(anyhow::anyhow!(
+                "dedup block {hash:016x} does not match its content hash"
+            )));
+        }
+        Ok(block)
     }
 
     /// Chunk `tmp_path` into blocks, write manifest to `final_path`.
@@ -127,8 +190,7 @@ impl BlockStore {
                 break;
             }
             let chunk = &buf[..n];
-            self.write_logical_block(chunk, super::compression::DEFAULT_ZSTD_LEVEL)?;
-            let hash = Self::hash_block(chunk);
+            let hash = self.write_logical_block(chunk, super::compression::DEFAULT_ZSTD_LEVEL)?;
             entries.push((hash, n as u32));
         }
 
@@ -175,7 +237,23 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Dedup block refs held by a blob; only NOSD manifests and dedup-flagged NOSI blobs are read in full.
     pub fn manifest_entries(blob_path: &Path) -> Result<Vec<(u64, u32)>, StorageError> {
+        let mut head = Vec::with_capacity(FIXED_HEADER_LEN_V1);
+        File::open(blob_path)
+            .and_then(|f| f.take(FIXED_HEADER_LEN_V1 as u64).read_to_end(&mut head))
+            .map_err(|e| internal(anyhow::anyhow!(e)))?;
+        let may_hold_refs = match detect_blob_format(&head) {
+            BlobFormat::Nosd => true,
+            BlobFormat::Nosi => {
+                head.len() >= FIXED_HEADER_LEN_V1
+                    && u16::from_le_bytes([head[22], head[23]]) & NOSI_FLAG_DEDUP != 0
+            }
+            _ => false,
+        };
+        if !may_hold_refs {
+            return Ok(Vec::new());
+        }
         let data = std::fs::read(blob_path).map_err(|e| internal(anyhow::anyhow!(e)))?;
         collect_dedup_refs(&data)
     }
@@ -187,8 +265,8 @@ impl BlockStore {
         for (hash, size) in entries {
             let hex = format!("{hash:016x}");
             sqlx::query(
-                "INSERT INTO dedup_blocks (hash, size, refcount) VALUES (?, ?, 1)
-                 ON CONFLICT(hash) DO UPDATE SET refcount = refcount + 1",
+                "INSERT INTO dedup_blocks (hash, size, refcount, released_at) VALUES (?, ?, 1, NULL)
+                 ON CONFLICT(hash) DO UPDATE SET refcount = refcount + 1, released_at = NULL",
             )
             .bind(&hex)
             .bind(*size as i64)
@@ -199,42 +277,83 @@ impl BlockStore {
         Ok(())
     }
 
+    /// Human: Drop one reference per entry. A block that reaches zero stays on disk until `gc_released_blocks`
+    /// removes it (see the type docs); the decrement is one statement, so concurrent releases can't lose counts.
     pub async fn dec_refs(
         pool: &Pool<Sqlite>,
-        data_dir: &str,
+        _data_dir: &str,
         entries: &[(u64, u32)],
     ) -> Result<(), StorageError> {
-        let store = BlockStore::new(data_dir);
+        let now = unix_now();
         for (hash, _size) in entries {
-            let hex = format!("{hash:016x}");
-            let row: Option<(i64,)> =
-                sqlx::query_as("SELECT refcount FROM dedup_blocks WHERE hash = ?")
-                    .bind(&hex)
-                    .fetch_optional(pool)
-                    .await
-                    .map_err(internal)?;
-            let Some((refcount,)) = row else {
+            sqlx::query(
+                "UPDATE dedup_blocks SET refcount = refcount - 1, \
+                 released_at = CASE WHEN refcount <= 1 THEN ? ELSE released_at END \
+                 WHERE hash = ? AND refcount > 0",
+            )
+            .bind(now)
+            .bind(format!("{hash:016x}"))
+            .execute(pool)
+            .await
+            .map_err(internal)?;
+        }
+        Ok(())
+    }
+
+    /// Human: Delete up to `limit` blocks nothing references, once they've been unreferenced for `grace` and no
+    /// upload shared them since (sharing refreshes the file's mtime). RETURNS the number of blocks removed.
+    /// Agent: FILE removed under the block's lock after the mtime check; the row goes only while still at zero.
+    pub async fn gc_released_blocks(
+        pool: &Pool<Sqlite>,
+        data_dir: &str,
+        grace: Duration,
+        limit: i64,
+    ) -> Result<u64, StorageError> {
+        let cutoff = unix_now() - grace.as_secs() as i64;
+        let released: Vec<(String,)> = sqlx::query_as(
+            "SELECT hash FROM dedup_blocks WHERE refcount <= 0 AND released_at IS NOT NULL AND released_at < ? LIMIT ?",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+        .map_err(internal)?;
+        let store = BlockStore::new(data_dir);
+        let cutoff_time = SystemTime::UNIX_EPOCH + Duration::from_secs(cutoff.max(0) as u64);
+        let mut removed = 0;
+        for (hex,) in released {
+            let Ok(hash) = u64::from_str_radix(&hex, 16) else {
                 continue;
             };
-            if refcount <= 1 {
-                sqlx::query("DELETE FROM dedup_blocks WHERE hash = ?")
+            let path = store.block_path(hash);
+            let deleted = {
+                let _guard = block_file_lock(hash);
+                let shared_since = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|modified| modified > cutoff_time);
+                if shared_since {
+                    false
+                } else {
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => true,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(e) => {
+                            tracing::warn!(block = %hex, error = %e, "cannot remove released dedup block");
+                            false
+                        }
+                    }
+                }
+            };
+            if deleted {
+                sqlx::query("DELETE FROM dedup_blocks WHERE hash = ? AND refcount <= 0")
                     .bind(&hex)
                     .execute(pool)
                     .await
                     .map_err(internal)?;
-                let path = store.block_path(*hash);
-                let _ = std::fs::remove_file(path);
-            } else {
-                sqlx::query(
-                    "UPDATE dedup_blocks SET refcount = refcount - 1 WHERE hash = ?",
-                )
-                .bind(&hex)
-                .execute(pool)
-                .await
-                .map_err(internal)?;
+                removed += 1;
             }
         }
-        Ok(())
+        Ok(removed)
     }
 
     pub async fn release_blob(
@@ -242,7 +361,14 @@ impl BlockStore {
         data_dir: &str,
         blob_path: &Path,
     ) -> Result<(), StorageError> {
-        let entries = Self::manifest_entries(blob_path)?;
+        // Human: Refs that can't be read are leaked (their blocks stay), rather than making the blob undeletable.
+        let entries = match Self::manifest_entries(blob_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(path = %blob_path.display(), error = %e, "cannot read dedup refs; leaving them counted");
+                return Ok(());
+            }
+        };
         if entries.is_empty() {
             return Ok(());
         }
@@ -256,6 +382,13 @@ impl BlockStore {
                 size     INTEGER NOT NULL,
                 refcount INTEGER NOT NULL DEFAULT 0
             )",
+        )
+        .execute(pool)
+        .await
+        .map_err(internal)?;
+        super::object_meta::add_column_if_missing(pool, "dedup_blocks", "released_at", "INTEGER").await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_dedup_released ON dedup_blocks(released_at) WHERE refcount <= 0",
         )
         .execute(pool)
         .await

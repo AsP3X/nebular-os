@@ -1,13 +1,48 @@
 //! Human: Proxy object writes to the assigned peer when NOS_ASSIGNMENT_FORWARD is enabled.
-//! Agent: HTTP to peer public API with caller Authorization and placement headers.
+//! Agent: HTTP to peer public API with caller Authorization and placement headers. Every forwarded request
+//! carries FORWARDED_HEADER; a node never forwards or fans out such a request again, so nodes whose rules or
+//! peer lists disagree can't bounce a request between them forever.
 
 use axum::http::header;
 use reqwest::StatusCode;
 use crate::cluster::assignment::{AssignmentResolution, WriteContext};
 use crate::cluster::peer::PeerRegistry;
 use crate::storage::error::{internal, StorageError};
-use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
+use crate::storage::multipart::{CompletedPart, InitMultipartResult, PartUploadResult};
+use crate::storage::write_path::WriteConditions;
 use crate::storage::types::ObjectMetadata;
+
+/// Marks a request one node sent another on a client's behalf.
+pub const FORWARDED_HEADER: &str = "x-nd-forwarded";
+
+/// Human: The peer URL path of an object, each segment percent-encoded (keys may hold spaces, `?`, `#`, `%`...).
+/// None for a key with a `.` or `..` segment: URL parsing resolves those (encoded or not), so a request for
+/// `a/./b` would reach `a/b` — such keys can only be handled on the node a client sends them to.
+/// Agent: RETURNS "{bucket}/{seg}/{seg}…" with `/` kept as the separator.
+pub fn object_path(bucket: &str, key: &str) -> Option<String> {
+    if [bucket].into_iter().chain(key.split('/')).any(|segment| matches!(segment, "." | "..")) {
+        return None;
+    }
+    let key: Vec<_> = key.split('/').map(urlencoding::encode).collect();
+    Some(format!("{}/{}", urlencoding::encode(bucket), key.join("/")))
+}
+
+/// `object_path`, or a `400` for a key another node can't be asked about.
+fn forwardable_path(bucket: &str, key: &str) -> Result<String, StorageError> {
+    object_path(bucket, key).ok_or_else(|| {
+        StorageError::InvalidRequest(
+            "keys with `.` or `..` path segments can't be forwarded to another node; send the request to the node that holds the object".into(),
+        )
+    })
+}
+
+/// Human: Whether an `Authorization` value can be passed on to a peer: a bearer token can, a SigV4 or `NOS`
+/// signature can't — it covers this request's host and headers, which a forwarded request doesn't keep.
+pub fn is_bearer(authorization: &str) -> bool {
+    authorization
+        .get(..7)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+}
 
 fn peer_base<'a>(
     peers: &'a PeerRegistry,
@@ -33,7 +68,9 @@ fn apply_placement_headers(
     resolution: &AssignmentResolution,
     ctx: Option<&WriteContext>,
 ) -> reqwest::RequestBuilder {
-    let mut req = builder.header("x-nd-storage-class", &resolution.storage_class);
+    let mut req = builder
+        .header(FORWARDED_HEADER, "1")
+        .header("x-nd-storage-class", &resolution.storage_class);
     if let Some(group) = ctx.and_then(|c| c.replication_group_header.as_deref()) {
         req = req.header("x-nd-replication-group", group);
     }
@@ -52,9 +89,32 @@ async fn map_forward_status(
         });
     }
     if !status.is_success() {
-        return Err(internal(anyhow::anyhow!("peer forward returned {status}")));
+        return Err(peer_error(resp).await);
     }
     Ok(resp)
+}
+
+/// Human: A peer's error answer as the same error here, so the client sees what the owning node said (a `412`
+/// used to reach it as a `500`).
+/// Agent: 400 (with the peer's message) | 404 | 408 | 412 | 413 | 507 map to their StorageError; else Internal.
+async fn peer_error(resp: reqwest::Response) -> StorageError {
+    let status = resp.status();
+    let message = resp
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| body.get("error").and_then(|e| e.as_str()).map(str::to_string));
+    match status {
+        StatusCode::BAD_REQUEST => StorageError::InvalidRequest(
+            message.unwrap_or_else(|| "rejected by the node that holds the object".into()),
+        ),
+        StatusCode::NOT_FOUND => StorageError::NotFound,
+        StatusCode::REQUEST_TIMEOUT => StorageError::RequestTimeout,
+        StatusCode::PRECONDITION_FAILED => StorageError::PreconditionFailed,
+        StatusCode::PAYLOAD_TOO_LARGE => StorageError::PayloadTooLarge,
+        StatusCode::INSUFFICIENT_STORAGE => StorageError::InsufficientStorage,
+        _ => internal(anyhow::anyhow!("peer forward returned {status}")),
+    }
 }
 
 fn metadata_from_etag(
@@ -90,16 +150,24 @@ pub async fn proxy_put(
     custom_meta: Option<&str>,
     body: Vec<u8>,
     ctx: Option<&WriteContext>,
+    conditions: WriteConditions<'_>,
 ) -> Result<ObjectMetadata, StorageError> {
     let (_, base) = peer_base(peers, resolution)?;
-    let url = format!("{base}/{bucket}/{key}");
-    let client = reqwest::Client::new();
-    let mut req = client
+    let url = format!("{base}/{}", forwardable_path(bucket, key)?);
+    let mut req = crate::cluster::http::upload_client()
         .put(&url)
+        .timeout(crate::cluster::http::transfer_timeout(body.len() as u64))
         .header(header::AUTHORIZATION, auth_header(ctx)?)
         .body(body);
     if let Some(ct) = content_type {
         req = req.header(header::CONTENT_TYPE, ct);
+    }
+    // Human: The owning peer evaluates preconditions against its own copy of the object.
+    if let Some(v) = conditions.if_match {
+        req = req.header(header::IF_MATCH, v);
+    }
+    if let Some(v) = conditions.if_none_match {
+        req = req.header(header::IF_NONE_MATCH, v);
     }
     if let Some(meta) = custom_meta {
         req = req.header("x-nd-custom-meta", meta);
@@ -131,10 +199,9 @@ pub async fn proxy_copy(
     ctx: Option<&WriteContext>,
 ) -> Result<ObjectMetadata, StorageError> {
     let (_, base) = peer_base(peers, resolution)?;
-    let url = format!("{base}/{dst_bucket}/{dst_key}");
+    let url = format!("{base}/{}", forwardable_path(dst_bucket, dst_key)?);
     let copy_source = format!("{src_bucket}/{src_key}");
-    let client = reqwest::Client::new();
-    let mut req = client
+    let mut req = crate::cluster::http::client()
         .put(&url)
         .header(header::AUTHORIZATION, auth_header(ctx)?)
         .header("x-nd-copy-source", &copy_source);
@@ -167,9 +234,12 @@ pub async fn proxy_init_multipart(
     ctx: Option<&WriteContext>,
 ) -> Result<InitMultipartResult, StorageError> {
     let (_, base) = peer_base(peers, resolution)?;
-    let url = format!("{base}/{bucket}/_multipart?key={}", urlencoding::encode(key));
-    let client = reqwest::Client::new();
-    let mut req = client
+    let url = format!(
+        "{base}/{}/_multipart?key={}",
+        urlencoding::encode(bucket),
+        urlencoding::encode(key)
+    );
+    let mut req = crate::cluster::http::client()
         .post(&url)
         .header(header::AUTHORIZATION, auth_header(ctx)?);
     if let Some(ct) = content_type {
@@ -199,10 +269,14 @@ pub async fn proxy_upload_part(
 ) -> Result<PartUploadResult, StorageError> {
     let (_, base) = peer_base(peers, resolution)?;
     let _ = key;
-    let url = format!("{base}/{bucket}/_multipart/{upload_id}/parts/{part_number}");
-    let client = reqwest::Client::new();
-    let req = client
+    let url = format!(
+        "{base}/{}/_multipart/{}/parts/{part_number}",
+        urlencoding::encode(bucket),
+        urlencoding::encode(upload_id)
+    );
+    let req = crate::cluster::http::upload_client()
         .put(&url)
+        .timeout(crate::cluster::http::transfer_timeout(body.len() as u64))
         .header(header::AUTHORIZATION, auth_header(ctx)?)
         .body(body);
     let resp = map_forward_status(
@@ -217,6 +291,7 @@ pub async fn proxy_upload_part(
 }
 
 /// Human: Forward multipart complete to the assigned peer.
+#[allow(clippy::too_many_arguments)]
 pub async fn proxy_complete_multipart(
     peers: &PeerRegistry,
     resolution: &AssignmentResolution,
@@ -225,18 +300,23 @@ pub async fn proxy_complete_multipart(
     upload_id: &str,
     custom_meta: Option<&str>,
     ctx: Option<&WriteContext>,
+    parts: Option<&[CompletedPart]>,
 ) -> Result<ObjectMetadata, StorageError> {
     let (_, base) = peer_base(peers, resolution)?;
     let url = format!(
-        "{base}/{bucket}/_multipart/{upload_id}/complete?key={}",
+        "{base}/{}/_multipart/{}/complete?key={}",
+        urlencoding::encode(bucket),
+        urlencoding::encode(upload_id),
         urlencoding::encode(key)
     );
-    let client = reqwest::Client::new();
-    let mut req = client
+    let mut req = crate::cluster::http::client()
         .post(&url)
         .header(header::AUTHORIZATION, auth_header(ctx)?);
     if let Some(meta) = custom_meta {
         req = req.header("x-nd-custom-meta", meta);
+    }
+    if let Some(parts) = parts {
+        req = req.json(&serde_json::json!({ "parts": parts }));
     }
     let resp = map_forward_status(
         apply_placement_headers(req, resolution, ctx).send().await.map_err(internal)?,
@@ -255,6 +335,34 @@ fn peer_auth(ctx: Option<&WriteContext>) -> Result<String, StorageError> {
     auth_header(ctx).map(str::to_string)
 }
 
+/// Human: Forward a single-object DELETE (with its If-Match) to a peer, which deletes only its own copy.
+/// Agent: DELETE with Authorization + x-nd-forwarded (+ If-Match); 2xx → Ok, 412 → PreconditionFailed, else Err.
+pub async fn proxy_delete_object(
+    peer_base: &str,
+    bucket: &str,
+    key: &str,
+    if_match: Option<&str>,
+    ctx: Option<&WriteContext>,
+) -> Result<(), StorageError> {
+    let url = format!("{}/{}", peer_base.trim_end_matches('/'), forwardable_path(bucket, key)?);
+    let mut req = crate::cluster::http::client()
+        .delete(&url)
+        .header(header::AUTHORIZATION, auth_header(ctx)?)
+        .header(FORWARDED_HEADER, "1");
+    if let Some(v) = if_match {
+        req = req.header(header::IF_MATCH, v);
+    }
+    let resp = req.send().await.map_err(internal)?;
+    match resp.status() {
+        status if status.is_success() => Ok(()),
+        // Human: Nothing to delete there.
+        StatusCode::NOT_FOUND => Ok(()),
+        // Human: A read-only replica takes no direct writes; replication brings it the delete.
+        StatusCode::SERVICE_UNAVAILABLE => Ok(()),
+        _ => Err(peer_error(resp).await),
+    }
+}
+
 /// Human: Forward prefix delete to a peer node (cluster fan-out).
 pub async fn proxy_delete_prefix(
     peer_base: &str,
@@ -266,8 +374,9 @@ pub async fn proxy_delete_prefix(
 ) -> Result<crate::storage::types::DeletePrefixOutcome, StorageError> {
     use crate::storage::types::{DeletePrefixOutcome, DeletePrefixResponse};
     let mut url = format!(
-        "{}/{bucket}?prefix={}",
+        "{}/{}?prefix={}",
         peer_base.trim_end_matches('/'),
+        urlencoding::encode(bucket),
         urlencoding::encode(prefix)
     );
     if let Some(l) = limit {
@@ -276,10 +385,10 @@ pub async fn proxy_delete_prefix(
     if let Some(sa) = start_after {
         url.push_str(&format!("&start_after={}", urlencoding::encode(sa)));
     }
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = crate::cluster::http::client()
         .delete(&url)
         .header(header::AUTHORIZATION, peer_auth(ctx)?)
+        .header(FORWARDED_HEADER, "1")
         .send()
         .await
         .map_err(internal)?;
@@ -310,11 +419,15 @@ pub async fn proxy_batch_delete(
     ctx: Option<&WriteContext>,
 ) -> Result<crate::storage::types::DeletePrefixOutcome, StorageError> {
     use crate::storage::types::{DeletePrefixOutcome, DeletePrefixResponse};
-    let url = format!("{}/{bucket}/_batch_delete", peer_base.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let resp = client
+    let url = format!(
+        "{}/{}/_batch_delete",
+        peer_base.trim_end_matches('/'),
+        urlencoding::encode(bucket)
+    );
+    let resp = crate::cluster::http::client()
         .post(&url)
         .header(header::AUTHORIZATION, peer_auth(ctx)?)
+        .header(FORWARDED_HEADER, "1")
         .json(&serde_json::json!({ "keys": keys }))
         .send()
         .await

@@ -24,13 +24,20 @@ pub fn map_storage_error(err: StorageError) -> (StatusCode, Json<serde_json::Val
                 "storage_class": storage_class,
             })),
         ),
+        StorageError::InvalidRequest(message) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": message })),
+        ),
         other => {
             let status = match &other {
                 StorageError::NotFound => StatusCode::NOT_FOUND,
-                StorageError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+                StorageError::RangeNotSatisfiable { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
                 StorageError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+                StorageError::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
                 StorageError::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
-                StorageError::InvalidBucket | StorageError::InvalidKey => StatusCode::BAD_REQUEST,
+                StorageError::InvalidBucket
+                | StorageError::InvalidKey
+                | StorageError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
                 StorageError::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
                 StorageError::ReadOnlyReplica => StatusCode::SERVICE_UNAVAILABLE,
                 StorageError::NotAssigned { .. } => unreachable!(),

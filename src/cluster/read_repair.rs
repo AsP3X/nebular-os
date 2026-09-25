@@ -31,12 +31,10 @@ pub async fn fetch_from_peers(
         if peer_id == self_id {
             continue;
         }
-        let url = format!(
-            "{}/_cluster/objects/{}/{}",
-            peer.url.trim_end_matches('/'),
-            bucket,
-            key
-        );
+        let Some(path) = crate::cluster::forward::object_path(bucket, key) else {
+            break;
+        };
+        let url = format!("{}/_cluster/objects/{path}", peer.url.trim_end_matches('/'));
         let mut req = client
             .get(&url)
             .header(header::AUTHORIZATION, format!("Bearer {token}"));
@@ -64,6 +62,16 @@ pub async fn fetch_from_peers(
         if status == StatusCode::NOT_FOUND {
             continue;
         }
+        let content_range = resp
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range);
+        if status == StatusCode::RANGE_NOT_SATISFIABLE
+            && let Some((_, size)) = content_range
+        {
+            return Err(StorageError::RangeNotSatisfiable { size });
+        }
         if !status.is_success() && status != StatusCode::NOT_MODIFIED {
             tracing::warn!(
                 peer_id = %peer_id,
@@ -84,17 +92,14 @@ pub async fn fetch_from_peers(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
         let custom_meta = custom_meta_json_from_headers(resp.headers());
-        let total_size = resp
+        let header_length: Option<u64> = resp
             .headers()
-            .get(header::CONTENT_RANGE)
+            .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
-            .and_then(parse_total_from_content_range)
-            .or_else(|| {
-                resp.headers()
-                    .get(header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse().ok())
-            })
+            .and_then(|s| s.parse().ok());
+        let total_size = content_range
+            .map(|(_, total)| total)
+            .or(header_length)
             .unwrap_or(0);
 
         let epoch = Utc.timestamp_opt(0, 0).single().unwrap();
@@ -124,12 +129,23 @@ pub async fn fetch_from_peers(
             return Ok(GetObjectOutcome::NotModified(meta));
         }
 
-        let content_length = resp
-            .headers()
-            .get(header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(total_size);
+        // Human: The response we build states Content-Length, so it must match the bytes the peer streams:
+        // the span for 206, the peer's own Content-Length for 200. Skip peers that give neither.
+        let (range, content_length) = if status == StatusCode::PARTIAL_CONTENT {
+            let Some((Some((start, end)), _)) = content_range.filter(|(span, _)| {
+                span.is_some_and(|(start, end)| start <= end)
+            }) else {
+                tracing::warn!(peer_id = %peer_id, "read repair peer sent 206 without a usable Content-Range");
+                continue;
+            };
+            (Some((start, end)), end - start + 1)
+        } else {
+            let Some(length) = header_length else {
+                tracing::warn!(peer_id = %peer_id, "read repair peer response has no Content-Length");
+                continue;
+            };
+            (None, length)
+        };
 
         let http_stream = resp.bytes_stream().map(|chunk| {
             chunk.map_err(|e| std::io::Error::other(e.to_string()))
@@ -141,6 +157,7 @@ pub async fn fetch_from_peers(
             stream,
             content_length,
             total_size,
+            range,
             meta: Box::new(meta),
         });
     }
@@ -148,8 +165,27 @@ pub async fn fetch_from_peers(
     Err(StorageError::NotFound)
 }
 
-fn parse_total_from_content_range(value: &str) -> Option<u64> {
-    let part = value.strip_prefix("bytes ")?.split(' ').next()?;
-    let (_, total) = part.rsplit_once('/')?;
-    total.parse().ok()
+/// `bytes start-end/total` => (Some((start, end)), total); `bytes */total` => (None, total).
+fn parse_content_range(value: &str) -> Option<(Option<(u64, u64)>, u64)> {
+    let (span, total) = value.strip_prefix("bytes ")?.trim().split_once('/')?;
+    let total = total.trim().parse().ok()?;
+    if span.trim() == "*" {
+        return Some((None, total));
+    }
+    let (start, end) = span.split_once('-')?;
+    Some((Some((start.trim().parse().ok()?, end.trim().parse().ok()?)), total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_content_range;
+
+    #[test]
+    fn parses_satisfied_and_unsatisfied_forms() {
+        assert_eq!(parse_content_range("bytes 0-4/26"), Some((Some((0, 4)), 26)));
+        assert_eq!(parse_content_range("bytes */26"), Some((None, 26)));
+        assert_eq!(parse_content_range("bytes 0-4/*"), None);
+        assert_eq!(parse_content_range("items 0-4/26"), None);
+        assert_eq!(parse_content_range("bytes a-4/26"), None);
+    }
 }

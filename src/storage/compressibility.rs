@@ -75,10 +75,10 @@ pub fn should_attempt_compression(ctx: CompressionContext<'_>) -> bool {
     if ctx.logical_size < ctx.min_size as u64 {
         return false;
     }
-    if let Some(key) = ctx.object_key {
-        if extension_is_excluded(key, ctx.extra_excluded_extensions) {
-            return false;
-        }
+    if let Some(key) = ctx.object_key
+        && extension_is_excluded(key, ctx.extra_excluded_extensions)
+    {
+        return false;
     }
     if let Some(ct) = ctx.content_type
         && content_type_is_excluded(ct)

@@ -1,0 +1,200 @@
+{
+ "generated_by": "nebular-os v0.1.4 (tag v0.1.4) via tests/fixtures/generate_v0_1_4.py",
+ "blob_formats": {
+  "NOS2": 20,
+  "raw": 2,
+  "NOSD": 2
+ },
+ "objects": [
+  {
+   "bucket": "media",
+   "key": "dedup/a.txt",
+   "size": 68192,
+   "sha256": "db5e6ab6b5044e63f36f910a7edbdcb12cc67725c2169edb22186b9b10437045",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "dedup/b.txt",
+   "size": 68192,
+   "sha256": "db5e6ab6b5044e63f36f910a7edbdcb12cc67725c2169edb22186b9b10437045",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-00.log",
+   "size": 3159,
+   "sha256": "9dbdcf317b3001fc438860cc609776f3c3247ebb7582e082831e9d928b7a51cc",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-01.log",
+   "size": 3127,
+   "sha256": "672d24b688bcdf5f8ba3c63fae9a38a0e35f68746ca087e9afe6a5bd4f14c066",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-02.log",
+   "size": 3124,
+   "sha256": "9fdb1b33bffa3c3a9d7e5c0955e9e0a9e2955588881a21bcea4026581118a936",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-03.log",
+   "size": 3109,
+   "sha256": "7bf379e0434b01d39eea518fb8f27b3a02faf83242469cf2aca3082a344caf58",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-04.log",
+   "size": 3137,
+   "sha256": "3b018687ed55ff55c72875528d3abd145e8006637dc152171f72f4896565598a",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-05.log",
+   "size": 3118,
+   "sha256": "e5f2b2a30630c04c9785a85f28257db0738ffb116605c1fc44793fe6480a4fc7",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-06.log",
+   "size": 3119,
+   "sha256": "f4be9650d1cb2b189093ec82ea7e37d4c58c0427bac0ff125101f18c0251d46b",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-07.log",
+   "size": 3153,
+   "sha256": "38bc5d3a91eac8b9bcf31d816ade57d560c736d01dd630fef135ec6bed1898b6",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-08.log",
+   "size": 3081,
+   "sha256": "4cb74d90c083af305ccc05f3e56fa03cc939ac3d060315f6d6fb34d8175d30c4",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-09.log",
+   "size": 3137,
+   "sha256": "adadd84dd17ced26476992b60c70659c66fe7ed5313393503b88e8c5ea8d6c74",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-10.log",
+   "size": 3174,
+   "sha256": "158cd76f1db606e8dd51eb4ee420c227e166c3e073df8920cfd2ea6448cdb4c0",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-11.log",
+   "size": 3124,
+   "sha256": "aaed7f08063a3780abaea59bac136cae5053934b0c5fc46dc63ca1bca827857c",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-12.log",
+   "size": 3205,
+   "sha256": "878c569540afe0f5307b3d41dd2451ff8dced17ee868cd8bb603266a6b89b9c7",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-13.log",
+   "size": 3049,
+   "sha256": "95039a6664d137092cebb7694356f8a71f9e1bdc60a764434b76de8a182edeb6",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-14.log",
+   "size": 3153,
+   "sha256": "f561453762862e59554c85e57615a2871948228690c247f2277048f7ae0e65f7",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/day-15.log",
+   "size": 3158,
+   "sha256": "a3ba45fd161769f94035a6c773ad4b7801c49dbfd34b9d7f5676214f34694a7b",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "logs/with-dict.log",
+   "size": 3513,
+   "sha256": "f060a042bf15914d04b101b13f967b9b1ba9ecd033b1bd320d1ca6f20b1402f6",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "meta/typed.json",
+   "size": 760,
+   "sha256": "43391fa804fd52c61d00549a45d2485eecaa331a253f90476b39138a1bede539",
+   "content_type": "application/json",
+   "custom_meta_origin": "v0.1.4"
+  },
+  {
+   "bucket": "media",
+   "key": "multipart/joined.bin",
+   "size": 21106,
+   "sha256": "5b0aa674cf65959d4d8475f0181b2f80a8d16337bd0bd3efbd29dd3345fd61a4",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "raw/random.bin",
+   "size": 6000,
+   "sha256": "ba4634cc57487b99cd9305126379ca52eb672b024fa882115bb206876689b1c9",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "other",
+   "key": "logs/day-00.log",
+   "size": 2075,
+   "sha256": "c323dd019553d0e167ef11b503694278fa800c904ab5a005ab26a7334caf8018",
+   "content_type": null,
+   "custom_meta_origin": null
+  }
+ ],
+ "soft_deleted": [
+  {
+   "bucket": "media",
+   "key": "trash/deleted.txt"
+  }
+ ]
+}

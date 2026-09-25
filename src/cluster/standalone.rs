@@ -1,4 +1,6 @@
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
+use crate::storage::multipart::CompletedPart;
+use crate::storage::write_path::WriteConditions;
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
 use crate::storage::types::{DeletePrefixOutcome, ListCountResult, ListResult, ObjectMetadata};
@@ -36,9 +38,10 @@ impl StandaloneBackend {
         content_type: Option<&str>,
         custom_meta: Option<&str>,
         body: impl tokio::io::AsyncRead + Unpin,
+        conditions: WriteConditions<'_>,
     ) -> Result<ObjectMetadata, StorageError> {
         self.0
-            .put_object(bucket, key, content_type, custom_meta, body)
+            .put_object_conditional(bucket, key, content_type, custom_meta, body, conditions)
             .await
     }
 
@@ -184,9 +187,10 @@ impl StandaloneBackend {
         key: &str,
         upload_id: &str,
         custom_meta: Option<&str>,
+        parts: Option<&[CompletedPart]>,
     ) -> Result<ObjectMetadata, StorageError> {
         self.0
-            .complete_multipart(bucket, key, upload_id, custom_meta)
+            .complete_multipart_with_parts(bucket, key, upload_id, custom_meta, parts)
             .await
     }
 

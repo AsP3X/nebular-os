@@ -6,42 +6,40 @@ use sqlx::{Pool, Sqlite};
 use tokio::fs;
 use tokio::sync::Semaphore;
 
-use super::blob_ops::link_or_copy_blob;
+use super::blob_ops::{link_or_copy_blob, sync_file};
 use super::block_cache::BlockDecodeCache;
 use super::blocks::BlockStore;
 use super::compressibility::DEFAULT_MIN_COMPRESSIBLE_SIZE;
 use super::compression::{self, DEFAULT_BLOCK_SIZE, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_LEVEL_UPLOAD};
-use super::dict_store::DictStore;
+use super::dict_store::{DictStore, IdentifiedDict};
 use super::error::{internal, StorageError};
+use super::key_locks::KeyLocks;
 use super::metadata_backend::MetadataBackendKind;
 use super::metadata_mode::MetadataMode;
 use super::object_meta::{ObjectMetaConnect, ObjectMetaStore};
-use super::range::parse_content_range;
+use super::range::{evaluate_range, RangeRequest};
 use super::streaming::{
-    finalize_temp_to_blob, open_object_body_stream, stream_body_to_temp, BlobFinalizeOptions,
-    GuardedObjectBodyStream,
+    open_object_body_stream, stream_body_to_temp, BlobFinalizeOptions, GuardedObjectBodyStream,
 };
+use super::write_path::{CommitHook, Committed, MetaCommit, WriteConditions};
 use super::blob_finalize::ReadContext;
-use super::precondition::{check_write_preconditions, etag_matches};
+use super::precondition::check_write_preconditions;
 use super::types::{
     DeletedObjectRef, DeletePrefixFailure, DeletePrefixOutcome, ListCountResult, ListItem,
     ListResult, ObjectMetadata,
 };
 use super::{
-    blob_path, blob_path_variants, first_existing_blob_path, object_key_from_blob_relpath,
+    blob_path_variants, check_new_object, first_existing_blob_path, object_key_from_blob_relpath,
     sanitize_bucket, sanitize_key,
 };
+
+/// Keys a bulk delete locks and removes at a time.
+const BULK_DELETE_CHUNK: usize = 64;
 
 pub(crate) const DEFAULT_UPLOAD_BUFFER: usize = 256 * 1024;
 const DEFAULT_LIST_SCAN_CAP: i64 = 4096;
 const DEFAULT_BULK_DELETE_CONCURRENCY: usize = 32;
 const DEFAULT_BULK_DELETE_BATCH_LIMIT: u64 = 1000;
-
-fn escape_like_pattern(s: &str) -> String {
-    s.replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
-}
 
 /// Outcome of GET after conditional header checks against stored metadata.
 /// Per-check results for `GET /health/ready`.
@@ -74,6 +72,8 @@ pub enum GetObjectOutcome {
         stream: GuardedObjectBodyStream,
         content_length: u64,
         total_size: u64,
+        /// Inclusive byte span served when a Range was honored (206); `None` means the full body (200).
+        range: Option<(u64, u64)>,
         meta: Box<ObjectMetadata>,
     },
 }
@@ -105,11 +105,15 @@ pub struct EngineOptions {
     pub compress_block_size: usize,
     pub compress_exclude_extensions: Vec<String>,
     pub block_cache_entries: usize,
+    /// Byte budget for decoded blocks held by the cache (NOS_BLOCK_CACHE_MAX_BYTES).
+    pub block_cache_max_bytes: usize,
     pub verify_batch_size: usize,
     pub scrub_sample_denom: u64,
     pub scrub_mode_light: bool,
     pub verify_on_read: bool,
     pub read_buffer_size: usize,
+    /// fsync blob data and its directory before a write becomes visible (NOS_FSYNC_WRITES).
+    pub fsync_writes: bool,
 }
 
 impl Default for EngineOptions {
@@ -141,14 +145,21 @@ impl Default for EngineOptions {
             compress_block_size: DEFAULT_BLOCK_SIZE,
             compress_exclude_extensions: Vec::new(),
             block_cache_entries: 256,
+            block_cache_max_bytes: super::block_cache::DEFAULT_BLOCK_CACHE_MAX_BYTES,
             verify_batch_size: 100,
             scrub_sample_denom: 1,
             scrub_mode_light: false,
             verify_on_read: false,
             read_buffer_size: 256 * 1024,
+            fsync_writes: true,
         }
     }
 }
+
+/// maintenance_state key holding the last key the periodic scrub visited ("" = start over).
+const SCRUB_CURSOR: &str = "scrub_cursor";
+/// maintenance_state key holding how many full passes the periodic scrub has completed (its sample slice).
+const SCRUB_EPOCH: &str = "scrub_epoch";
 
 #[derive(Clone)]
 pub struct StorageEngine {
@@ -188,6 +199,25 @@ pub struct StorageEngine {
     verify_on_read: bool,
     read_buffer_pool: super::buffer_pool::BufferPool,
     read_buffer_size: usize,
+    key_locks: KeyLocks,
+    capacity_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bytes admitted under NOS_MAX_LOGICAL_BYTES by writes that haven't committed yet (`CapacityReservation`).
+    capacity_in_flight: Arc<std::sync::atomic::AtomicI64>,
+    fsync_writes: bool,
+}
+
+/// Human: Room a write was admitted for under NOS_MAX_LOGICAL_BYTES, counted against the cap until the write has
+/// committed (its size is then in the metadata totals) or failed; released on drop.
+pub(crate) struct CapacityReservation {
+    in_flight: Arc<std::sync::atomic::AtomicI64>,
+    bytes: i64,
+}
+
+impl Drop for CapacityReservation {
+    fn drop(&mut self) {
+        self.in_flight
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 pub(crate) struct TempFileGuard {
@@ -257,6 +287,14 @@ impl StorageEngine {
         fs::create_dir_all(format!("{}/.tmp", data_dir))
             .await
             .map_err(internal)?;
+        let tmp_dir = PathBuf::from(format!("{data_dir}/.tmp"));
+        let portable = tokio::task::spawn_blocking(move || super::blob_paths::configure_filenames_for(&tmp_dir))
+            .await
+            .map_err(internal)?
+            .map_err(internal)?;
+        if portable {
+            tracing::info!("blob filenames: portable (filesystem ignores case, or Windows)");
+        }
         fs::create_dir_all(format!("{}/.multipart", data_dir))
             .await
             .map_err(internal)?;
@@ -269,7 +307,7 @@ impl StorageEngine {
 
         BlockStore::init_schema(&system_write).await?;
 
-        Ok(Self {
+        let engine = Self {
             object_meta,
             system_write,
             system_read,
@@ -299,7 +337,10 @@ impl StorageEngine {
             compress_min_size: opts.compress_min_size.max(1),
             compress_block_size: opts.compress_block_size.max(4096),
             compress_exclude_extensions: Arc::new(opts.compress_exclude_extensions),
-            block_decode_cache: BlockDecodeCache::new(opts.block_cache_entries),
+            block_decode_cache: BlockDecodeCache::with_byte_budget(
+                opts.block_cache_entries,
+                opts.block_cache_max_bytes,
+            ),
             verify_batch_size: opts.verify_batch_size.max(1),
             scrub_sample_denom: opts.scrub_sample_denom.max(1),
             scrub_mode_light: opts.scrub_mode_light,
@@ -309,7 +350,13 @@ impl StorageEngine {
                 32,
             ),
             read_buffer_size: opts.read_buffer_size.max(4096),
-        })
+            key_locks: KeyLocks::default(),
+            capacity_lock: Arc::new(tokio::sync::Mutex::new(())),
+            capacity_in_flight: Arc::default(),
+            fsync_writes: opts.fsync_writes,
+        };
+        engine.recover_interrupted_swaps().await?;
+        Ok(engine)
     }
 
     pub fn write_pool(&self) -> &Pool<Sqlite> {
@@ -334,6 +381,48 @@ impl StorageEngine {
 
     pub fn object_meta(&self) -> &ObjectMetaStore {
         &self.object_meta
+    }
+
+    /// Per-object write locks shared by every clone of this engine.
+    pub fn key_locks(&self) -> &KeyLocks {
+        &self.key_locks
+    }
+
+    /// Human: Admit a write of `incoming_bytes` replacing `existing_bytes` under NOS_MAX_LOGICAL_BYTES. Writes still
+    /// in flight count too, so concurrent writes can't overshoot the cap together; the lock covers only this check
+    /// (it used to cover each write's file and metadata I/O, which ran every write on a capped node one at a time).
+    /// Agent: RETURNS None without a cap; Err(InsufficientStorage) over it; HOLD the reservation until committed.
+    pub(crate) async fn reserve_capacity(
+        &self,
+        existing_bytes: i64,
+        incoming_bytes: u64,
+    ) -> Result<Option<CapacityReservation>, StorageError> {
+        if self.max_logical_bytes <= 0 {
+            return Ok(None);
+        }
+        let _check = self.capacity_lock.lock().await;
+        let current = self.total_bytes().await?;
+        let in_flight = self
+            .capacity_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let incoming = i64::try_from(incoming_bytes).unwrap_or(i64::MAX);
+        let projected = current
+            .saturating_add(in_flight)
+            .saturating_sub(existing_bytes)
+            .saturating_add(incoming);
+        if projected > self.max_logical_bytes {
+            return Err(StorageError::InsufficientStorage);
+        }
+        self.capacity_in_flight
+            .fetch_add(incoming, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(CapacityReservation {
+            in_flight: self.capacity_in_flight.clone(),
+            bytes: incoming,
+        }))
+    }
+
+    pub fn fsync_writes(&self) -> bool {
+        self.fsync_writes
     }
 
     /// Rejects writes when active logical bytes plus incoming would exceed NOS_MAX_LOGICAL_BYTES.
@@ -478,20 +567,24 @@ impl StorageEngine {
         &self.system_write
     }
 
+    /// The dictionary new blobs are compressed with, and its id (none unless NOS_ZSTD_DICT_ENABLED).
+    pub(crate) fn write_dictionary(&self) -> Option<IdentifiedDict> {
+        self.zstd_dict_enabled.then(|| self.dict_store.current()).flatten()
+    }
+
     pub(crate) fn blob_finalize_options(
         &self,
         existing: Option<PathBuf>,
         object_key: &str,
         content_type: Option<&str>,
     ) -> BlobFinalizeOptions {
-        let dict = if self.zstd_dict_enabled {
-            self.dict_store.global_dict()
-        } else {
-            None
+        let (dict_id, dict) = match self.write_dictionary() {
+            Some((id, dict)) => (id, Some(dict)),
+            None => (0, None),
         };
         BlobFinalizeOptions {
             level: self.zstd_level_upload,
-            dict_id: 0,
+            dict_id,
             dict,
             dedup_enabled: self.dedup_enabled,
             dedup_block_size: self.dedup_block_size,
@@ -510,11 +603,9 @@ impl StorageEngine {
     pub fn read_context(&self) -> ReadContext {
         ReadContext {
             data_dir: self.data_dir.clone(),
-            dict: if self.zstd_dict_enabled {
-                self.dict_store.global_dict()
-            } else {
-                None
-            },
+            // Human: Always, whatever NOS_ZSTD_DICT_ENABLED says now — blobs written while it was on need the
+            // dictionary to decode, and turning the setting off used to make them unreadable.
+            dict: self.dict_store.global_dict(),
             block_cache: self.block_decode_cache.clone(),
             read_buffer_size: self.read_buffer_size,
             verify_on_read: self.verify_on_read,
@@ -556,24 +647,54 @@ impl StorageEngine {
     }
 
     pub async fn scrub_with_defaults(&self, limit: usize) -> Result<super::maintenance::VerifyBlobsReport, StorageError> {
-        let cursor = self.get_maintenance_state("scrub_cursor").await?;
+        let opts = self.next_scrub_options(limit).await?;
+        let report = self.scrub_objects(opts.clone()).await?;
+        self.save_scrub_progress(&opts, &report).await?;
+        Ok(report)
+    }
+
+    /// Human: Options for the next periodic scrub batch: the configured mode and sampling, resuming after the
+    /// key the previous batch stopped at, in the current pass's sample slice.
+    pub async fn next_scrub_options(&self, limit: usize) -> Result<super::scrub::ScrubOptions, StorageError> {
+        let start_after = self
+            .get_maintenance_state(SCRUB_CURSOR)
+            .await?
+            .filter(|c| !c.is_empty());
+        let sample_epoch = self
+            .get_maintenance_state(SCRUB_EPOCH)
+            .await?
+            .and_then(|e| e.parse().ok())
+            .unwrap_or(0);
         let mode = if self.scrub_mode_light {
             super::scrub::ScrubMode::Light
         } else {
             super::scrub::ScrubMode::Deep
         };
-        let report = self
-            .scrub_objects(super::scrub::ScrubOptions {
-                limit,
-                sample_denom: self.scrub_sample_denom,
-                mode,
-                start_after: cursor,
-            })
-            .await?;
-        if let Some(ref next) = report.next_start_after {
-            self.set_maintenance_state("scrub_cursor", next).await?;
+        Ok(super::scrub::ScrubOptions {
+            limit,
+            sample_denom: self.scrub_sample_denom,
+            sample_epoch,
+            mode,
+            start_after,
+        })
+    }
+
+    /// Human: Remember where the periodic scrub continues. After the last key it starts over — it used to keep
+    /// the final key, so every later batch was empty and objects were never re-verified — and moves to the next
+    /// sample slice, so sampled scrubs cover every key within `sample_denom` passes.
+    pub async fn save_scrub_progress(
+        &self,
+        opts: &super::scrub::ScrubOptions,
+        report: &super::maintenance::VerifyBlobsReport,
+    ) -> Result<(), StorageError> {
+        match report.next_start_after.as_deref() {
+            Some(key) if report.is_truncated => self.set_maintenance_state(SCRUB_CURSOR, key).await,
+            _ => {
+                let next_epoch = opts.sample_epoch.wrapping_add(1).to_string();
+                self.set_maintenance_state(SCRUB_EPOCH, &next_epoch).await?;
+                self.set_maintenance_state(SCRUB_CURSOR, "").await
+            }
         }
-        Ok(report)
     }
 
     async fn existing_blob_path(&self, bucket: &str, key: &str) -> Result<PathBuf, StorageError> {
@@ -582,17 +703,6 @@ impl StorageEngine {
             .await
             .map_err(internal)?
             .ok_or(StorageError::NotFound)
-    }
-
-    async fn existing_blob_path_optional(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<PathBuf>, StorageError> {
-        let variants = blob_path_variants(&self.data_dir, bucket, key);
-        first_existing_blob_path(&variants)
-            .await
-            .map_err(internal)
     }
 
     /// Human: Loads active object metadata when present, without treating a miss as an error.
@@ -628,17 +738,39 @@ impl StorageEngine {
         key: &str,
         content_type: Option<&str>,
         custom_meta: Option<&str>,
+        body: impl tokio::io::AsyncRead + Unpin,
+    ) -> Result<ObjectMetadata, StorageError> {
+        self.put_object_conditional(
+            bucket,
+            key,
+            content_type,
+            custom_meta,
+            body,
+            WriteConditions::default(),
+        )
+        .await
+    }
+
+    /// Human: PUT with If-Match / If-None-Match evaluated atomically with the write (under the key lock).
+    pub async fn put_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        content_type: Option<&str>,
+        custom_meta: Option<&str>,
         mut body: impl tokio::io::AsyncRead + Unpin,
+        conditions: WriteConditions<'_>,
     ) -> Result<ObjectMetadata, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        check_new_object(&bucket, &safe_key)?;
         let (meta, _) = self
-            .write_object_stream(&bucket, &safe_key, content_type, custom_meta, &mut body)
+            .write_object_stream(&bucket, &safe_key, content_type, custom_meta, &mut body, conditions)
             .await?;
         Ok(meta)
     }
 
-    /// Server-side copy using kernel copy when available, otherwise async file copy.
+    /// Server-side copy: the destination gets its own hard link (or copy) of the source blob.
     pub async fn copy_object(
         &self,
         src_bucket: &str,
@@ -648,38 +780,70 @@ impl StorageEngine {
         if_match: Option<&str>,
         if_none_match: Option<&str>,
     ) -> Result<ObjectMetadata, StorageError> {
+        let conditions = WriteConditions {
+            if_match,
+            if_none_match,
+            hook: None,
+        };
+        self.copy_object_conditional(src_bucket, src_key, dst_bucket, dst_key, conditions)
+            .await
+    }
+
+    /// `copy_object` with `conditions` (preconditions and hook) evaluated against the destination.
+    pub async fn copy_object_conditional(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+        conditions: WriteConditions<'_>,
+    ) -> Result<ObjectMetadata, StorageError> {
         let src_bucket = sanitize_bucket(src_bucket).map_err(|_| StorageError::InvalidBucket)?;
         let src_key = sanitize_key(src_key).map_err(|_| StorageError::InvalidKey)?;
         let dst_bucket = sanitize_bucket(dst_bucket).map_err(|_| StorageError::InvalidBucket)?;
         let dst_key = sanitize_key(dst_key).map_err(|_| StorageError::InvalidKey)?;
+        check_new_object(&dst_bucket, &dst_key)?;
 
-        if if_match.is_some() || if_none_match.is_some() {
-            self.ensure_write_preconditions(&dst_bucket, &dst_key, if_match, if_none_match)
-                .await?;
-        }
+        // Human: Lock source and destination so the source's bytes and metadata can't change mid-copy.
+        let _locks = self
+            .key_locks
+            .lock_many([
+                (src_bucket.as_str(), src_key.as_str()),
+                (dst_bucket.as_str(), dst_key.as_str()),
+            ])
+            .await;
 
         let src_meta = self.fetch_active_metadata(&src_bucket, &src_key).await?;
         let src_path = self.existing_blob_path(&src_bucket, &src_key).await?;
-        let dst_path = blob_path(&self.data_dir, &dst_bucket, &dst_key);
 
-        // Human: Hard-link the on-disk blob when possible so copies share storage on the same volume.
-        // Agent: CALLS link_or_copy_blob(src,dst); fallback fs::copy on EXDEV; metadata row for dst only.
-        self.ensure_capacity_for_write(&dst_bucket, &dst_key, src_meta.size as u64)
-            .await?;
-        let entries = BlockStore::manifest_entries(&src_path)?;
-        if entries.is_empty() {
-            link_or_copy_blob(&src_path, &dst_path).await?;
-        } else {
-            if dst_path.exists() {
-                BlockStore::release_blob(&self.system_write, &self.data_dir, &dst_path).await?;
-            }
-            link_or_copy_blob(&src_path, &dst_path).await?;
-            BlockStore::inc_refs(&self.system_write, &entries).await?;
+        // Human: Stage a hard link (same inode, no byte copy) and commit it like an upload.
+        // Agent: CALLS link_or_copy_blob(src, staging); inc_refs for the new owner; commit_staged_locked swaps it in.
+        let staging = PathBuf::from(format!(
+            "{}/.tmp/{}.stage",
+            self.data_dir,
+            uuid::Uuid::new_v4()
+        ));
+        let _staging_guard = TempFileGuard {
+            path: staging.clone(),
+        };
+        link_or_copy_blob(&src_path, &staging).await?;
+        if self.fsync_writes {
+            sync_file(&staging).await?;
+        }
+        let refs = BlockStore::manifest_entries(&staging)?;
+        if !refs.is_empty() {
+            BlockStore::inc_refs(&self.system_write, &refs).await?;
         }
 
-        self.object_meta
-            .copy_object_metadata(&src_meta, &dst_bucket, &dst_key)
-            .await
+        self.commit_staged_locked(
+            &dst_bucket,
+            &dst_key,
+            &staging,
+            &refs,
+            MetaCommit::CopyOf(&src_meta),
+            conditions,
+        )
+        .await
     }
 
     async fn write_object_stream(
@@ -689,87 +853,33 @@ impl StorageEngine {
         content_type: Option<&str>,
         custom_meta: Option<&str>,
         body: &mut (impl tokio::io::AsyncRead + Unpin),
+        conditions: WriteConditions<'_>,
     ) -> Result<(ObjectMetadata, String), StorageError> {
-        let tmp_path = format!("{}/.tmp/{}.tmp", self.data_dir, uuid::Uuid::new_v4());
-        let final_path = blob_path(&self.data_dir, bucket, safe_key);
+        let tmp_path = PathBuf::from(format!(
+            "{}/.tmp/{}.tmp",
+            self.data_dir,
+            uuid::Uuid::new_v4()
+        ));
         let _tmp_guard = TempFileGuard {
-            path: PathBuf::from(&tmp_path),
+            path: tmp_path.clone(),
         };
 
-        // Human: Stream upload to a temp file, hash on the fly, then compress to the final blob without buffering the whole object in RAM.
-        // Agent: CALLS stream_body_to_temp; finalize_temp_to_blob(zstd_level); metadata size=logical bytes; TempFileGuard cleans tmp.
+        // Human: Stream the body to a temp file (hashing on the fly), then encode and commit it atomically.
+        // Agent: CALLS stream_body_to_temp; commit_upload_file (stage -> key lock -> checks -> rename -> metadata).
         let (size, etag) =
-            stream_body_to_temp(body, PathBuf::from(&tmp_path).as_path(), self.upload_buffer_size)
-                .await?;
-
-        let existing = self
-            .existing_blob_path_optional(bucket, safe_key)
-            .await?;
-        finalize_temp_to_blob(
-            PathBuf::from(&tmp_path).as_path(),
-            &final_path,
-            size,
-            self.blob_finalize_options(existing.clone(), safe_key, content_type),
-        )
-        .await?;
-
-        if let Some(old) = existing
-            && old != final_path
-            && old.exists()
-        {
-            BlockStore::release_blob(&self.system_write, &self.data_dir, &old).await?;
-            let _ = fs::remove_file(&old).await;
-        }
-
-        if let Err(e) = self
-            .ensure_capacity_for_write(bucket, safe_key, size)
-            .await
-        {
-            let _ = fs::remove_file(&final_path).await;
-            return Err(e);
-        }
-
-        if self.metadata_mode.is_blob_only() {
-            let now = chrono::Utc::now();
-            return Ok((
-                ObjectMetadata {
-                    bucket: bucket.to_string(),
-                    key: safe_key.to_string(),
-                    size: size as i64,
-                    mime_type: content_type.map(str::to_string),
-                    etag: Some(etag.clone()),
-                    created_at: now,
-                    updated_at: now,
-                    custom_meta: custom_meta.map(str::to_string),
-                    deleted_at: None,
-                    storage_class: None,
-                    origin_node: None,
-                },
-                etag,
-            ));
-        }
-
-        let meta = match self
-            .object_meta
-            .upsert_object(
-                &self.data_dir,
+            stream_body_to_temp(body, tmp_path.as_path(), self.upload_buffer_size).await?;
+        let meta = self
+            .commit_upload_file(
                 bucket,
                 safe_key,
-                size as i64,
-                content_type,
+                &tmp_path,
+                size,
                 &etag,
+                content_type,
                 custom_meta,
-                None,
-                None,
+                conditions,
             )
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                let _ = fs::remove_file(&final_path).await;
-                return Err(e);
-            }
-        };
+            .await?;
         Ok((meta, etag))
     }
 
@@ -783,6 +893,9 @@ impl StorageEngine {
     ) -> Result<GetObjectOutcome, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        // Human: Read the metadata and open the blob as one step relative to writers of this key; the stream
+        // keeps its own handle, so the lock is released before any byte is sent.
+        let _reading = self.key_locks.read(&bucket, &safe_key).await;
         let meta = if self.metadata_mode.is_blob_only() {
             self.fetch_blob_only_metadata(&bucket, &safe_key).await?
         } else {
@@ -794,12 +907,21 @@ impl StorageEngine {
         }
 
         let total_size = meta.size as u64;
-        let range = range_header.and_then(|h| parse_content_range(h, total_size));
+        let range = match range_header.map(|h| evaluate_range(h, total_size)) {
+            None | Some(RangeRequest::Ignore) => None,
+            Some(RangeRequest::Satisfiable { start, end }) => Some((start, end)),
+            Some(RangeRequest::Unsatisfiable) => {
+                return Err(StorageError::RangeNotSatisfiable { size: total_size });
+            }
+        };
 
         let path = self
             .existing_blob_path(&meta.bucket, &meta.key)
             .await?;
-        let (start, _end, content_length) = Self::resolve_range(range, total_size)?;
+        let (start, content_length) = match range {
+            Some((start, end)) => (start, end - start + 1),
+            None => (0, total_size),
+        };
 
         // Human: Stream object bytes from disk, decompressing via spill file or channel when the blob is zstd-wrapped.
         // Agent: CALLS open_object_body_stream(path, logical_size, range_start, content_length, data_dir); no full-blob RAM buffer.
@@ -818,6 +940,7 @@ impl StorageEngine {
             stream,
             content_length,
             total_size,
+            range,
             meta: Box::new(meta),
         })
     }
@@ -831,10 +954,14 @@ impl StorageEngine {
     ) -> Result<Option<ObjectMetadata>, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        let _reading = self.key_locks.read(&bucket, &safe_key).await;
         let meta = if self.metadata_mode.is_blob_only() {
             self.fetch_blob_only_metadata(&bucket, &safe_key).await?
         } else {
-            self.fetch_active_metadata(&bucket, &safe_key).await?
+            let meta = self.fetch_active_metadata(&bucket, &safe_key).await?;
+            // Human: Answer like GET would — a row whose blob is gone is not a readable object.
+            self.existing_blob_path(&meta.bucket, &meta.key).await?;
+            meta
         };
         if self.is_not_modified(&meta, if_none_match, if_modified_since) {
             return Ok(None);
@@ -848,20 +975,7 @@ impl StorageEngine {
         if_none_match: Option<&str>,
         if_modified_since: Option<i64>,
     ) -> bool {
-        if let Some(etag) = if_none_match {
-            if etag == "*" {
-                return true;
-            }
-            if let Some(stored) = &meta.etag
-                && etag_matches(stored, etag) {
-                    return true;
-                }
-        }
-        if let Some(since) = if_modified_since
-            && meta.updated_at.timestamp() <= since {
-                return true;
-            }
-        false
+        super::precondition::is_not_modified(meta, if_none_match, if_modified_since)
     }
 
     pub async fn delete_object(
@@ -870,16 +984,56 @@ impl StorageEngine {
         key: &str,
         if_match: Option<&str>,
     ) -> Result<(), StorageError> {
+        let conditions = WriteConditions {
+            if_match,
+            ..WriteConditions::default()
+        };
+        self.delete_object_conditional(bucket, key, conditions).await
+    }
+
+    /// Human: Delete with If-Match and a hook evaluated under the key's write lock. Deleting a missing object
+    /// succeeds; the hook sees it all the same (a delete replicates whether or not this node had the object).
+    /// Agent: KEY LOCK → If-Match check → hook.before → delete_object_locked → hook.after(Deleted { storage_class }).
+    pub async fn delete_object_conditional(
+        &self,
+        bucket: &str,
+        key: &str,
+        conditions: WriteConditions<'_>,
+    ) -> Result<(), StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         let safe_key = sanitize_key(key).map_err(|_| StorageError::InvalidKey)?;
+        // Human: Same lock as writers, so If-Match and the delete see one version and never race a PUT.
+        let _key_guard = self.key_locks.lock(&bucket, &safe_key).await;
 
-        if if_match.is_some() && !self.metadata_mode.is_blob_only() {
-            self.ensure_write_preconditions(&bucket, &safe_key, if_match, None)
+        if conditions.if_match.is_some() && !self.metadata_mode.is_blob_only() {
+            self.ensure_write_preconditions(&bucket, &safe_key, conditions.if_match, None)
                 .await?;
         }
+        let storage_class = if self.metadata_mode.is_blob_only() {
+            None
+        } else {
+            self.object_meta
+                .try_fetch_active_metadata(&bucket, &safe_key)
+                .await?
+                .map(|meta| meta.storage_class)
+        };
+        if let Some(hook) = conditions.hook {
+            hook.before(&bucket, &safe_key).await?;
+        }
+        self.delete_object_locked(&bucket, &safe_key, storage_class.is_some())
+            .await?;
+        if let Some(hook) = conditions.hook {
+            let storage_class = storage_class.as_ref().and_then(|class| class.as_deref());
+            hook.after(&bucket, &safe_key, Committed::Deleted { storage_class })
+                .await?;
+        }
+        Ok(())
+    }
 
+    /// Agent: CALLER HOLDS the key lock; `has_row` = an active metadata row exists (ignored in blob-only mode).
+    async fn delete_object_locked(&self, bucket: &str, key: &str, has_row: bool) -> Result<(), StorageError> {
         if self.metadata_mode.is_blob_only() {
-            let variants = blob_path_variants(&self.data_dir, &bucket, &safe_key);
+            let variants = blob_path_variants(&self.data_dir, bucket, key);
             if first_existing_blob_path(&variants)
                 .await
                 .map_err(internal)?
@@ -887,33 +1041,38 @@ impl StorageEngine {
             {
                 return Ok(());
             }
-            return self.drop_object_blob(&bucket, &safe_key).await;
+            return self.drop_object_blob(bucket, key).await;
         }
-
-        if self.object_meta.active_row_count(&bucket, &safe_key).await? == 0 {
+        if !has_row {
             return Ok(());
         }
 
+        // Human: Metadata first, then the bytes: a crash in between leaves an unreferenced file (reclaimed by
+        // orphan GC), never a listed object whose bytes are gone.
         if self.soft_delete_ttl_secs <= 0 {
-            self.drop_object_blob(&bucket, &safe_key).await?;
-            self.object_meta.hard_delete_object(&bucket, &safe_key).await?;
+            self.object_meta.hard_delete_object(bucket, key).await?;
+            self.drop_object_blob_best_effort(bucket, key).await;
             return Ok(());
         }
 
+        self.object_meta.soft_delete_object(bucket, key).await?;
         if self.soft_delete_drop_blob {
-            self.drop_object_blob(&bucket, &safe_key).await?;
+            self.drop_object_blob_best_effort(bucket, key).await;
         }
-
-        self.object_meta.soft_delete_object(&bucket, &safe_key).await?;
         Ok(())
     }
 
+    /// Drop the blob of an object whose metadata is already gone; a failure only leaves an orphan behind.
+    async fn drop_object_blob_best_effort(&self, bucket: &str, key: &str) {
+        if let Err(e) = self.drop_object_blob(bucket, key).await {
+            tracing::warn!(%bucket, %key, error = %e, "dropping a deleted object's blob failed; orphan GC reclaims it");
+        }
+    }
+
     async fn drop_object_blob(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
-        for path in blob_path_variants(&self.data_dir, bucket, key) {
-            if path.exists() {
-                BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
-                let _ = fs::remove_file(&path).await;
-            }
+        for path in super::existing_blob_paths(&blob_path_variants(&self.data_dir, bucket, key)) {
+            BlockStore::release_blob(&self.system_write, &self.data_dir, &path).await?;
+            let _ = fs::remove_file(&path).await;
         }
         Ok(())
     }
@@ -923,6 +1082,16 @@ impl StorageEngine {
         &self,
         bucket: &str,
         keys: &[String],
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        self.delete_objects_batch_hooked(bucket, keys, None).await
+    }
+
+    /// `delete_objects_batch`, calling `hook.after` for each deleted key under its write lock.
+    pub async fn delete_objects_batch_hooked(
+        &self,
+        bucket: &str,
+        keys: &[String],
+        hook: Option<&dyn CommitHook>,
     ) -> Result<DeletePrefixOutcome, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         if keys.is_empty() {
@@ -966,7 +1135,7 @@ impl StorageEngine {
             }
         }
 
-        let mut outcome = self.delete_objects_internal(&bucket, pending).await?;
+        let mut outcome = self.delete_objects_internal(&bucket, pending, hook).await?;
         outcome.failed.extend(failed);
         Ok(outcome)
     }
@@ -979,6 +1148,19 @@ impl StorageEngine {
         prefix: &str,
         limit: Option<u64>,
         start_after: Option<&str>,
+    ) -> Result<DeletePrefixOutcome, StorageError> {
+        self.delete_objects_by_prefix_hooked(bucket, prefix, limit, start_after, None)
+            .await
+    }
+
+    /// `delete_objects_by_prefix`, calling `hook.after` for each deleted key under its write lock.
+    pub async fn delete_objects_by_prefix_hooked(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        limit: Option<u64>,
+        start_after: Option<&str>,
+        hook: Option<&dyn CommitHook>,
     ) -> Result<DeletePrefixOutcome, StorageError> {
         let bucket = sanitize_bucket(bucket).map_err(|_| StorageError::InvalidBucket)?;
         if prefix.is_empty() {
@@ -993,18 +1175,16 @@ impl StorageEngine {
 
         if self.metadata_mode.is_blob_only() {
             return self
-                .delete_blob_only_prefix(&bucket, &safe_prefix, limit, start_after)
+                .delete_blob_only_prefix(&bucket, &safe_prefix, limit, start_after, hook)
                 .await;
         }
-
-        let prefix_pattern = format!("{}%", escape_like_pattern(&safe_prefix));
 
         let rows = self
             .object_meta
             .list_active_rows(
                 &bucket,
                 start_after,
-                &prefix_pattern,
+                &safe_prefix,
                 (limit as i64).saturating_add(1),
             )
             .await?;
@@ -1035,7 +1215,7 @@ impl StorageEngine {
             })
             .collect();
 
-        let mut outcome = self.delete_objects_internal(&bucket, pending).await?;
+        let mut outcome = self.delete_objects_internal(&bucket, pending, hook).await?;
         outcome.truncated = truncated;
         outcome.next_start_after = next_start_after;
         Ok(outcome)
@@ -1045,112 +1225,107 @@ impl StorageEngine {
         &self,
         bucket: &str,
         pending: Vec<DeletedObjectRef>,
+        hook: Option<&dyn CommitHook>,
     ) -> Result<DeletePrefixOutcome, StorageError> {
-        if pending.is_empty() {
-            return Ok(DeletePrefixOutcome {
-                deleted: 0,
-                failed: Vec::new(),
-                truncated: false,
-                next_start_after: None,
-                deleted_objects: Vec::new(),
-            });
-        }
-
-        let keys: Vec<String> = pending.iter().map(|r| r.key.clone()).collect();
-        let needs_blob_drop =
-            self.metadata_mode.is_blob_only() || self.soft_delete_ttl_secs <= 0 || self.soft_delete_drop_blob;
-
-        let mut blob_ok_keys: Vec<String> = Vec::with_capacity(keys.len());
-        let mut failed: Vec<DeletePrefixFailure> = Vec::new();
-
-        if needs_blob_drop {
-            let semaphore = Arc::new(Semaphore::new(self.bulk_delete_concurrency));
-            let mut join_set = tokio::task::JoinSet::new();
-            for key in keys {
-                let permit = semaphore
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| internal(anyhow::anyhow!("bulk delete worker pool closed")))?;
-                let engine = self.clone();
-                let bucket = bucket.to_string();
-                join_set.spawn(async move {
-                    let result = engine.drop_object_blob(&bucket, &key).await;
-                    drop(permit);
-                    (key, result)
-                });
-            }
-            while let Some(joined) = join_set.join_next().await {
-                match joined {
-                    Ok((key, Ok(()))) => blob_ok_keys.push(key),
-                    Ok((key, Err(e))) => failed.push(DeletePrefixFailure {
-                        key,
-                        error: e.to_string(),
-                    }),
-                    Err(e) => failed.push(DeletePrefixFailure {
-                        key: String::new(),
-                        error: format!("bulk delete task failed: {e}"),
-                    }),
-                }
-            }
-        } else {
-            blob_ok_keys = keys;
-        }
-
-        let deleted_objects: Vec<DeletedObjectRef> = pending
-            .into_iter()
-            .filter(|r| blob_ok_keys.iter().any(|k| k == &r.key))
-            .collect();
-
-        let (deleted, deleted_objects) = if blob_ok_keys.is_empty() || self.metadata_mode.is_blob_only() {
-            (blob_ok_keys.len() as u64, deleted_objects)
-        } else if self.soft_delete_ttl_secs <= 0 {
-            let metadata_result = self
-                .object_meta
-                .hard_delete_objects(bucket, &blob_ok_keys)
-                .await;
-            match metadata_result {
-                Ok(n) => (n, deleted_objects),
-                Err(e) => {
-                    let err = e.to_string();
-                    for key in blob_ok_keys {
-                        failed.push(DeletePrefixFailure {
-                            key,
-                            error: err.clone(),
-                        });
-                    }
-                    (0, Vec::new())
-                }
-            }
-        } else {
-            let metadata_result = self
-                .object_meta
-                .soft_delete_objects(bucket, &blob_ok_keys)
-                .await;
-            match metadata_result {
-                Ok(n) => (n, deleted_objects),
-                Err(e) => {
-                    let err = e.to_string();
-                    for key in blob_ok_keys {
-                        failed.push(DeletePrefixFailure {
-                            key,
-                            error: err.clone(),
-                        });
-                    }
-                    (0, Vec::new())
-                }
-            }
-        };
-
-        failed.retain(|f| !f.key.is_empty());
-
-        Ok(DeletePrefixOutcome {
-            deleted,
-            failed,
+        let mut outcome = DeletePrefixOutcome {
+            deleted: 0,
+            failed: Vec::new(),
             truncated: false,
             next_start_after: None,
-            deleted_objects,
-        })
+            deleted_objects: Vec::new(),
+        };
+        let mut hook_error = None;
+        // Human: A chunk at a time. Each key's write lock is held across its metadata update and blob drop, so a
+        // concurrent PUT can't land between them — but only for one chunk's keys: holding every lock of a large
+        // delete (thousands of lock stripes) stalled reads and writes of unrelated keys until it finished.
+        // Agent: BULK_DELETE_CHUNK keys per lock_many; a failed chunk is reported in `failed`, the rest continue.
+        for chunk in pending.chunks(BULK_DELETE_CHUNK) {
+            let keys: Vec<String> = chunk.iter().map(|r| r.key.clone()).collect();
+            let _key_guards = self
+                .key_locks
+                .lock_many(keys.iter().map(|k| (bucket, k.as_str())))
+                .await;
+            let removed: Vec<DeletedObjectRef> = if self.metadata_mode.is_blob_only() {
+                let (dropped, failed) = self.drop_blobs_concurrently(bucket, keys).await?;
+                outcome.failed.extend(failed);
+                outcome.deleted += dropped.len() as u64;
+                chunk.iter().filter(|r| dropped.contains(&r.key)).cloned().collect()
+            } else {
+                // Human: Metadata first, then the bytes: if the metadata update fails nothing is deleted, and a
+                // blob that can't be dropped afterwards is only an orphan for GC — never a listed object without bytes.
+                let metadata_result = if self.soft_delete_ttl_secs <= 0 {
+                    self.object_meta.hard_delete_objects(bucket, &keys).await
+                } else {
+                    self.object_meta.soft_delete_objects(bucket, &keys).await
+                };
+                match metadata_result {
+                    Ok(n) => outcome.deleted += n,
+                    Err(e) => {
+                        let error = e.to_string();
+                        outcome.failed.extend(keys.into_iter().map(|key| DeletePrefixFailure {
+                            key,
+                            error: error.clone(),
+                        }));
+                        continue;
+                    }
+                }
+                if self.soft_delete_ttl_secs <= 0 || self.soft_delete_drop_blob {
+                    let (_, blob_failures) = self.drop_blobs_concurrently(bucket, keys).await?;
+                    for failure in blob_failures {
+                        tracing::warn!(
+                            %bucket, key = %failure.key, error = %failure.error,
+                            "dropping a deleted object's blob failed; orphan GC reclaims it"
+                        );
+                    }
+                }
+                chunk.to_vec()
+            };
+            if let Err(e) = report_bulk_deletes(hook, bucket, &removed).await {
+                hook_error.get_or_insert(e);
+            }
+            outcome.deleted_objects.extend(removed);
+        }
+        match hook_error {
+            Some(e) => Err(e),
+            None => Ok(outcome),
+        }
+    }
+
+    /// Drop the blobs of `keys` with bounded concurrency; RETURNS the keys dropped and the failures.
+    async fn drop_blobs_concurrently(
+        &self,
+        bucket: &str,
+        keys: Vec<String>,
+    ) -> Result<(Vec<String>, Vec<DeletePrefixFailure>), StorageError> {
+        let semaphore = Arc::new(Semaphore::new(self.bulk_delete_concurrency));
+        let mut join_set = tokio::task::JoinSet::new();
+        for key in keys {
+            let permit = semaphore
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| internal(anyhow::anyhow!("bulk delete worker pool closed")))?;
+            let engine = self.clone();
+            let bucket = bucket.to_string();
+            join_set.spawn(async move {
+                let result = engine.drop_object_blob(&bucket, &key).await;
+                drop(permit);
+                (key, result)
+            });
+        }
+        let mut dropped = Vec::new();
+        let mut failed = Vec::new();
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok((key, Ok(()))) => dropped.push(key),
+                Ok((key, Err(e))) => failed.push(DeletePrefixFailure {
+                    key,
+                    error: e.to_string(),
+                }),
+                Err(e) => tracing::error!(%bucket, error = %e, "bulk delete task failed"),
+            }
+        }
+        Ok((dropped, failed))
     }
 
     async fn delete_blob_only_prefix(
@@ -1159,6 +1334,7 @@ impl StorageEngine {
         prefix: &str,
         limit: usize,
         start_after: &str,
+        hook: Option<&dyn CommitHook>,
     ) -> Result<DeletePrefixOutcome, StorageError> {
         let keys = self
             .list_blob_only_keys(bucket, Some(prefix), limit.saturating_add(1))
@@ -1181,7 +1357,7 @@ impl StorageEngine {
                 storage_class: None,
             })
             .collect();
-        let mut outcome = self.delete_objects_internal(bucket, pending).await?;
+        let mut outcome = self.delete_objects_internal(bucket, pending, hook).await?;
         outcome.truncated = truncated;
         outcome.next_start_after = next_start_after;
         Ok(outcome)
@@ -1235,29 +1411,6 @@ impl StorageEngine {
         self.object_meta.fetch_active_metadata(bucket, key).await
     }
 
-    fn resolve_range(
-        range: Option<(u64, u64)>,
-        total_size: u64,
-    ) -> Result<(u64, u64, u64), StorageError> {
-        match range {
-            Some((_s, _e)) if total_size == 0 => Err(StorageError::RangeNotSatisfiable),
-            Some((s, e)) => {
-                if s >= total_size {
-                    return Err(StorageError::RangeNotSatisfiable);
-                }
-                let end = e.min(total_size - 1);
-                Ok((s, end, end - s + 1))
-            }
-            None => {
-                if total_size == 0 {
-                    Ok((0, 0, 0))
-                } else {
-                    Ok((0, total_size - 1, total_size))
-                }
-            }
-        }
-    }
-
     /// Returns the count of active objects under `prefix` without listing every key.
     pub async fn count_objects_by_prefix(
         &self,
@@ -1275,10 +1428,9 @@ impl StorageEngine {
                 prefix: Some(prefix.to_string()),
             });
         }
-        let prefix_pattern = format!("{}%", escape_like_pattern(prefix));
         let count = self
             .object_meta
-            .count_active_with_prefix(&bucket, &prefix_pattern)
+            .count_active_with_prefix(&bucket, prefix)
             .await?;
         Ok(ListCountResult {
             count: count.max(0) as u64,
@@ -1385,8 +1537,6 @@ impl StorageEngine {
         let limit = limit.unwrap_or(100).min(1000) as usize;
         let prefix = prefix.unwrap_or("");
         let start_after = start_after.unwrap_or("");
-        let prefix_pattern = format!("{}%", escape_like_pattern(prefix));
-
         let scan_limit = if delimiter.is_some() {
             self.list_scan_cap
         } else {
@@ -1395,7 +1545,7 @@ impl StorageEngine {
 
         let rows = self
             .object_meta
-            .list_active_rows(&bucket, start_after, &prefix_pattern, scan_limit)
+            .list_active_rows(&bucket, start_after, prefix, scan_limit)
             .await?;
 
         if delimiter.is_none() {
@@ -1438,7 +1588,10 @@ impl StorageEngine {
         for row in rows {
             last_scanned = Some(row.key.clone());
             let key = &row.key;
-            let remainder = key.strip_prefix(prefix).unwrap_or(key.as_str());
+            // Human: The store returns only keys under `prefix`; skip anything else rather than slice blindly.
+            let Some(remainder) = key.strip_prefix(prefix) else {
+                continue;
+            };
             if let Some(pos) = remainder.find(delimiter) {
                 let prefix_end = prefix.len() + pos + delimiter.len();
                 let folder = key[..prefix_end].to_string();
@@ -1473,7 +1626,7 @@ impl StorageEngine {
             } else if let Some(ref last) = last_scanned {
                 let count = self
                     .object_meta
-                    .count_keys_after(&bucket, last, &prefix_pattern)
+                    .count_keys_after(&bucket, last, prefix)
                     .await?;
                 is_truncated = count > 0;
             }
@@ -1533,5 +1686,150 @@ impl StorageEngine {
         &self,
     ) -> Result<Vec<(String, i64)>, StorageError> {
         self.object_meta.objects_by_storage_class().await
+    }
+}
+
+/// Human: Tell `hook` about each key a bulk delete removed (their write locks are still held). A failure for one
+/// key doesn't stop the others: their rows are already gone, so no retry of the delete would reach them again.
+/// Agent: CALLS hook.after for every key; LOGS each failure; RETURNS the first error.
+async fn report_bulk_deletes(
+    hook: Option<&dyn CommitHook>,
+    bucket: &str,
+    deleted: &[DeletedObjectRef],
+) -> Result<(), StorageError> {
+    let Some(hook) = hook else {
+        return Ok(());
+    };
+    let mut first_error = None;
+    for object in deleted {
+        let storage_class = object.storage_class.as_deref();
+        if let Err(e) = hook
+            .after(bucket, &object.key, Committed::Deleted { storage_class })
+            .await
+        {
+            tracing::error!(%bucket, key = %object.key, error = %e, "recording a deleted object failed");
+            first_error.get_or_insert(e);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use futures_util::future::BoxFuture;
+
+    use super::*;
+    use crate::storage::key_locks::KeyLocks;
+
+    /// Takes its time over every deleted key, like a replication hook waiting on a busy database.
+    struct SlowRecorder;
+
+    impl CommitHook for SlowRecorder {
+        fn before<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Result<(), StorageError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn after<'a>(&'a self, _: &'a str, _: &'a str, _: Committed<'a>) -> BoxFuture<'a, Result<(), StorageError>> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok(())
+            })
+        }
+    }
+
+    /// Records every key it is told about and fails for one of them.
+    struct FlakyRecorder {
+        seen: std::sync::Mutex<Vec<String>>,
+        fail_on: &'static str,
+    }
+
+    impl CommitHook for FlakyRecorder {
+        fn before<'a>(&'a self, _: &'a str, _: &'a str) -> BoxFuture<'a, Result<(), StorageError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn after<'a>(&'a self, _: &'a str, key: &'a str, _: Committed<'a>) -> BoxFuture<'a, Result<(), StorageError>> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(key.to_string());
+                if key == self.fail_on {
+                    return Err(StorageError::Internal(anyhow::anyhow!("database is locked")));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    async fn test_engine() -> (StorageEngine, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let data_dir = tmp.path().join("blobs");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let meta = format!("file:{}?mode=memory&cache=shared", uuid::Uuid::new_v4());
+        let opts = EngineOptions {
+            fsync_writes: false,
+            ..EngineOptions::default()
+        };
+        let engine = StorageEngine::with_full_options(&meta, &data_dir.to_string_lossy(), opts)
+            .await
+            .unwrap();
+        (engine, tmp)
+    }
+
+    #[tokio::test]
+    async fn a_failed_record_doesnt_stop_a_bulk_delete_recording_the_rest() {
+        let (engine, _tmp) = test_engine().await;
+        let keys: Vec<String> = (0..10).map(|i| format!("k-{i}")).collect();
+        for key in &keys {
+            engine
+                .put_object("bulk", key, None, None, std::io::Cursor::new(b"x".to_vec()))
+                .await
+                .unwrap();
+        }
+        let recorder = FlakyRecorder {
+            seen: std::sync::Mutex::new(Vec::new()),
+            fail_on: "k-3",
+        };
+        let result = engine.delete_objects_batch_hooked("bulk", &keys, Some(&recorder)).await;
+        assert!(result.is_err(), "the failure is reported");
+        // Human: The rows are gone either way; keys after the failure used to go unrecorded (never replicated).
+        assert_eq!(*recorder.seen.lock().unwrap(), keys);
+        assert_eq!(engine.object_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_deletes_lock_one_chunk_of_keys_at_a_time() {
+        let (engine, _tmp) = test_engine().await;
+        let keys: Vec<String> = (0..640).map(|i| format!("k-{i}")).collect();
+        for key in &keys {
+            engine
+                .put_object("bulk", key, None, None, std::io::Cursor::new(b"x".to_vec()))
+                .await
+                .unwrap();
+        }
+        // Human: An unrelated object sharing a lock stripe with the delete's last key.
+        let stripe = KeyLocks::stripe("bulk", keys.last().unwrap());
+        let neighbour = (0..)
+            .map(|i| format!("neighbour-{i}"))
+            .find(|k| KeyLocks::stripe("bulk", k) == stripe)
+            .unwrap();
+        engine
+            .put_object("bulk", &neighbour, None, None, std::io::Cursor::new(b"n".to_vec()))
+            .await
+            .unwrap();
+
+        let deleting = {
+            let engine = engine.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move { engine.delete_objects_batch_hooked("bulk", &keys, Some(&SlowRecorder)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        engine.head_object("bulk", &neighbour, None, None).await.unwrap();
+        // Human: Holding all 640 keys' locks kept this read waiting for the whole delete (~3 s of hook time).
+        assert!(started.elapsed() < Duration::from_secs(1), "read waited {:?}", started.elapsed());
+        let outcome = deleting.await.unwrap().unwrap();
+        assert_eq!(outcome.deleted, 640);
+        assert_eq!(outcome.deleted_objects.len(), 640);
     }
 }

@@ -5,6 +5,7 @@ use axum::{
     Json,
 };
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::routes::AppState;
 
@@ -26,41 +27,69 @@ pub struct MetricsResponse {
     pub storage_class_counts: Vec<StorageClassCount>,
 }
 
+/// How long computed storage totals are reused. Computing them scans the metadata tables, and /metrics is open
+/// to anyone unless NOS_METRICS_TOKEN is set, so scrapes share one result instead of each running the scans.
+const STORAGE_STATS_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct StorageStats {
+    total_objects: i64,
+    total_bytes: i64,
+    replication_pending_events: u64,
+    storage_class_counts: Vec<(String, i64)>,
+}
+
+/// Human: The last computed storage totals. Holding the lock while computing makes concurrent scrapes wait for
+/// one computation instead of starting their own.
+#[derive(Default)]
+pub struct StorageStatsCache(tokio::sync::Mutex<Option<(Instant, StorageStats)>>);
+
+impl StorageStatsCache {
+    async fn get(&self, state: &AppState) -> Result<StorageStats, StatusCode> {
+        let mut cached = self.0.lock().await;
+        if let Some((at, stats)) = cached.as_ref()
+            && at.elapsed() < STORAGE_STATS_TTL
+        {
+            return Ok(stats.clone());
+        }
+        let stats = compute_storage_stats(state).await?;
+        *cached = Some((Instant::now(), stats.clone()));
+        Ok(stats)
+    }
+}
+
+async fn compute_storage_stats(state: &AppState) -> Result<StorageStats, StatusCode> {
+    let failed = |what: &'static str| {
+        move |e: crate::storage::error::StorageError| {
+            tracing::error!(error = %e, "{what} failed");
+            state.metrics.inc_errors();
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+    let backend = state.backend();
+    Ok(StorageStats {
+        total_objects: backend.object_count().await.map_err(failed("object_count"))?,
+        total_bytes: backend.total_bytes().await.map_err(failed("total_bytes"))?,
+        replication_pending_events: backend.pending_replication_events().await.unwrap_or(0),
+        storage_class_counts: backend
+            .engine()
+            .objects_by_storage_class()
+            .await
+            .unwrap_or_default(),
+    })
+}
+
 pub async fn metrics(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
     state.metrics.inc_requests();
-
-    let total_objects = state
-        .backend()
-        .object_count()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "object_count failed");
-            state.metrics.inc_errors();
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let total_bytes = state
-        .backend()
-        .total_bytes()
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, "total_bytes failed");
-            state.metrics.inc_errors();
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-    let replication_pending_events = state
-        .backend()
-        .pending_replication_events()
-        .await
-        .unwrap_or(0);
-    let storage_class_counts = state
-        .backend()
-        .engine()
-        .objects_by_storage_class()
-        .await
-        .unwrap_or_default();
+    let StorageStats {
+        total_objects,
+        total_bytes,
+        replication_pending_events,
+        storage_class_counts,
+    } = state.storage_stats.get(&state).await?;
 
     let accept = headers
         .get(header::ACCEPT)

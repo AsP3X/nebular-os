@@ -4,15 +4,16 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map};
-use std::io;
 use std::sync::Arc;
 
 use crate::routes::errors::map_storage_error;
+use crate::storage::error::StorageError;
+use crate::storage::multipart::CompletedPart;
 use crate::routes::helpers::write_context_from_headers;
-use crate::routes::object::LimitReader;
+use crate::routes::body_digest::ExpectedDigests;
+use crate::routes::object::upload_body_reader;
 use crate::routes::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -37,6 +38,9 @@ pub struct UploadSessionParams {
     bucket: String,
     upload_id: String,
 }
+
+/// Largest accepted complete-multipart body (a 10,000-part list is well under this).
+const MAX_COMPLETE_BODY: usize = 1024 * 1024;
 
 pub async fn init_multipart(
     State(state): State<Arc<AppState>>,
@@ -65,11 +69,21 @@ pub async fn init_multipart(
     }
 }
 
+/// Largest part number, as in S3; with NOS_MULTIPART_PART_SIZE per part this also bounds an upload's size.
+const MAX_PART_NUMBER: i32 = 10_000;
+
 pub async fn upload_part(
     State(state): State<Arc<AppState>>,
     Path(params): Path<UploadPartParams>,
     req: Request,
 ) -> Response {
+    if !(1..=MAX_PART_NUMBER).contains(&params.part_number) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("part number must be between 1 and {MAX_PART_NUMBER}") })),
+        )
+            .into_response();
+    }
     let key = match state
         .backend()
         .multipart_key_for_upload(&params.upload_id)
@@ -80,17 +94,19 @@ pub async fn upload_part(
     };
 
     let write_ctx = write_context_from_headers(req.headers(), None);
-    let max_part = state.backend().multipart_part_size();
-    let body_stream = req.into_body().into_data_stream();
-    let body_reader = tokio_util::io::StreamReader::new(
-        body_stream.map(|result| {
-            result.map_err(io::Error::other)
-        }),
-    );
-    let body_reader = LimitReader {
-        inner: body_reader,
-        remaining: max_part,
+    let digests = match ExpectedDigests::from_request(req.headers(), req.extensions()) {
+        Ok(digests) => digests,
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
     };
+    let max_part = state.backend().multipart_part_size();
+    let body_reader = upload_body_reader(
+        req.into_body(),
+        max_part,
+        state.config.upload_idle_timeout_secs,
+        digests,
+    );
 
     match state
         .backend()
@@ -138,6 +154,40 @@ pub async fn complete_multipart(
     };
     let write_ctx = write_context_from_headers(req.headers(), custom_meta.as_deref());
 
+    // Human: Optional S3-style part list `{"parts":[{"part_number":1,"etag":"..."}]}`; without it the
+    // stored parts must be contiguous from 1.
+    let declared_len = req
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared_len.is_some_and(|len| len > MAX_COMPLETE_BODY) {
+        return map_storage_error(StorageError::PayloadTooLarge).into_response();
+    }
+    let Ok(body) = axum::body::to_bytes(req.into_body(), MAX_COMPLETE_BODY).await else {
+        return map_storage_error(StorageError::InvalidRequest(
+            "could not read the part list".into(),
+        ))
+        .into_response();
+    };
+    // Human: Only a JSON object with a `parts` field is a part list; any other body (`{}`, `null`, XML, text) is
+    // ignored as before — earlier releases ignored the body entirely, so clients send all sorts.
+    let parts = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(serde_json::Value::Object(mut fields)) => match fields.remove("parts") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(list) => match serde_json::from_value::<Vec<CompletedPart>>(list) {
+                Ok(list) => Some(list),
+                Err(e) => {
+                    return map_storage_error(StorageError::InvalidRequest(format!(
+                        "invalid part list: {e}"
+                    )))
+                    .into_response();
+                }
+            },
+        },
+        _ => None,
+    };
+
     match state
         .backend()
         .complete_multipart(
@@ -146,6 +196,7 @@ pub async fn complete_multipart(
             &params.upload_id,
             custom_meta.as_deref(),
             Some(&write_ctx),
+            parts.as_deref(),
         )
         .await
     {

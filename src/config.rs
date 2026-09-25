@@ -63,6 +63,19 @@ pub struct NosConfig {
     pub bulk_delete_batch_limit: u64,
     pub upload_max_in_flight_bytes: u64,
     pub upload_permit_unit: u64,
+    /// Abort an upload body that sends no bytes for this many seconds (`0` = never).
+    pub upload_idle_timeout_secs: u64,
+    /// Seconds a connection may take to send a request's headers, including idle time between keep-alive
+    /// requests (`0` = no limit).
+    pub header_read_timeout_secs: u64,
+    /// Seconds a response write may stay blocked because the client stopped reading (`0` = no limit).
+    pub send_stall_timeout_secs: u64,
+    /// Connections served at once; at the limit new ones wait in the listen queue (`0` = no limit).
+    pub max_connections: usize,
+    /// On SIGTERM/SIGINT, seconds requests in progress may take to finish before the process exits.
+    pub shutdown_grace_secs: u64,
+    /// Longest accepted presigned URL lifetime from now, in seconds (`0` = unlimited).
+    pub presign_max_ttl_secs: u64,
     pub orphan_gc_interval_secs: u64,
     pub rate_limit_bypass_roles: Vec<String>,
     pub multipart_part_size: usize,
@@ -84,17 +97,29 @@ pub struct NosConfig {
     pub compress_block_size: usize,
     pub compress_exclude_extensions: Vec<String>,
     pub block_cache_entries: usize,
+    pub block_cache_max_bytes: usize,
     pub verify_interval_secs: u64,
     pub verify_batch_size: usize,
     pub scrub_sample_denom: u64,
     pub scrub_mode_light: bool,
     pub verify_on_read: bool,
     pub read_buffer_size: usize,
+    /// fsync blob data and directories before a write becomes visible (NOS_FSYNC_WRITES, default true).
+    pub fsync_writes: bool,
     pub webhooks: WebhookConfig,
     pub s3_compat: bool,
     pub bucket_policy: BucketPolicy,
     pub s3_access_key: Option<String>,
     pub s3_secret_key: Option<String>,
+    /// Role granted to requests signed with the access key (NOS_S3_ACCESS_KEY_ROLE, default `admin`).
+    pub s3_access_key_role: String,
+    /// Accept the legacy `Authorization: NOS <key>:<signature>` scheme (NOS_LEGACY_ACCESS_KEY_AUTH, default
+    /// false). It signs only method and bucket, so a captured signature works forever; use SigV4 instead.
+    pub legacy_access_key_auth: bool,
+    /// When set, JWTs must carry this `iss` claim (NOS_JWT_ISSUER).
+    pub jwt_issuer: Option<String>,
+    /// When set, JWTs must carry this `aud` claim (NOS_JWT_AUDIENCE).
+    pub jwt_audience: Option<String>,
     pub cluster: ClusterConfig,
     /// Human: One-time operator token for PUT /_cluster/config before cluster_token is set.
     pub cluster_bootstrap_token: Option<String>,
@@ -115,6 +140,12 @@ impl fmt::Debug for NosConfig {
             .field("jwt_secret", &"[REDACTED]")
             .field("signing_secret", &"[REDACTED]")
             .field("max_body_size", &self.max_body_size)
+            .field("upload_idle_timeout_secs", &self.upload_idle_timeout_secs)
+            .field("header_read_timeout_secs", &self.header_read_timeout_secs)
+            .field("send_stall_timeout_secs", &self.send_stall_timeout_secs)
+            .field("max_connections", &self.max_connections)
+            .field("shutdown_grace_secs", &self.shutdown_grace_secs)
+            .field("presign_max_ttl_secs", &self.presign_max_ttl_secs)
             .field("upload_buffer_size", &self.upload_buffer_size)
             .field("allow_public_read", &self.allow_public_read)
             .field("reconcile_on_startup", &self.reconcile_on_startup)
@@ -142,7 +173,9 @@ impl fmt::Debug for NosConfig {
             .field("compress_min_size", &self.compress_min_size)
             .field("compress_block_size", &self.compress_block_size)
             .field("block_cache_entries", &self.block_cache_entries)
+            .field("block_cache_max_bytes", &self.block_cache_max_bytes)
             .field("verify_interval_secs", &self.verify_interval_secs)
+            .field("fsync_writes", &self.fsync_writes)
             .field("compress_exclude_extensions", &self.compress_exclude_extensions)
             .field("s3_compat", &self.s3_compat)
             .field(
@@ -150,6 +183,10 @@ impl fmt::Debug for NosConfig {
                 &self.bucket_policy.0.keys().collect::<Vec<_>>(),
             )
             .field("s3_access_key", &self.s3_access_key.as_ref().map(|_| "[REDACTED]"))
+            .field("s3_access_key_role", &self.s3_access_key_role)
+            .field("legacy_access_key_auth", &self.legacy_access_key_auth)
+            .field("jwt_issuer", &self.jwt_issuer)
+            .field("jwt_audience", &self.jwt_audience)
             .field("cluster_mode", &self.cluster.mode.as_str())
             .field("node_id", &self.cluster.node_id)
             .finish()
@@ -284,6 +321,43 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_UPLOAD_PERMIT_UNIT must be a valid u64"))
                 .transpose()?
                 .unwrap_or(5 * 1024 * 1024),
+            presign_max_ttl_secs: env::var("NOS_PRESIGN_MAX_TTL_SECS")
+                .ok()
+                .map(|s| s.parse().context("NOS_PRESIGN_MAX_TTL_SECS must be a valid u64"))
+                .transpose()?
+                .unwrap_or(7 * 24 * 3600),
+            upload_idle_timeout_secs: env::var("NOS_UPLOAD_IDLE_TIMEOUT_SECS")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_UPLOAD_IDLE_TIMEOUT_SECS must be a valid u64")
+                })
+                .transpose()?
+                .unwrap_or(60),
+            header_read_timeout_secs: env::var("NOS_HEADER_READ_TIMEOUT_SECS")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .context("NOS_HEADER_READ_TIMEOUT_SECS must be a valid u64")
+                })
+                .transpose()?
+                .unwrap_or(75),
+            send_stall_timeout_secs: env::var("NOS_SEND_STALL_TIMEOUT_SECS")
+                .ok()
+                .map(|s| s.parse().context("NOS_SEND_STALL_TIMEOUT_SECS must be a valid u64"))
+                .transpose()?
+                .unwrap_or(300),
+            max_connections: env::var("NOS_MAX_CONNECTIONS")
+                .ok()
+                .map(|s| s.parse().context("NOS_MAX_CONNECTIONS must be a valid usize"))
+                .transpose()?
+                .unwrap_or(0),
+            // Human: Under Docker's default 10 s stop timeout, so the process exits before it is killed.
+            shutdown_grace_secs: env::var("NOS_SHUTDOWN_GRACE_SECS")
+                .ok()
+                .map(|s| s.parse().context("NOS_SHUTDOWN_GRACE_SECS must be a valid u64"))
+                .transpose()?
+                .unwrap_or(8),
             orphan_gc_interval_secs: env::var("NOS_ORPHAN_GC_INTERVAL_SECS")
                 .ok()
                 .map(|s| {
@@ -398,6 +472,11 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_BLOCK_CACHE_ENTRIES must be a valid usize"))
                 .transpose()?
                 .unwrap_or(256),
+            block_cache_max_bytes: env::var("NOS_BLOCK_CACHE_MAX_BYTES")
+                .ok()
+                .map(|s| s.parse().context("NOS_BLOCK_CACHE_MAX_BYTES must be a valid usize"))
+                .transpose()?
+                .unwrap_or(crate::storage::block_cache::DEFAULT_BLOCK_CACHE_MAX_BYTES),
             verify_interval_secs: env::var("NOS_VERIFY_INTERVAL_SECS")
                 .ok()
                 .map(|s| s.parse().context("NOS_VERIFY_INTERVAL_SECS must be a valid u64"))
@@ -426,6 +505,10 @@ impl NosConfig {
                 .map(|s| s.parse().context("NOS_READ_BUFFER_SIZE must be a valid usize"))
                 .transpose()?
                 .unwrap_or(256 * 1024),
+            fsync_writes: env::var("NOS_FSYNC_WRITES")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(true),
             webhooks: env::var("NOS_WEBHOOKS_JSON")
                 .ok()
                 .map(|s| WebhookConfig::from_json(&s))
@@ -446,6 +529,24 @@ impl NosConfig {
                 .unwrap_or_default(),
             s3_access_key: env::var("NOS_S3_ACCESS_KEY").ok().filter(|s| !s.is_empty()),
             s3_secret_key: env::var("NOS_S3_SECRET_KEY").ok().filter(|s| !s.is_empty()),
+            s3_access_key_role: {
+                let role = env::var("NOS_S3_ACCESS_KEY_ROLE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "admin".to_string());
+                if !crate::auth::is_known_role(&role) {
+                    anyhow::bail!(
+                        "NOS_S3_ACCESS_KEY_ROLE must be admin, editor, uploader, listener or readonly (got {role})"
+                    );
+                }
+                role
+            },
+            legacy_access_key_auth: env::var("NOS_LEGACY_ACCESS_KEY_AUTH")
+                .ok()
+                .map(|s| parse_bool(&s))
+                .unwrap_or(false),
+            jwt_issuer: env::var("NOS_JWT_ISSUER").ok().filter(|s| !s.is_empty()),
+            jwt_audience: env::var("NOS_JWT_AUDIENCE").ok().filter(|s| !s.is_empty()),
             cluster: ClusterConfig::from_env()?,
             cluster_bootstrap_token: env::var("NOS_CLUSTER_BOOTSTRAP_TOKEN")
                 .ok()

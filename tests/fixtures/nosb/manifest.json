@@ -1,0 +1,79 @@
+{
+ "generated_by": "nebular-os at commit da75495 via tests/fixtures/generate_nosb.py",
+ "blob_formats": {
+  "NOSB": 6,
+  "raw": 3
+ },
+ "objects": [
+  {
+   "bucket": "media",
+   "key": "docs/mixed.bin",
+   "size": 53539,
+   "sha256": "503f66e6f537844e337be38922aab99ad3d422d2ac4beff1500be478a0b7ace2",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "docs/multi-block.txt",
+   "size": 41340,
+   "sha256": "f55ae58ee8d8cbf1bd69e2a50f255dfeef1e6b503c3473946d90bd17aa34fefa",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "docs/tiny.txt",
+   "size": 32,
+   "sha256": "2a0b09126dd53f74506673de5ed37764749b0507e05ab499ff5bc1ad9134f091",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "docs/two-blocks.txt",
+   "size": 5191,
+   "sha256": "68f95c05861aac15ef84ab1bb60fa5b618edbb0f06f9962cf93c22166df882f4",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "meta/typed.json",
+   "size": 6400,
+   "sha256": "ef398726c63785a1c5e1d1ac7be2a3b18a00a2d63ceb0e26f65da7350f9ba6d8",
+   "content_type": "application/json",
+   "custom_meta_origin": "nosb-era"
+  },
+  {
+   "bucket": "media",
+   "key": "raw/random.bin",
+   "size": 20000,
+   "sha256": "b30b3c5f92361c250e342b73b1d9cb648466015848bb561fa3bbc918e20e6f77",
+   "content_type": null,
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "media",
+   "key": "video/clip.mp4",
+   "size": 13852,
+   "sha256": "a0697f9b4fc64a856b27dbd74ce34953793e4e34e788e65b3fdedf71c9672f75",
+   "content_type": "video/mp4",
+   "custom_meta_origin": null
+  },
+  {
+   "bucket": "other",
+   "key": "docs/multi-block.txt",
+   "size": 17379,
+   "sha256": "5fc1f11ce98aa032b2f638b4b51586765e71e96ca59faca930fb5d2eff69839f",
+   "content_type": null,
+   "custom_meta_origin": null
+  }
+ ],
+ "soft_deleted": [
+  {
+   "bucket": "media",
+   "key": "trash/deleted.txt"
+  }
+ ]
+}

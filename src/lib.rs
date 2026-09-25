@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod background_jobs;
 pub mod cluster;
 pub mod config;
 pub mod webhooks;
@@ -8,4 +9,5 @@ pub mod observability;
 pub mod secrets;
 pub mod routes;
 pub mod server;
+pub mod sigv4;
 pub mod storage;

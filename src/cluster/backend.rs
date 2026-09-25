@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use crate::storage::engine::{GetObjectOutcome, ReadinessChecks, StorageEngine};
+use crate::storage::multipart::CompletedPart;
+use crate::storage::write_path::WriteConditions;
 use super::config::ClusterConfig;
 use crate::storage::error::StorageError;
 use crate::storage::multipart::{InitMultipartResult, PartUploadResult};
@@ -43,6 +45,24 @@ impl StorageBackend {
         }
     }
 
+    /// Human: Stop the background tasks of a backend a config reload replaced (queued events stay in the log).
+    pub fn shutdown(&self) {
+        match self {
+            Self::Standalone(_) => {}
+            Self::Replicated(b) => b.shutdown(),
+            Self::Assigned(b) => b.shutdown(),
+        }
+    }
+
+    /// The replication log, in modes that replicate.
+    pub fn replication_log(&self) -> Option<&super::replicated::ReplicationLog> {
+        match self {
+            Self::Standalone(_) => None,
+            Self::Replicated(b) => Some(b.replication_log()),
+            Self::Assigned(b) => b.replication_log(),
+        }
+    }
+
     pub async fn ensure_write_preconditions(
         &self,
         bucket: &str,
@@ -67,6 +87,7 @@ impl StorageBackend {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -75,18 +96,19 @@ impl StorageBackend {
         custom_meta: Option<&str>,
         body: impl tokio::io::AsyncRead + Unpin,
         write_ctx: Option<&WriteContext>,
+        conditions: WriteConditions<'_>,
     ) -> Result<ObjectMetadata, StorageError> {
         match self {
             Self::Standalone(b) => {
-                b.put_object(bucket, key, content_type, custom_meta, body)
+                b.put_object(bucket, key, content_type, custom_meta, body, conditions)
                     .await
             }
             Self::Replicated(b) => {
-                b.put_object(bucket, key, content_type, custom_meta, body, write_ctx)
+                b.put_object(bucket, key, content_type, custom_meta, body, write_ctx, conditions)
                     .await
             }
             Self::Assigned(b) => {
-                b.put_object(bucket, key, content_type, custom_meta, body, write_ctx)
+                b.put_object(bucket, key, content_type, custom_meta, body, write_ctx, conditions)
                     .await
             }
         }
@@ -364,18 +386,19 @@ impl StorageBackend {
         upload_id: &str,
         custom_meta: Option<&str>,
         write_ctx: Option<&WriteContext>,
+        parts: Option<&[CompletedPart]>,
     ) -> Result<ObjectMetadata, StorageError> {
         match self {
             Self::Standalone(b) => {
-                b.complete_multipart(bucket, key, upload_id, custom_meta)
+                b.complete_multipart(bucket, key, upload_id, custom_meta, parts)
                     .await
             }
             Self::Replicated(b) => {
-                b.complete_multipart(bucket, key, upload_id, custom_meta, write_ctx)
+                b.complete_multipart(bucket, key, upload_id, custom_meta, write_ctx, parts)
                     .await
             }
             Self::Assigned(b) => {
-                b.complete_multipart(bucket, key, upload_id, custom_meta, write_ctx)
+                b.complete_multipart(bucket, key, upload_id, custom_meta, write_ctx, parts)
                     .await
             }
         }
@@ -429,11 +452,15 @@ impl StorageBackend {
         }
     }
 
-    pub async fn backfill_replication(&self, limit: usize) -> Result<BackfillReport, StorageError> {
+    pub async fn backfill_replication(
+        &self,
+        limit: usize,
+        start_after: Option<&str>,
+    ) -> Result<BackfillReport, StorageError> {
         match self {
             Self::Standalone(_) => Ok(BackfillReport::default()),
-            Self::Replicated(b) => b.backfill_replication(limit).await,
-            Self::Assigned(b) => b.backfill_replication(limit).await,
+            Self::Replicated(b) => b.backfill_replication(limit, start_after).await,
+            Self::Assigned(b) => b.backfill_replication(limit, start_after).await,
         }
     }
 
@@ -452,23 +479,9 @@ impl StorageBackend {
         match self {
             Self::Standalone(b) => b.engine().scrub_with_defaults(limit).await,
             Self::Replicated(b) => {
-                let cursor = b.engine().get_maintenance_state("scrub_cursor").await?;
-                let mode = if b.engine().scrub_mode_light() {
-                    crate::storage::scrub::ScrubMode::Light
-                } else {
-                    crate::storage::scrub::ScrubMode::Deep
-                };
-                let report = b
-                    .scrub_with_recovery(crate::storage::scrub::ScrubOptions {
-                        limit,
-                        sample_denom: b.engine().scrub_sample_denom(),
-                        mode,
-                        start_after: cursor,
-                    })
-                    .await?;
-                if let Some(ref next) = report.next_start_after {
-                    b.engine().set_maintenance_state("scrub_cursor", next).await?;
-                }
+                let opts = b.engine().next_scrub_options(limit).await?;
+                let report = b.scrub_with_recovery(opts.clone()).await?;
+                b.engine().save_scrub_progress(&opts, &report).await?;
                 Ok(report)
             }
             Self::Assigned(b) => b.scrub_with_defaults(limit).await,
@@ -503,6 +516,13 @@ pub fn build_backend(
             "NOS_NODE_ID is not listed in NOS_CLUSTER_PEERS (asymmetric peering)"
         );
     }
+    // Human: Everything that can fail comes before a replicated backend starts its worker: a failure after it
+    // left the worker running for a configuration that was never applied.
+    let rules = if cluster.mode_includes_assignment() {
+        Some(cluster.assignment_rules()?)
+    } else {
+        None
+    };
 
     let inner = if cluster.mode_includes_replication() {
         AssignedInner::Replicated(ReplicatedBackend::new(
@@ -515,8 +535,7 @@ pub fn build_backend(
         AssignedInner::Standalone(StandaloneBackend::new(engine))
     };
 
-    if cluster.mode_includes_assignment() {
-        let rules = cluster.assignment_rules()?;
+    if let Some(rules) = rules {
         return Ok(StorageBackend::Assigned(AssignedBackend::new(
             inner,
             cluster,

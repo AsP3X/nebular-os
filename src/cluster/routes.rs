@@ -10,9 +10,13 @@ use std::sync::Arc;
 
 use crate::cluster::assignment::WriteContext;
 use crate::cluster::backend::StorageBackend;
-use crate::routes::helpers::{apply_object_headers, parse_if_modified_since, parse_if_none_match};
+use crate::routes::helpers::{
+    apply_object_headers, object_content_response, parse_if_modified_since, parse_if_none_match,
+    range_not_satisfiable_response,
+};
 use crate::routes::{errors::map_storage_error, AppState};
 use crate::storage::engine::GetObjectOutcome;
+use crate::storage::error::StorageError;
 
 #[derive(Serialize)]
 pub struct ClusterHealthResponse {
@@ -83,27 +87,33 @@ pub async fn cluster_object_get(
             stream,
             content_length,
             total_size,
+            range,
             meta,
         }) => {
-            let body = Body::from_stream(stream);
-            let mut resp = Response::new(body);
-            apply_object_headers(resp.headers_mut(), &meta);
-            if let Ok(ar) = "bytes".parse() {
-                resp.headers_mut().insert(header::ACCEPT_RANGES, ar);
-            }
-            if let Some(range_hdr) = range_header {
-                let start = crate::routes::helpers::parse_range(range_hdr, total_size)
-                    .map(|(s, _)| s)
-                    .unwrap_or(0);
-                let end = start + content_length.saturating_sub(1);
-                let value = format!("bytes {}-{}/{}", start, end, total_size);
-                if let Ok(cr) = value.parse() {
-                    resp.headers_mut().insert(header::CONTENT_RANGE, cr);
-                }
-                *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+            let mut resp = object_content_response(stream, content_length, total_size, range, &meta);
+            // Human: A peer restoring the object from this copy records the version it has here. The version is read
+            // after the bytes were opened, so it is sent only if the object is still the one being served: a write
+            // in between would otherwise label these bytes with the newer version, and the peer would then refuse
+            // that newer version when it arrived.
+            // Agent: version read first, ETag re-checked after — a write commits its metadata before its version.
+            if let Some(log) = state.backend().replication_log()
+                && let Ok(Some(version)) = log.key_version(&bucket, &key).await
+                && let Ok(Some(current)) = state
+                    .backend()
+                    .engine()
+                    .object_meta()
+                    .try_fetch_active_metadata(&meta.bucket, &meta.key)
+                    .await
+                && current.etag.is_some()
+                && current.etag == meta.etag
+                && let Ok(value) = header::HeaderValue::from_str(&version.version.to_header())
+            {
+                resp.headers_mut()
+                    .insert(crate::cluster::replicated::versions::HEADER, value);
             }
             resp
         }
+        Err(StorageError::RangeNotSatisfiable { size }) => range_not_satisfiable_response(size),
         Err(e) => map_storage_error(e).into_response(),
     }
 }
@@ -176,6 +186,7 @@ pub async fn assignment_resolve(
                 content_length: body.content_length,
                 authorization: None,
                 replication_group_header: None,
+                forwarded: false,
             };
             b.resolve(&body.bucket, &body.key, Some(&ctx))
         }
@@ -202,16 +213,23 @@ pub async fn assignment_resolve(
 #[derive(serde::Deserialize)]
 pub struct BackfillQuery {
     pub limit: Option<u64>,
+    /// Cursor from a previous response's `next_start_after`.
+    pub start_after: Option<String>,
 }
 
-/// Human: Enqueue replication events for existing objects not yet pushed to peers.
-/// Agent: POST /_cluster/replication/backfill; Bearer cluster token; optional limit (default 100).
+/// Human: Enqueue replication events for existing objects not yet pushed to peers, one batch per call.
+/// Agent: POST /_cluster/replication/backfill; Bearer cluster token; optional limit (default 100) and
+/// start_after; REPEAT with start_after=next_start_after while is_truncated.
 pub async fn replication_backfill(
     State(state): State<Arc<AppState>>,
     Query(query): Query<BackfillQuery>,
 ) -> impl IntoResponse {
     let limit = query.limit.unwrap_or(100).min(10_000) as usize;
-    match state.backend().backfill_replication(limit).await {
+    match state
+        .backend()
+        .backfill_replication(limit, query.start_after.as_deref())
+        .await
+    {
         Ok(report) => (StatusCode::OK, Json(report)).into_response(),
         Err(e) => {
             let (status, json) = crate::routes::errors::map_storage_error(e);

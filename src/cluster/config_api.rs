@@ -48,6 +48,7 @@ pub struct ClusterConfigSnapshotPublic {
 
 impl From<ClusterConfigSnapshot> for ClusterConfigSnapshotPublic {
     fn from(s: ClusterConfigSnapshot) -> Self {
+        let replication_factor = s.effective_replication_factor();
         Self {
             mode: s.mode,
             node_id: s.node_id,
@@ -58,7 +59,7 @@ impl From<ClusterConfigSnapshot> for ClusterConfigSnapshotPublic {
             storage_classes: s.storage_classes,
             replication_group: s.replication_group,
             replication_role: s.replication_role,
-            replication_factor: s.replication_factor,
+            replication_factor,
             replication_read_repair: s.replication_read_repair,
             replication_async: s.replication_async,
             default_storage_class: s.default_storage_class,

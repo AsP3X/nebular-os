@@ -5,6 +5,7 @@ pub mod backend;
 pub mod config;
 pub mod config_api;
 pub mod forward;
+pub mod http;
 pub mod peer;
 pub mod read_repair;
 pub mod replication_recover;

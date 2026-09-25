@@ -1,11 +1,58 @@
 use super::error::StorageError;
 use super::types::ObjectMetadata;
 
-/// Human: Compares a stored etag with a client If-Match / If-None-Match token.
-/// Agent: NORMALIZES quotes; MATCHES stored==candidate OR stored==trimmed client value.
+/// Human: True when any entity-tag in a client If-Match / If-None-Match list equals the stored etag.
+/// Agent: SPLITS on commas; STRIPS weak prefix `W/` and quotes (our etags are never weak, so weak and
+/// strong comparison agree); `*` is handled by callers.
 pub fn etag_matches(stored: &str, candidate: &str) -> bool {
-    let candidate = candidate.trim().trim_matches('"');
-    stored == candidate || stored == candidate.trim()
+    candidate.split(',').any(|tag| {
+        let tag = tag.trim();
+        let tag = tag.strip_prefix("W/").unwrap_or(tag);
+        tag.trim_matches('"') == stored
+    })
+}
+
+/// Human: RFC 9110 §13.1.3 — whether a conditional GET or HEAD is answered `304 Not Modified`.
+/// Agent: If-None-Match takes precedence (If-Modified-Since is then ignored); a future date is ignored.
+pub fn is_not_modified(
+    meta: &ObjectMetadata,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<i64>,
+) -> bool {
+    if let Some(etag) = if_none_match {
+        return etag == "*"
+            || meta
+                .etag
+                .as_deref()
+                .is_some_and(|stored| etag_matches(stored, etag));
+    }
+    if let Some(since) = if_modified_since
+        && since <= chrono::Utc::now().timestamp()
+    {
+        return meta.updated_at.timestamp() <= since;
+    }
+    false
+}
+
+/// Human: RFC 9110 §13.1.5 — whether a Range may be served under `If-Range`. The validator must be a strong
+/// entity-tag equal to the current one, or exactly the current Last-Modified date; otherwise the client gets
+/// the whole representation, so it never splices bytes from two versions.
+/// Agent: Weak tags never match; unquoted values that aren't dates are compared as our (unquoted) ETags.
+pub fn if_range_matches(meta: &ObjectMetadata, if_range: &str) -> bool {
+    let value = if_range.trim();
+    if value.starts_with("W/") {
+        return false;
+    }
+    if value.starts_with('"') {
+        return meta
+            .etag
+            .as_deref()
+            .is_some_and(|stored| value.trim_matches('"') == stored);
+    }
+    if let Ok(date) = chrono::DateTime::parse_from_rfc2822(value) {
+        return meta.updated_at.timestamp() == date.timestamp();
+    }
+    meta.etag.as_deref() == Some(value)
 }
 
 /// Human: Enforces If-Match / If-None-Match on mutating object requests before upload or delete proceeds.

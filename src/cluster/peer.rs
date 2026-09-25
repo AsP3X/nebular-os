@@ -156,15 +156,19 @@ pub fn spawn_peer_health_checks(
     peers: Arc<PeerRegistry>,
     cluster_token: String,
     node_id: String,
+    shutdown: tokio_util::sync::CancellationToken,
 ) {
     if peers.peers.is_empty() {
         return;
     }
     tokio::spawn(async move {
-        let client = reqwest::Client::new();
+        let client = super::http::client();
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         loop {
-            ticker.tick().await;
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = ticker.tick() => {}
+            }
             for (peer_id, peer) in &peers.peers {
                 if peer_id == &node_id {
                     continue;
@@ -176,6 +180,7 @@ pub fn spawn_peer_health_checks(
                 match client
                     .get(&url)
                     .bearer_auth(&cluster_token)
+                    .timeout(Duration::from_secs(10))
                     .send()
                     .await
                 {

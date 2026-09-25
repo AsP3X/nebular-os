@@ -48,6 +48,23 @@ pub enum BlobFormat {
     Nosi,
 }
 
+/// Human: The format a stored blob is read as. Detection goes by leading magic bytes, so a raw upload that
+/// happened to start with one (possible before such uploads were stored wrapped) would never decode. Every
+/// format keeps the logical size at bytes 4..12; when that disagrees with the object's size and the file is
+/// exactly the object's size, the file is that raw upload.
+/// Agent: `head` = the blob's first bytes (≥ 12 to recognise anything); sizes come from metadata and the file.
+pub fn stored_blob_format(head: &[u8], file_len: u64, logical_size: u64) -> BlobFormat {
+    let format = detect_blob_format(head);
+    if format != BlobFormat::Raw
+        && file_len == logical_size
+        && head.len() >= 12
+        && u64::from_le_bytes(head[4..12].try_into().unwrap()) != logical_size
+    {
+        return BlobFormat::Raw;
+    }
+    format
+}
+
 pub fn detect_blob_format(data: &[u8]) -> BlobFormat {
     if data.len() >= HEADER_LEN && data.starts_with(NOSI_MAGIC) {
         return BlobFormat::Nosi;
@@ -329,38 +346,36 @@ pub fn parse_layout_bytes(data: &[u8]) -> Result<BlobLayout, StorageError> {
     }
 }
 
-pub fn read_blob_layout(mut file: File) -> Result<BlobLayout, StorageError> {
-    let mut peek = [0u8; FIXED_HEADER_LEN_V1_LEVEL];
-    file.read_exact(&mut peek[..FIXED_HEADER_LEN_V1])
-        .map_err(|e| internal(anyhow::anyhow!(e)))?;
-    let format = detect_blob_format(&peek);
-    let fixed_len = match format {
+/// Human: Header and block index of an indexed blob, read from the start of `file` without its blocks.
+/// Agent: READS the 20 bytes NOSB and NOSI share, then only the rest of that format's fixed header (NOSB 20,
+/// NOSI 24 or 25) — reading 24 up front shifted NOSB's index by 4 bytes and broke every NOSB read.
+pub fn read_blob_layout(mut file: impl Read) -> Result<BlobLayout, StorageError> {
+    let io = |e: std::io::Error| internal(anyhow::anyhow!(e));
+    let mut header = [0u8; FIXED_HEADER_LEN_V1_LEVEL];
+    file.read_exact(&mut header[..FIXED_HEADER_LEN]).map_err(io)?;
+    let fixed_len = match detect_blob_format(&header[..FIXED_HEADER_LEN]) {
+        BlobFormat::Nosb => FIXED_HEADER_LEN,
         BlobFormat::Nosi => {
-            let flags = u16::from_le_bytes([peek[22], peek[23]]);
+            file.read_exact(&mut header[FIXED_HEADER_LEN..FIXED_HEADER_LEN_V1])
+                .map_err(io)?;
+            let flags = u16::from_le_bytes([header[22], header[23]]);
             if (flags & NOSI_FLAG_HAS_LEVEL) != 0 {
-                file.read_exact(&mut peek[FIXED_HEADER_LEN_V1..FIXED_HEADER_LEN_V1_LEVEL])
-                    .map_err(|e| internal(anyhow::anyhow!(e)))?;
+                file.read_exact(&mut header[FIXED_HEADER_LEN_V1..FIXED_HEADER_LEN_V1_LEVEL])
+                    .map_err(io)?;
                 FIXED_HEADER_LEN_V1_LEVEL
             } else {
                 FIXED_HEADER_LEN_V1
             }
         }
-        BlobFormat::Nosb => FIXED_HEADER_LEN,
         _ => return Err(internal(anyhow::anyhow!("not an indexed blob"))),
     };
-    let block_count = u32::from_le_bytes(peek[16..20].try_into().unwrap()) as usize;
+    let block_count = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
     if block_count > MAX_BLOCK_COUNT {
         return Err(internal(anyhow::anyhow!("block count exceeds limit")));
     }
-    let index_bytes = block_count * INDEX_ENTRY_LEN;
-    let mut rest = vec![0u8; index_bytes];
-    if index_bytes > 0 {
-        file.read_exact(&mut rest)
-            .map_err(|e| internal(anyhow::anyhow!(e)))?;
-    }
-    let mut data = Vec::with_capacity(fixed_len + index_bytes);
-    data.extend_from_slice(&peek[..fixed_len]);
-    data.extend_from_slice(&rest);
+    let mut data = header[..fixed_len].to_vec();
+    data.resize(fixed_len + block_count * INDEX_ENTRY_LEN, 0);
+    file.read_exact(&mut data[fixed_len..]).map_err(io)?;
     parse_layout_bytes(&data)
 }
 
@@ -380,11 +395,22 @@ fn validate_index(index: &[IndexEntry], logical_size: u64) -> Result<(), Storage
     Ok(())
 }
 
+/// Human: Logical object size from a compressed blob's header. Reads up to the longest fixed header (NOS2's 16
+/// bytes): it read 12, too few to recognise NOS2 — the format every release through 0.1.4 wrote — so streaming
+/// GETs, scrub and migration failed on those objects.
 pub fn read_blob_logical_size(mut file: File) -> Result<u64, StorageError> {
-    let mut header = [0u8; HEADER_LEN];
-    file.read_exact(&mut header)
-        .map_err(|e| internal(anyhow::anyhow!(e)))?;
-    match detect_blob_format(&header) {
+    let mut header = [0u8; HEADER_LEN_V2];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(internal(anyhow::anyhow!(e))),
+        }
+    }
+    let header = &header[..filled];
+    match detect_blob_format(header) {
         BlobFormat::Nosi | BlobFormat::Nosb | BlobFormat::Nosz | BlobFormat::Nos2 => {
             Ok(u64::from_le_bytes(header[4..12].try_into().unwrap()))
         }
@@ -465,16 +491,6 @@ pub fn write_blob_header_v1<W: std::io::Write>(
             .write_all(&entry.logical_end.to_le_bytes())
             .map_err(|e| internal(anyhow::anyhow!(e)))?;
     }
-    Ok(())
-}
-
-#[cfg(test)]
-#[cfg(test)]
-pub fn write_block_header_v0(writer: &mut Vec<u8>, block_type: u8, payload_len: u32) -> Result<(), StorageError> {
-    let mut header = [0u8; BLOCK_HEADER_LEN];
-    header[0] = block_type;
-    header[4..8].copy_from_slice(&payload_len.to_le_bytes());
-    writer.extend_from_slice(&header);
     Ok(())
 }
 

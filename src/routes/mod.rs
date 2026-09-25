@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod body_digest;
 pub mod bucket;
 pub mod capabilities;
 pub mod errors;
@@ -37,9 +38,13 @@ pub struct AppState {
     pub metrics: Arc<NosMetrics>,
     pub webhooks: WebhookDispatcher,
     pub rate_limiters: Arc<DashMap<String, ClientBucket>>,
+    /// Per-IP budget for failed authentication attempts (only used when NOS_RATE_LIMIT_RPS > 0).
+    pub auth_failures: Arc<DashMap<String, ClientBucket>>,
     pub upload_budget: Option<Arc<UploadBudget>>,
     pub max_body_size: usize,
     pub allow_public_read: bool,
+    /// Storage totals for /metrics, reused for a few seconds.
+    pub storage_stats: Arc<metrics::StorageStatsCache>,
 }
 
 impl AppState {

@@ -4,11 +4,12 @@ use std::sync::Arc;
 use sqlx::Pool;
 use sqlx::Sqlite;
 
+use super::blob_ops::{sync_dir, sync_file};
 use super::block_cache::BlockDecodeCache;
 use super::blocks::BlockStore;
 use super::compressibility::CompressionContext;
 use super::compression::{
-    compress_file_to_storage, detect_blob_format, is_dedup_manifest, is_compressed_blob,
+    encode_file_for_storage, detect_blob_format, FileEncoding, is_dedup_manifest, is_compressed_blob,
     read_indexed_dict_id, read_stored_dict_id, read_stored_zstd_level, BlobFormat,
     EncodeOptions, BLOB_MAGIC, BLOB_MAGIC_V2, DEDUP_MAGIC, HEADER_LEN, HEADER_LEN_V2,
     NOSI_MAGIC, NOSB_MAGIC,
@@ -32,31 +33,26 @@ pub struct BlobFinalizeOptions {
     pub existing_blob: Option<PathBuf>,
 }
 
-/// Human: After temp upload, NOSI block-compress-or-store (with optional dedup refs) to final blob path.
-pub async fn finalize_temp_to_blob(
+/// Where an upload's bytes live once staged for commit.
+#[derive(Debug)]
+pub enum StagedBlob {
+    /// Raw payload: the upload temp file itself becomes the blob.
+    Raw,
+    /// Indexed blob written to the staging path; its dedup refs are already counted.
+    Encoded { refs: Vec<(u64, u32)> },
+}
+
+/// Human: Encode an uploaded temp file into `staging` without touching the object's blob path.
+/// Agent: spawn_blocking(encode_file_for_storage); inc_refs for Encoded; caller commits or releases the refs.
+pub async fn stage_temp_blob(
     tmp_path: &Path,
-    final_path: &Path,
+    staging: &Path,
     logical_size: u64,
-    opts: BlobFinalizeOptions,
-) -> Result<(), StorageError> {
-    if let Some(existing) = &opts.existing_blob
-        && existing.exists()
-    {
-        BlockStore::release_blob(&opts.system_pool, &opts.data_dir, existing).await?;
-    }
-
-    if let Some(parent) = final_path.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(internal)?;
-    }
-    if final_path.exists() {
-        tokio::fs::remove_file(final_path)
-            .await
-            .map_err(map_io_error)?;
-    }
-
+    opts: &BlobFinalizeOptions,
+) -> Result<StagedBlob, StorageError> {
     let use_dedup = opts.dedup_enabled && logical_size >= opts.dedup_min_size;
     let tmp = tmp_path.to_path_buf();
-    let fin = final_path.to_path_buf();
+    let out = staging.to_path_buf();
     let data_dir = opts.data_dir.clone();
     let pool = opts.system_pool.clone();
     let level = opts.level;
@@ -76,7 +72,7 @@ pub async fn finalize_temp_to_blob(
     let content_type = opts.content_type.clone();
     let extra_ext = opts.extra_excluded_extensions.clone();
 
-    let entries = tokio::task::spawn_blocking(move || {
+    let encoding = tokio::task::spawn_blocking(move || {
         let ctx = CompressionContext::new(
             object_key.as_deref(),
             content_type.as_deref(),
@@ -90,13 +86,54 @@ pub async fn finalize_temp_to_blob(
             dict: dict.as_deref().map(|v| v.as_slice()),
             dedup_store: if use_dedup { Some(&store) } else { None },
         };
-        compress_file_to_storage(&tmp, &fin, logical_size, level, block_size, ctx, encode_opts)
+        encode_file_for_storage(&tmp, &out, logical_size, level, block_size, ctx, encode_opts)
     })
     .await
     .map_err(internal)??;
 
-    if !entries.is_empty() {
-        BlockStore::inc_refs(&pool, &entries).await?;
+    match encoding {
+        FileEncoding::Raw => Ok(StagedBlob::Raw),
+        FileEncoding::Indexed(refs) => {
+            if !refs.is_empty() {
+                BlockStore::inc_refs(&pool, &refs).await?;
+            }
+            Ok(StagedBlob::Encoded { refs })
+        }
+    }
+}
+
+/// Human: Encode a temp upload and move it to `final_path` — staged, fsynced, then renamed over the old blob.
+/// Agent: Library helper without locking or metadata; StorageEngine commits uploads via commit_staged_locked.
+#[deprecated(note = "StorageEngine::put_object commits uploads atomically with metadata")]
+pub async fn finalize_temp_to_blob(
+    tmp_path: &Path,
+    final_path: &Path,
+    logical_size: u64,
+    opts: BlobFinalizeOptions,
+) -> Result<(), StorageError> {
+    let staging = final_path.with_extension(format!("stage-{}", uuid::Uuid::new_v4()));
+    let staged = stage_temp_blob(tmp_path, &staging, logical_size, &opts).await?;
+    let source = match &staged {
+        StagedBlob::Raw => tmp_path,
+        StagedBlob::Encoded { .. } => staging.as_path(),
+    };
+    let old_refs = match &opts.existing_blob {
+        Some(existing) if existing.exists() => BlockStore::manifest_entries(existing)?,
+        _ => Vec::new(),
+    };
+    if let Some(parent) = final_path.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(internal)?;
+    }
+    sync_file(source).await?;
+    if let Err(e) = tokio::fs::rename(source, final_path).await {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return Err(map_io_error(e));
+    }
+    if let Some(parent) = final_path.parent() {
+        sync_dir(parent).await?;
+    }
+    if !old_refs.is_empty() {
+        BlockStore::dec_refs(&opts.system_pool, &opts.data_dir, &old_refs).await?;
     }
     Ok(())
 }
@@ -112,6 +149,22 @@ pub struct ReadContext {
 }
 
 impl ReadContext {
+    /// Human: A read context built from the data directory alone (dictionary and dedup blocks live there),
+    /// for code without an engine handle — the replication worker — that must ship logical object bytes.
+    pub fn for_data_dir(data_dir: &str) -> Self {
+        // Human: Frames find their dictionary by the ID in their header once the directory is registered.
+        super::dict_store::register_data_dir(data_dir);
+        Self {
+            data_dir: data_dir.to_string(),
+            dict: None,
+            block_cache: None,
+            read_buffer_size: 256 * 1024,
+            verify_on_read: false,
+            buffer_pool: super::buffer_pool::BufferPool::new(256 * 1024, 4),
+            expected_etag: None,
+        }
+    }
+
     pub fn dict_bytes(&self) -> Option<&[u8]> {
         self.dict.as_deref().map(|v| v.as_slice())
     }
