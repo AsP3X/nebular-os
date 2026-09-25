@@ -401,10 +401,14 @@ impl StorageEngine {
             return Ok(None);
         }
         let _check = self.capacity_lock.lock().await;
-        let current = self.total_bytes().await?;
+        // Human: In-flight bytes first, stored total second. A write releases its reservation only after its
+        // metadata has committed, so it is then counted at least once. Read the other way round, a write committing
+        // and releasing between the two reads was counted in neither, and concurrent writes overshot the cap.
+        // Agent: ORDER MATTERS — load(in_flight) happens-before total_bytes(); commit happens-before release.
         let in_flight = self
             .capacity_in_flight
             .load(std::sync::atomic::Ordering::SeqCst);
+        let current = self.total_bytes().await?;
         let incoming = i64::try_from(incoming_bytes).unwrap_or(i64::MAX);
         let projected = current
             .saturating_add(in_flight)

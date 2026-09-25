@@ -4596,39 +4596,43 @@ async fn test_serve_until_stops_waiting_after_the_grace_period() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_writes_never_overshoot_the_capacity_cap() {
-    let (storage, _tmp) = setup_engine(EngineOptions {
-        max_logical_bytes: 1_000,
-        ..EngineOptions::default()
-    })
-    .await;
-    let storage = Arc::new(storage);
-    // Human: Twenty writers race for room for ten 100-byte objects; the cap check and the commits overlap.
-    let writers: Vec<_> = (0..20)
-        .map(|i| {
-            let storage = storage.clone();
-            tokio::spawn(async move {
-                let key = format!("obj-{i}");
-                let written = storage
-                    .put_object("quota", &key, None, None, std::io::Cursor::new(vec![b'x'; 100]))
-                    .await;
-                (key, written)
-            })
+    // Human: Forty writers race for room for ten 100-byte objects, over several rounds: the cap check, other
+    // writers' commits and their reservations being released all interleave.
+    for round in 0..8 {
+        let (storage, _tmp) = setup_engine(EngineOptions {
+            max_logical_bytes: 1_000,
+            fsync_writes: false,
+            ..EngineOptions::default()
         })
-        .collect();
-    let mut stored = Vec::new();
-    for writer in writers {
-        match writer.await.unwrap() {
-            (key, Ok(_)) => stored.push(key),
-            (_, Err(nebular_os::storage::error::StorageError::InsufficientStorage)) => {}
-            (key, Err(e)) => panic!("{key}: unexpected error: {e:?}"),
+        .await;
+        let storage = Arc::new(storage);
+        let writers: Vec<_> = (0..40)
+            .map(|i| {
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    let key = format!("obj-{i}");
+                    let written = storage
+                        .put_object("quota", &key, None, None, std::io::Cursor::new(vec![b'x'; 100]))
+                        .await;
+                    (key, written)
+                })
+            })
+            .collect();
+        let mut stored = Vec::new();
+        for writer in writers {
+            match writer.await.unwrap() {
+                (key, Ok(_)) => stored.push(key),
+                (_, Err(nebular_os::storage::error::StorageError::InsufficientStorage)) => {}
+                (key, Err(e)) => panic!("{key}: unexpected error: {e:?}"),
+            }
         }
+        assert_eq!(stored.len(), 10, "round {round}");
+        assert_eq!(storage.total_bytes().await.unwrap(), 1_000, "round {round}");
+        // Human: Room freed by a delete is available again (reservations were released, not leaked). Which
+        // writers won the race varies, so free the room of one that did.
+        storage.delete_object("quota", &stored[0], None).await.unwrap();
+        put_bytes(&storage, "quota", "after-delete", &[b'y'; 100]).await;
     }
-    assert_eq!(stored.len(), 10);
-    assert_eq!(storage.total_bytes().await.unwrap(), 1_000);
-    // Human: Room freed by a delete is available again (reservations were released, not leaked). Which writers
-    // won the race varies, so free the room of one that did.
-    storage.delete_object("quota", &stored[0], None).await.unwrap();
-    put_bytes(&storage, "quota", "after-delete", &[b'y'; 100]).await;
 }
 
 #[tokio::test]
