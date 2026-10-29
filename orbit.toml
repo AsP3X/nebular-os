@@ -1,0 +1,177 @@
+# orbit.toml — how orbit sets up, builds and runs Nebular OS (format: orbit/docs/orbit-toml.md).
+# There is no deploy.sh: this reproduces the README's "cp .env.example .env, set the secrets,
+# docker compose up --build" and the CI's cargo checks. Secrets are never stored here.
+version = 1
+name = "Nebular OS"
+kind = "compose"
+description = "Self-hosted object storage with an S3-like HTTP API (Rust, SQLite), optional hot/cold cluster"
+
+[checks]
+files = ["docker-compose.yml", "Dockerfile", "docker/entrypoint.sh", "Cargo.toml", "Cargo.lock"]
+
+# .env is created from .env.example on first setup (orbit's default template); its GENERATE_ME values are
+# placeholders, which is also what the server itself rejects (src/secrets.rs).
+[env]
+file = ".env"
+template = ".env.example"
+placeholder = "GENERATE_ME"
+
+# ── secrets (generated once, never replaced) ────────────────────────────────
+# The server needs >= 32 characters with >= 8 distinct ones; hex:32 gives 64 hex characters
+# (the README's `openssl rand -hex 32`). The weak list is the server's KNOWN_WEAK_SECRETS.
+
+[settings.NOS_JWT_SECRET]
+type = "secret"
+generate = "hex:32"
+required = true
+min_len = 32
+weak = [
+  "change-me-in-production", "change-me-in-production-jwt-secret", "dev-jwt-secret-change-me",
+  "dev-master-secret-change-me", "dev-nos-jwt-secret-change-me", "dev-nos-signing-secret-change-me",
+]
+
+[settings.NOS_SIGNING_SECRET]
+type = "secret"
+generate = "hex:32"
+required = true
+min_len = 32
+weak = [
+  "change-me-in-production", "change-me-in-production-jwt-secret", "dev-jwt-secret-change-me",
+  "dev-master-secret-change-me", "dev-nos-jwt-secret-change-me", "dev-nos-signing-secret-change-me",
+]
+
+# Only the cluster services use it, but docker-compose.yml marks it `:?` and compose interpolates every
+# service, including ones in a disabled profile, so every compose call fails without it. Always generated.
+[settings.NOS_CLUSTER_TOKEN]
+type = "secret"
+generate = "hex:32"
+required = true
+min_len = 32
+
+# ── profiles ────────────────────────────────────────────────────────────────
+
+[profiles.cluster]
+ask = "Also run the hot/cold cluster nodes (ports 9001 and 9002)?"
+default = false
+
+[compose]
+files = ["docker-compose.yml"]
+
+# ── storage and backups ─────────────────────────────────────────────────────
+# Volume names come from docker-compose.yml (no `name:`), so the real names are nebular-os_<volume>.
+# The entrypoint hands /data to uid 10001 itself; there is no folder mode in the compose file.
+
+[[storage]]
+name = "data"
+service = "nebular-os"
+mount = "/data"
+volume = "nebular_data"
+
+[[storage]]
+name = "hot"
+service = "nebular-os-hot"
+mount = "/data"
+volume = "nebular_hot_data"
+
+[[storage]]
+name = "cold"
+service = "nebular-os-cold"
+mount = "/data"
+volume = "nebular_cold_data"
+
+# Live archive of the standalone node (the server keeps running).
+[[backup]]
+kind = "volume_tar"
+storage = "data"
+to = "backups/nebular-data-${now}.tar.gz"
+
+# ── after deploy ────────────────────────────────────────────────────────────
+
+[[probe]]
+url = "http://127.0.0.1:9000/health/ready"
+retries = 2
+[[probe]]
+url = "http://127.0.0.1:9001/health/ready"
+when = "profile:cluster"
+retries = 2
+[[probe]]
+url = "http://127.0.0.1:9002/health/ready"
+when = "profile:cluster"
+retries = 2
+
+[[diagnose]]
+match = "port is already allocated"
+hint = "Host ports 9000/9001/9002 are fixed in docker-compose.yml; ownly's stack also binds 9000 and 9001. Stop the other stack first."
+[[diagnose]]
+match = "address already in use"
+hint = "Host ports 9000/9001/9002 are fixed in docker-compose.yml; ownly's stack also binds 9000 and 9001. Stop the other stack first."
+[[diagnose]]
+match = "required variable NOS_"
+hint = "A secret is missing from .env: run Setup, which generates NOS_JWT_SECRET, NOS_SIGNING_SECRET and NOS_CLUSTER_TOKEN."
+[[diagnose]]
+match = "known weak default"
+logs = "nebular-os"
+hint = "The server refuses a placeholder secret: replace it in .env with a random value (>= 32 chars), then Deploy."
+[[diagnose]]
+match = "distinct characters"
+logs = "nebular-os"
+hint = "A secret in .env is too uniform: replace it with a random value (e.g. openssl rand -hex 32)."
+[[diagnose]]
+match = "unhealthy"
+hint = "A node did not pass /health/ready (metadata DB or /data/blobs not writable): see Logs."
+
+[show]
+urls = [
+  { label = "API", url = "http://localhost:9000" },
+  { label = "Hot node", url = "http://localhost:9001", when = "profile:cluster" },
+  { label = "Cold node", url = "http://localhost:9002", when = "profile:cluster" },
+]
+open = "http://localhost:9000/health/ready"
+notes = [
+  { text = "Clients sign HS256 JWTs (sub, email, role, iat, exp) with NOS_JWT_SECRET from .env." },
+  { text = "Cluster routes use Bearer NOS_CLUSTER_TOKEN; hot/cold peers are fixed in docker-compose.yml.", when = "profile:cluster" },
+]
+
+# ── project actions ─────────────────────────────────────────────────────────
+
+# Human: The SQLite metadata DB runs in WAL mode, so a live tar can catch it mid-write. This stops the
+# standalone node, archives its volume read-only and starts it again.
+[[action]]
+name = "Offline backup"
+desc = "stop nebular-os, archive its volume, start it again"
+confirm = "yes"
+steps = [
+  { mkdir = ["backups"] },
+  { stop = ["nebular-os"], label = "Stop nebular-os" },
+  { cmd = [
+      "docker", "run", "--rm",
+      "-v", "${project.name}_nebular_data:/data:ro",
+      "-v", "${project.dir}/backups:/backup",
+      "alpine:3", "tar", "czf", "/backup/nebular-data-offline-${now}.tar.gz", "-C", "/data", ".",
+    ], label = "Archive nebular_data", warn_only = true },
+  { start = ["nebular-os"], label = "Start nebular-os" },
+  { wait = { http = "http://127.0.0.1:9000/health/ready", timeout = 90 }, label = "Wait for readiness" },
+]
+
+# ── cargo (the crate itself; same commands as AGENTS.md and CI) ──────────────
+
+[[task]]
+name = "build"
+desc = "cargo build --release"
+cmd = ["cargo", "build", "--release"]
+
+[[task]]
+name = "test"
+desc = "cargo test (self-contained, no server needed)"
+cmd = ["cargo", "test"]
+
+[[task]]
+name = "clippy"
+desc = "cargo clippy as CI runs it"
+cmd = ["cargo", "clippy", "--all-targets", "--", "-D", "warnings"]
+
+[[task]]
+name = "run"
+desc = "cargo run with .env (binds NOS_BIND_ADDR; stop the stack first)"
+cmd = ["cargo", "run"]
+terminal = true
